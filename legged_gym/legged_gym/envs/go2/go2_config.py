@@ -276,5 +276,5 @@ class Go2RoughCfgPPO( LeggedRobotCfgPPO ):
         ])
 
         max_iterations = 2000
-        save_interval = 2000
+        save_interval = 100
         log_interval = 100
