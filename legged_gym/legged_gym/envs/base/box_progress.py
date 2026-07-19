@@ -18,6 +18,7 @@ class BoxProgressTracker:
         required_distinct_feet=2,
         landing_steps=10,
         body_contact_steps=15,
+        reset_on_body_contact=True,
         roll_threshold=1.4,
         pitch_threshold=1.6,
         base_height_threshold=0.15,
@@ -38,6 +39,7 @@ class BoxProgressTracker:
         self.required_distinct_feet = int(required_distinct_feet)
         self.landing_steps = int(landing_steps)
         self.body_contact_steps = int(body_contact_steps)
+        self.reset_on_body_contact = bool(reset_on_body_contact)
         self.roll_threshold = float(roll_threshold)
         self.pitch_threshold = float(pitch_threshold)
         self.base_height_threshold = float(base_height_threshold)
@@ -165,12 +167,15 @@ class BoxProgressTracker:
             self.body_contact_counter + 1,
             torch.zeros_like(self.body_contact_counter),
         )
+        body_contact_fall = (
+            self.body_contact_counter >= self.body_contact_steps
+        ) & self.reset_on_body_contact
         base_height = base_positions[:, 2] - env_origins[:, 2]
         self.fall_buf[:] = (
             (roll.abs() > self.roll_threshold)
             | (pitch.abs() > self.pitch_threshold)
             | (base_height < self.base_height_threshold)
-            | (self.body_contact_counter >= self.body_contact_steps)
+            | body_contact_fall
         )
 
         lateral_offset = (base_positions[:, 1] - env_origins[:, 1]).abs()

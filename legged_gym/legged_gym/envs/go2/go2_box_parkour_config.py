@@ -88,6 +88,8 @@ class Go2BoxParkourCfg(DebugGo2BoxCfg):
         required_distinct_feet = 2
         landing_steps = 10
         body_contact_steps = 15
+        # Body bracing is valid while discovering a climb strategy.
+        reset_on_body_contact = False
         roll_threshold = 1.4
         pitch_threshold = 1.6
         base_height_threshold = 0.15
@@ -103,14 +105,14 @@ class Go2BoxParkourCfgPPO(Go2RoughCfgPPO):
 
     class runner(Go2RoughCfgPPO.runner):
         experiment_name = "go2_box_parkour"
-        run_name = "five_box_reward_v3_from10100"
+        run_name = "five_box_v3_no_base_reset_from10400"
         resume = True
         load_run = osp.join(
             osp.dirname(osp.dirname(osp.dirname(osp.dirname(__file__)))),
             "logs",
             "go2_box_parkour",
-            "Jul19_21-11-13_five_box_contact_v2_encoder_expand_from9700",
+            "Jul19_21-37-13_five_box_reward_v3_from10200",
         )
-        checkpoint = 10100
+        checkpoint = 10400
         ckpt_manipulator = None
         max_iterations = 2000

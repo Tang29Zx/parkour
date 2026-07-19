@@ -30,6 +30,7 @@ class LeggedRobotBox(LeggedRobot):
             required_distinct_feet=progress_cfg.required_distinct_feet,
             landing_steps=progress_cfg.landing_steps,
             body_contact_steps=progress_cfg.body_contact_steps,
+            reset_on_body_contact=progress_cfg.reset_on_body_contact,
             roll_threshold=progress_cfg.roll_threshold,
             pitch_threshold=progress_cfg.pitch_threshold,
             base_height_threshold=progress_cfg.base_height_threshold,
