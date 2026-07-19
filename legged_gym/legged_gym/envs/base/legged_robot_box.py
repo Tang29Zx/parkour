@@ -37,6 +37,12 @@ class LeggedRobotBox(LeggedRobot):
         )
         self._bind_progress_buffers()
         self._refresh_box_course_data()
+        self.forward_speed_sum = torch.zeros(
+            self.num_envs, dtype=torch.float, device=self.device
+        )
+        self.max_forward_speed = torch.full(
+            (self.num_envs,), -torch.inf, dtype=torch.float, device=self.device
+        )
 
         rigid_body_names = self.gym.get_actor_rigid_body_names(
             self.envs[0], self.actor_handles[0]
@@ -80,6 +86,14 @@ class LeggedRobotBox(LeggedRobot):
         spawn_margin = float(self.terrain.track_kwargs["spawn_margin"])
         self.track_start_x = self.env_origins[:, 0] - spawn_margin
         self.track_end_x = self.track_start_x + float(self.terrain.env_length)
+
+    def _post_physics_step_callback(self):
+        super()._post_physics_step_callback()
+        forward_speed = self.base_lin_vel[:, 0]
+        self.forward_speed_sum += forward_speed
+        self.max_forward_speed = torch.maximum(
+            self.max_forward_speed, forward_speed
+        )
 
     def check_termination(self):
         super().check_termination()
@@ -135,6 +149,13 @@ class LeggedRobotBox(LeggedRobot):
             self.out_of_track_buf[env_ids].float().mean()
         )
         episode["fall_rate"] = self.fall_buf[env_ids].float().mean()
+        episode_lengths = self.episode_length_buf[env_ids].clamp_min(1)
+        episode["mean_forward_speed_mps"] = torch.mean(
+            self.forward_speed_sum[env_ids] / episode_lengths
+        )
+        episode["max_forward_speed_mps"] = torch.max(
+            self.max_forward_speed[env_ids]
+        )
         for box_idx in range(self.terrain.num_boxes):
             episode[f"box_{box_idx + 1}_pass_rate"] = (
                 (self.passed_box_count[env_ids] > box_idx).float().mean()
@@ -147,16 +168,60 @@ class LeggedRobotBox(LeggedRobot):
         super()._reset_buffers(env_ids)
         if hasattr(self, "box_progress"):
             self.box_progress.reset(env_ids)
+        if hasattr(self, "forward_speed_sum"):
+            self.forward_speed_sum[env_ids] = 0.0
+            self.max_forward_speed[env_ids] = -torch.inf
 
-    def _reward_lin_vel_x(self):
-        """Reward signed world-x velocity without rewarding excess speed."""
-        return torch.clamp(self.root_states[:, 7], max=1.2)
+    def _near_box_for_speed_control(self):
+        """Return environments inside a short approach/exit window of any box."""
+        cfg = self.cfg.rewards
+        base_x = self.root_states[:, 0].unsqueeze(1)
+        base_y = self.root_states[:, 1].unsqueeze(1)
+        near_x = (
+            (base_x >= self.env_box_bounds[:, :, 0] - cfg.box_approach_distance)
+            & (base_x <= self.env_box_bounds[:, :, 1] + cfg.box_exit_distance)
+        )
+        near_y = (
+            (base_y >= self.env_box_bounds[:, :, 2] - cfg.box_lateral_margin)
+            & (base_y <= self.env_box_bounds[:, :, 3] + cfg.box_lateral_margin)
+        )
+        return torch.any(near_x & near_y, dim=1)
+
+    def _positive_speed_allowance(self):
+        """Allow a small positive speed error only near a box."""
+        return self._near_box_for_speed_control().to(
+            self.base_lin_vel.dtype
+        ) * self.cfg.rewards.box_speed_allowance
+
+    def _reward_speed_error_square(self):
+        """Penalize command error while preserving a short box-speed allowance."""
+        speed_error = self.base_lin_vel[:, 0] - self.commands[:, 0]
+        allowance = self._positive_speed_allowance()
+        adjusted_error = torch.where(
+            speed_error > 0.0,
+            torch.relu(speed_error - allowance),
+            speed_error,
+        )
+        return torch.square(adjusted_error)
 
     def _reward_overspeed(self):
-        """Penalize body-frame speed above the command plus a jump margin."""
-        return torch.relu(
-            self.base_lin_vel[:, 0] - self.commands[:, 0] - 0.4
+        """Quadratically penalize speed above the local flat/box margin."""
+        near_box = self._near_box_for_speed_control()
+        margin = torch.where(
+            near_box,
+            torch.full_like(
+                self.base_lin_vel[:, 0],
+                self.cfg.rewards.box_overspeed_margin,
+            ),
+            torch.full_like(
+                self.base_lin_vel[:, 0],
+                self.cfg.rewards.flat_overspeed_margin,
+            ),
         )
+        excess_speed = torch.relu(
+            self.base_lin_vel[:, 0] - self.commands[:, 0] - margin
+        )
+        return torch.square(excess_speed)
 
     def _reward_lin_pos_y(self):
         """Penalize lateral displacement from the course centerline."""

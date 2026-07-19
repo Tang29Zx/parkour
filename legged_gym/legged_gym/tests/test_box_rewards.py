@@ -304,7 +304,7 @@ class BoxRewardTest(unittest.TestCase):
         expected_scales = {
             "tracking_lin_vel": 1.0,
             "tracking_ang_vel": 0.2,
-            "lin_vel_x": 0.5,
+            "speed_error_square": -1.0,
             "overspeed": -1.5,
             "lin_pos_y": -0.1,
             "yaw_abs": -0.1,
@@ -352,27 +352,54 @@ class BoxRewardTest(unittest.TestCase):
         self.assertEqual(timeout.tolist(), [0.0, 1.0, 0.0])
         self.assertEqual(termination.tolist(), [0, 0, 1])
 
-    def test_signed_forward_reward(self):
-        env = SimpleNamespace(root_states=torch.zeros(3, 13))
-        env.root_states[:, 7] = torch.tensor([0.8, -0.3, 2.0])
-        reward = self.LeggedRobotBox._reward_lin_vel_x(env)
-        self.assertAlmostEqual(reward[0].item(), 0.8)
-        self.assertAlmostEqual(reward[1].item(), -0.3)
-        self.assertAlmostEqual(reward[2].item(), 1.2)
-
-    def test_overspeed_reward_has_command_relative_margin(self):
-        env = SimpleNamespace(
-            base_lin_vel=torch.tensor([[0.8, 0.0, 0.0],
-                                       [1.0, 0.0, 0.0],
-                                       [1.5, 0.0, 0.0],
-                                       [2.8, 0.0, 0.0]]),
-            commands=torch.tensor([[0.6, 0.0, 0.0]]).repeat(4, 1),
+    def make_speed_reward_env(self):
+        rewards = SimpleNamespace(
+            box_approach_distance=0.8,
+            box_exit_distance=0.35,
+            box_lateral_margin=0.2,
+            box_speed_allowance=0.4,
+            flat_overspeed_margin=0.2,
+            box_overspeed_margin=0.4,
         )
+        bounds = torch.tensor(
+            [
+                [[2.0, 3.0, -0.5, 0.5, 0.4]],
+                [[0.5, 1.5, -0.5, 0.5, 0.4]],
+                [[0.5, 1.5, -0.5, 0.5, 0.4]],
+            ]
+        )
+        root_states = torch.zeros(3, 13)
+        root_states[2, 1] = 1.0
+        env = object.__new__(self.LeggedRobotBox)
+        env.cfg = SimpleNamespace(rewards=rewards)
+        env.root_states = root_states
+        env.env_box_bounds = bounds
+        env.base_lin_vel = torch.tensor(
+            [[1.0, 0.0, 0.0], [1.0, 0.0, 0.0], [1.0, 0.0, 0.0]]
+        )
+        env.commands = torch.tensor([[0.5, 0.0, 0.0]]).repeat(3, 1)
+        return env
+
+    def test_speed_error_is_square_and_allows_only_near_box_acceleration(self):
+        env = self.make_speed_reward_env()
+        reward = self.LeggedRobotBox._reward_speed_error_square(env)
+
+        torch.testing.assert_close(
+            reward,
+            torch.tensor([0.25, 0.01, 0.25]),
+        )
+
+        env.base_lin_vel[:, 0] = 0.2
+        reward = self.LeggedRobotBox._reward_speed_error_square(env)
+        torch.testing.assert_close(reward, torch.full((3,), 0.09))
+
+    def test_overspeed_is_square_with_flat_and_box_margins(self):
+        env = self.make_speed_reward_env()
         reward = self.LeggedRobotBox._reward_overspeed(env)
 
         torch.testing.assert_close(
             reward,
-            torch.tensor([0.0, 0.0, 0.5, 1.8]),
+            torch.tensor([0.09, 0.01, 0.09]),
         )
 
     def test_4096_event_reward_shapes(self):
@@ -454,10 +481,10 @@ class BoxRewardTest(unittest.TestCase):
         runner = self.train_cfg.runner
         algorithm = self.train_cfg.algorithm
         self.assertTrue(runner.resume)
-        self.assertEqual(runner.checkpoint, 11500)
+        self.assertEqual(runner.checkpoint, 11700)
         self.assertEqual(
             runner.run_name,
-            "five_box_v5_overspeed15_from11500",
+            "five_box_v7_speed_control_from11700",
         )
         self.assertEqual(runner.ckpt_manipulator, "reset_optimizer_state")
         self.assertTrue(

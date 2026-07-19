@@ -60,9 +60,7 @@ class Go2BoxParkourCfg(DebugGo2BoxCfg):
         class scales:
             tracking_lin_vel = 1.0
             tracking_ang_vel = 0.2
-            # Keep progress useful but cap its raw reward at 1.2 m/s.
-            lin_vel_x = 0.5
-            # Allow short jump bursts up to 0.4 m/s above the command.
+            speed_error_square = -1.0
             overspeed = -1.5
             lin_pos_y = -0.1
             yaw_abs = -0.1
@@ -81,6 +79,14 @@ class Go2BoxParkourCfg(DebugGo2BoxCfg):
             episode_timeout = -250.0
 
         only_positive_rewards = False
+        # Track the command closely on flat ground. Near a box, allow a brief
+        # positive speed error for jumping or climbing without rewarding it.
+        box_approach_distance = 0.8
+        box_exit_distance = 0.35
+        box_lateral_margin = 0.2
+        box_speed_allowance = 0.4
+        flat_overspeed_margin = 0.2
+        box_overspeed_margin = 0.4
 
     class box_progress:
         pass_margin = 0.15
@@ -110,7 +116,7 @@ class Go2BoxParkourCfgPPO(Go2RoughCfgPPO):
 
     class runner(Go2RoughCfgPPO.runner):
         experiment_name = "go2_box_parkour"
-        run_name = "five_box_v5_overspeed15_from11500"
+        run_name = "five_box_v7_speed_control_from11700"
         resume = True
         load_run = osp.join(
             osp.dirname(osp.dirname(osp.dirname(osp.dirname(__file__)))),
@@ -118,6 +124,6 @@ class Go2BoxParkourCfgPPO(Go2RoughCfgPPO):
             "go2_box_parkour",
             "Jul19_23-03-03_five_box_v5_stable_from11000",
         )
-        checkpoint = 11500
+        checkpoint = 11700
         ckpt_manipulator = "reset_optimizer_state"
         max_iterations = 2000
