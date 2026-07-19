@@ -116,11 +116,13 @@ class BoxRewardTest(unittest.TestCase):
             Go2BoxParkourCfg,
             Go2BoxParkourCfgPPO,
         )
+        from legged_gym.envs.go2.debug_go2_box_config import DebugGo2BoxCfg
 
         cls.LeggedRobot = LeggedRobot
         cls.LeggedRobotBox = LeggedRobotBox
         cls.env_cfg = Go2BoxParkourCfg
         cls.train_cfg = Go2BoxParkourCfgPPO
+        cls.debug_cfg = DebugGo2BoxCfg
 
     def test_event_scale_values_after_control_dt(self):
         scales = self.env_cfg.rewards.scales
@@ -198,6 +200,25 @@ class BoxRewardTest(unittest.TestCase):
         self.assertEqual(commands.ranges.lin_vel_y, [0.0, 0.0])
         self.assertEqual(commands.ranges.ang_vel_yaw, [0.0, 0.0])
         self.assertGreater(commands.resampling_time, self.env_cfg.env.episode_length_s)
+
+    def test_4096_environments_use_many_physical_tracks(self):
+        terrain = self.env_cfg.terrain
+        physical_tracks = terrain.num_rows * terrain.num_cols
+        self.assertEqual((terrain.num_rows, terrain.num_cols), (8, 64))
+        self.assertEqual(physical_tracks, 512)
+        self.assertEqual(
+            terrain.RandomBoxTrack_kwargs["num_unique_layouts"],
+            4,
+        )
+        self.assertEqual(self.env_cfg.env.num_envs // physical_tracks, 8)
+
+    def test_geometry_debug_task_keeps_four_physical_tracks(self):
+        terrain = self.debug_cfg.terrain
+        self.assertEqual((terrain.num_rows, terrain.num_cols), (1, 4))
+        self.assertNotIn(
+            "num_unique_layouts",
+            terrain.RandomBoxTrack_kwargs,
+        )
 
     def test_checkpoint_source_is_locked(self):
         runner = self.train_cfg.runner

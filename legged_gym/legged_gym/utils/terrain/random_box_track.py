@@ -15,6 +15,7 @@ class RandomBoxTrack:
     default_kwargs = dict(
         randomize=False,
         seed=0,
+        num_unique_layouts=None,
         track_length=10.7,
         track_width=2.0,
         spawn_margin=0.6,
@@ -55,6 +56,21 @@ class RandomBoxTrack:
         self.seed = int(self.track_kwargs["seed"])
         self.env_length = float(self.track_kwargs["track_length"])
         self.env_width = float(self.track_kwargs["track_width"])
+        self.num_physical_tracks = self.cfg.num_rows * self.cfg.num_cols
+        configured_layouts = self.track_kwargs["num_unique_layouts"]
+        if configured_layouts is None:
+            self.num_unique_layouts = self.num_physical_tracks
+            self.repeat_layouts = False
+        else:
+            if not isinstance(configured_layouts, (int, np.integer)):
+                raise TypeError("num_unique_layouts must be an integer or None.")
+            self.num_unique_layouts = int(configured_layouts)
+            self.repeat_layouts = True
+        if not 1 <= self.num_unique_layouts <= self.num_physical_tracks:
+            raise ValueError(
+                "num_unique_layouts must be between 1 and the number of "
+                "physical tracks."
+            )
         self.env_origins = np.zeros(
             (self.cfg.num_rows, self.cfg.num_cols, 3), dtype=np.float32
         )
@@ -256,6 +272,8 @@ class RandomBoxTrack:
         for row_idx in range(self.cfg.num_rows):
             metadata_row = []
             for col_idx in range(self.cfg.num_cols):
+                physical_track_idx = row_idx * self.cfg.num_cols + col_idx
+                layout_idx = physical_track_idx % self.num_unique_layouts
                 track_x0_px = self.border + row_idx * self.track_length_px
                 track_y0_px = self.border + col_idx * self.track_width_px
                 spawn_x_px = track_x0_px + self.spawn_margin_px
@@ -270,8 +288,12 @@ class RandomBoxTrack:
                     dtype=np.float32,
                 )
                 self.env_origins[row_idx, col_idx] = spawn_world
+                if self.repeat_layouts:
+                    seed_sequence = [self.seed, 0, layout_idx]
+                else:
+                    seed_sequence = [self.seed, row_idx, col_idx]
                 rng = np.random.default_rng(
-                    np.random.SeedSequence([self.seed, row_idx, col_idx])
+                    np.random.SeedSequence(seed_sequence)
                 )
                 box_specs = []
                 forward_distance = 0.0
@@ -395,8 +417,10 @@ class RandomBoxTrack:
                     dict(
                         layout_id=(
                             f"{'random' if self.track_kwargs['randomize'] else 'fixed'}"
-                            f"_five_box_v1_r{row_idx}_c{col_idx}"
+                            f"_five_box_v1_layout{layout_idx}_r{row_idx}_c{col_idx}"
                         ),
+                        layout_index=layout_idx,
+                        physical_track_index=physical_track_idx,
                         seed=self.seed,
                         row=row_idx,
                         col=col_idx,

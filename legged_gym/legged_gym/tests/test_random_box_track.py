@@ -225,6 +225,52 @@ class RandomBoxTrackTest(unittest.TestCase):
             final_box_rear = layout["boxes"][-1]["box_max"][0]
             self.assertGreaterEqual(track_end - final_box_rear, 1.3 - 1e-6)
 
+    def test_four_layouts_repeat_across_separated_physical_tracks(self):
+        repeat_cfg = deepcopy(self.cfg)
+        repeat_cfg.num_rows = 2
+        repeat_cfg.num_cols = 8
+        repeat_cfg.RandomBoxTrack_kwargs.update(
+            randomize=True,
+            num_unique_layouts=4,
+            track_length=15.5,
+            first_gap_range=(0.8, 1.2),
+            gap_distributions=[
+                dict(name="dense", range=(0.45, 0.75), weight=0.2),
+                dict(name="normal", range=(0.75, 1.20), weight=0.6),
+                dict(name="sparse", range=(1.20, 1.60), weight=0.2),
+            ],
+            high_box_threshold=0.4,
+            post_high_min_gap=0.8,
+        )
+
+        terrain = self.RandomBoxTrack(repeat_cfg, num_robots=128)
+        signatures = {}
+        origins = terrain.env_origins.reshape(-1, 3)
+        self.assertEqual(len(self.np.unique(origins, axis=0)), 16)
+        self.assertEqual(terrain.num_physical_tracks, 16)
+        self.assertEqual(terrain.num_unique_layouts, 4)
+
+        for metadata_row in terrain.layout_metadata:
+            for layout in metadata_row:
+                signature = tuple(box["gap"] for box in layout["boxes"])
+                layout_idx = layout["layout_index"]
+                if layout_idx in signatures:
+                    self.assertEqual(signature, signatures[layout_idx])
+                else:
+                    signatures[layout_idx] = signature
+        self.assertEqual(set(signatures), {0, 1, 2, 3})
+        self.assertEqual(len(set(signatures.values())), 4)
+
+    def test_repeated_layout_count_is_validated(self):
+        invalid_cfg = deepcopy(self.cfg)
+        invalid_cfg.RandomBoxTrack_kwargs["num_unique_layouts"] = 0
+        with self.assertRaises(ValueError):
+            self.RandomBoxTrack(invalid_cfg, num_robots=4)
+
+        invalid_cfg.RandomBoxTrack_kwargs["num_unique_layouts"] = 5
+        with self.assertRaises(ValueError):
+            self.RandomBoxTrack(invalid_cfg, num_robots=4)
+
     def test_box_bounds_tensor_query(self):
         import torch
 

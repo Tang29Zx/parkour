@@ -256,7 +256,7 @@ class OnPolicyRunner:
         torch.save(run_state_dict, path)
 
     def load(self, path, load_optimizer=True):
-        loaded_dict = torch.load(path)
+        loaded_dict = torch.load(path, map_location=self.device)
         if self.cfg.get("ckpt_manipulator", False):
             # suppose to be a string specifying which function to use
             print("\033[1;36m Warning: using a hacky way to load the model. \033[0m")

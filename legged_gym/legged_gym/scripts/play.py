@@ -109,6 +109,13 @@ def play(args):
         ]
         env_cfg.terrain.BarrierTrack_kwargs["leap"]["fake_offset"] = 0.1
         env_cfg.terrain.BarrierTrack_kwargs["draw_virtual_terrain"] = True
+    elif env_cfg.terrain.selected == "RandomBoxTrack":
+        env_cfg.env.num_envs = min(env_cfg.env.num_envs, 1)
+        env_cfg.env.episode_length_s = 60
+        env_cfg.terrain.max_init_terrain_level = 0
+        env_cfg.terrain.num_rows = 1
+        env_cfg.terrain.num_cols = 1
+        env_cfg.terrain.RandomBoxTrack_kwargs["num_unique_layouts"] = 1
     else:
         env_cfg.env.num_envs = min(env_cfg.env.num_envs, 1)
         env_cfg.env.episode_length_s = 60
@@ -125,8 +132,9 @@ def play(args):
         env_cfg.commands.ranges.lin_vel_x = [1.2, 1.2]
     env_cfg.domain_rand.push_robots = False
     if not debug_geometry:
+        initial_x = 0.0 if env_cfg.terrain.selected == "RandomBoxTrack" else 0.6
         env_cfg.domain_rand.init_base_pos_range = dict(
-            x= [0.6, 0.6],
+            x= [initial_x, initial_x],
             y= [-0.05, 0.05],
         )
     # env_cfg.termination.termination_terms = []

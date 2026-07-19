@@ -26,6 +26,12 @@ class Go2BoxParkourCfg(DebugGo2BoxCfg):
         RandomBoxTrack_kwargs = deepcopy(
             DebugGo2BoxCfg.terrain.RandomBoxTrack_kwargs
         )
+        # Spread 4096 actors over 512 physical tracks while repeating only the
+        # same four logical layouts. This avoids GPU broad-phase pair overflow.
+        num_rows = 8
+        num_cols = 64
+        max_init_terrain_level = 7
+        RandomBoxTrack_kwargs["num_unique_layouts"] = 4
         # Oracle scan aligned with the existing 3 m forward-depth camera range.
         measured_points_x = np.linspace(-0.5, 3.0, 36).tolist()
         measured_points_y = np.linspace(-0.8, 0.8, 17).tolist()
