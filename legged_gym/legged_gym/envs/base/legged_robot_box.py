@@ -61,6 +61,8 @@ class LeggedRobotBox(LeggedRobot):
         self.passed_box_count = tracker.passed_box_count
         self.foot_contact_mask = tracker.foot_contact_mask
         self.box_passed_buf = tracker.box_passed_buf
+        self.first_foot_contact_buf = tracker.first_foot_contact_buf
+        self.second_foot_contact_buf = tracker.second_foot_contact_buf
         self.success_buf = tracker.success_buf
         self.missed_box_buf = tracker.missed_box_buf
         self.out_of_track_buf = tracker.out_of_track_buf
@@ -163,6 +165,14 @@ class LeggedRobotBox(LeggedRobot):
     def _reward_box_passed(self):
         """Emit one event when the current box is passed."""
         return self.box_passed_buf.float()
+
+    def _reward_box_first_foot_contact(self):
+        """Emit one event when the first distinct foot reaches a box top."""
+        return self.first_foot_contact_buf.float()
+
+    def _reward_box_second_foot_contact(self):
+        """Emit one event when the second distinct foot reaches a box top."""
+        return self.second_foot_contact_buf.float()
 
     def _reward_success(self):
         """Emit one event after all five boxes and a stable landing."""

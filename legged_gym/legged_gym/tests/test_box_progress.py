@@ -101,6 +101,37 @@ class BoxProgressTrackerTest(unittest.TestCase):
         self.assertEqual(self.tracker.passed_box_count[0].item(), 1)
         self.assertEqual(self.tracker.next_box_idx[0].item(), 1)
 
+    def test_first_and_second_foot_events_are_distinct_and_one_shot(self):
+        self.put_foot_on_box(0, 0, 0)
+        self.update()
+        self.assertTrue(self.tracker.first_foot_contact_buf[0])
+        self.assertFalse(self.tracker.second_foot_contact_buf[0])
+
+        self.update()
+        self.assertFalse(self.tracker.first_foot_contact_buf[0])
+        self.assertFalse(self.tracker.second_foot_contact_buf[0])
+
+        self.put_foot_on_box(0, 1, 0)
+        self.update()
+        self.assertFalse(self.tracker.first_foot_contact_buf[0])
+        self.assertTrue(self.tracker.second_foot_contact_buf[0])
+
+        self.put_foot_on_box(0, 2, 0)
+        self.update()
+        self.assertFalse(self.tracker.first_foot_contact_buf[0])
+        self.assertFalse(self.tracker.second_foot_contact_buf[0])
+
+    def test_two_feet_on_the_same_step_emit_both_events_once(self):
+        self.put_foot_on_box(0, 0, 0)
+        self.put_foot_on_box(0, 1, 0)
+        self.update()
+
+        self.assertTrue(self.tracker.first_foot_contact_buf[0])
+        self.assertTrue(self.tracker.second_foot_contact_buf[0])
+        self.update()
+        self.assertFalse(self.tracker.first_foot_contact_buf[0])
+        self.assertFalse(self.tracker.second_foot_contact_buf[0])
+
     def test_repeating_one_foot_does_not_satisfy_two_foot_rule(self):
         self.put_foot_on_box(0, 0, 0)
         self.update()
@@ -187,6 +218,8 @@ class BoxProgressTrackerTest(unittest.TestCase):
         self.tracker.body_contact_counter[:] = 4
         self.tracker.landing_counter[:] = 5
         self.tracker.box_passed_buf[:] = True
+        self.tracker.first_foot_contact_buf[:] = True
+        self.tracker.second_foot_contact_buf[:] = True
         self.tracker.success_buf[:] = True
         self.tracker.missed_box_buf[:] = True
         self.tracker.out_of_track_buf[:] = True
@@ -201,6 +234,8 @@ class BoxProgressTrackerTest(unittest.TestCase):
             self.tracker.body_contact_counter,
             self.tracker.landing_counter,
             self.tracker.box_passed_buf,
+            self.tracker.first_foot_contact_buf,
+            self.tracker.second_foot_contact_buf,
             self.tracker.success_buf,
             self.tracker.missed_box_buf,
             self.tracker.out_of_track_buf,
@@ -213,6 +248,8 @@ class BoxProgressTrackerTest(unittest.TestCase):
         tracker = self.BoxProgressTracker(4096, 4, 5, "cpu")
         self.assertEqual(tuple(tracker.next_box_idx.shape), (4096,))
         self.assertEqual(tuple(tracker.foot_contact_mask.shape), (4096, 4))
+        self.assertEqual(tuple(tracker.first_foot_contact_buf.shape), (4096,))
+        self.assertEqual(tuple(tracker.second_foot_contact_buf.shape), (4096,))
         self.assertEqual(tuple(tracker.success_buf.shape), (4096,))
 
 

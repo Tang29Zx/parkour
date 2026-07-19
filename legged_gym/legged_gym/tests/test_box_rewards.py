@@ -143,26 +143,34 @@ class BoxRewardTest(unittest.TestCase):
         for name, expected in expected_scales.items():
             self.assertEqual(getattr(scales, name), expected)
         dt = 0.02
-        self.assertAlmostEqual(scales.box_passed * dt, 2.0)
+        self.assertAlmostEqual(scales.box_first_foot_contact * dt, 0.5)
+        self.assertAlmostEqual(scales.box_second_foot_contact * dt, 0.5)
+        self.assertAlmostEqual(scales.box_passed * dt, 5.0)
         self.assertAlmostEqual(scales.success * dt, 10.0)
-        self.assertAlmostEqual(scales.termination * dt, -5.0)
-        self.assertAlmostEqual(scales.episode_timeout * dt, -2.0)
+        self.assertAlmostEqual(scales.termination * dt, -2.0)
+        self.assertAlmostEqual(scales.episode_timeout * dt, -3.0)
         self.assertFalse(self.env_cfg.rewards.only_positive_rewards)
         self.assertFalse(hasattr(scales, "lazy_stop"))
 
     def test_event_buffers_and_success_timeout_semantics(self):
         env = SimpleNamespace(
+            first_foot_contact_buf=torch.tensor([True, False, False]),
+            second_foot_contact_buf=torch.tensor([False, True, False]),
             box_passed_buf=torch.tensor([True, False, False]),
             success_buf=torch.tensor([True, False, False]),
             episode_timeout_buf=torch.tensor([False, True, False]),
             reset_buf=torch.tensor([True, True, True]),
             time_out_buf=torch.tensor([True, True, False]),
         )
+        first_foot = self.LeggedRobotBox._reward_box_first_foot_contact(env)
+        second_foot = self.LeggedRobotBox._reward_box_second_foot_contact(env)
         passed = self.LeggedRobotBox._reward_box_passed(env)
         success = self.LeggedRobotBox._reward_success(env)
         timeout = self.LeggedRobotBox._reward_episode_timeout(env)
         termination = self.LeggedRobot._reward_termination(env)
 
+        self.assertEqual(first_foot.tolist(), [1.0, 0.0, 0.0])
+        self.assertEqual(second_foot.tolist(), [0.0, 1.0, 0.0])
         self.assertEqual(passed.tolist(), [1.0, 0.0, 0.0])
         self.assertEqual(success.tolist(), [1.0, 0.0, 0.0])
         self.assertEqual(timeout.tolist(), [0.0, 1.0, 0.0])
@@ -177,9 +185,19 @@ class BoxRewardTest(unittest.TestCase):
 
     def test_4096_event_reward_shapes(self):
         env = SimpleNamespace(
+            first_foot_contact_buf=torch.zeros(4096, dtype=torch.bool),
+            second_foot_contact_buf=torch.zeros(4096, dtype=torch.bool),
             box_passed_buf=torch.zeros(4096, dtype=torch.bool),
             success_buf=torch.zeros(4096, dtype=torch.bool),
             episode_timeout_buf=torch.zeros(4096, dtype=torch.bool),
+        )
+        self.assertEqual(
+            self.LeggedRobotBox._reward_box_first_foot_contact(env).shape,
+            (4096,),
+        )
+        self.assertEqual(
+            self.LeggedRobotBox._reward_box_second_foot_contact(env).shape,
+            (4096,),
         )
         self.assertEqual(
             self.LeggedRobotBox._reward_box_passed(env).shape,
@@ -196,7 +214,7 @@ class BoxRewardTest(unittest.TestCase):
 
     def test_commands_are_per_episode_and_in_locked_range(self):
         commands = self.env_cfg.commands
-        self.assertEqual(commands.ranges.lin_vel_x, [0.5, 1.2])
+        self.assertEqual(commands.ranges.lin_vel_x, [0.4, 0.8])
         self.assertEqual(commands.ranges.lin_vel_y, [0.0, 0.0])
         self.assertEqual(commands.ranges.ang_vel_yaw, [0.0, 0.0])
         self.assertGreater(commands.resampling_time, self.env_cfg.env.episode_length_s)
@@ -223,7 +241,8 @@ class BoxRewardTest(unittest.TestCase):
     def test_checkpoint_source_is_locked(self):
         runner = self.train_cfg.runner
         self.assertTrue(runner.resume)
-        self.assertEqual(runner.checkpoint, 8400)
+        self.assertEqual(runner.checkpoint, 9700)
+        self.assertEqual(runner.run_name, "five_box_contact_v2_from9700")
         self.assertEqual(
             runner.ckpt_manipulator, "reinitialize_height_encoders"
         )

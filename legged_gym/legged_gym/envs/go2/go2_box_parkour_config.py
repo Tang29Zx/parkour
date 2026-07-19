@@ -42,7 +42,8 @@ class Go2BoxParkourCfg(DebugGo2BoxCfg):
         resampling_time = 1e16
 
         class ranges(DebugGo2BoxCfg.commands.ranges):
-            lin_vel_x = [0.5, 1.2]
+            # Stage-one range; restore [0.5, 1.2] after box-top contact emerges.
+            lin_vel_x = [0.4, 0.8]
             lin_vel_y = [0.0, 0.0]
             ang_vel_yaw = [0.0, 0.0]
 
@@ -69,10 +70,12 @@ class Go2BoxParkourCfg(DebugGo2BoxCfg):
             collision = -0.05
             exceed_dof_pos_limits = -0.1
             exceed_torque_limits_l1norm = -0.1
-            box_passed = 100.0
+            box_first_foot_contact = 25.0
+            box_second_foot_contact = 25.0
+            box_passed = 250.0
             success = 500.0
-            termination = -250.0
-            episode_timeout = -100.0
+            termination = -100.0
+            episode_timeout = -150.0
 
         only_positive_rewards = False
 
@@ -98,7 +101,7 @@ class Go2BoxParkourCfgPPO(Go2RoughCfgPPO):
 
     class runner(Go2RoughCfgPPO.runner):
         experiment_name = "go2_box_parkour"
-        run_name = "five_box_reward_v1_from8400"
+        run_name = "five_box_contact_v2_from9700"
         resume = True
         load_run = osp.join(
             osp.dirname(osp.dirname(osp.dirname(osp.dirname(__file__)))),
@@ -106,6 +109,6 @@ class Go2BoxParkourCfgPPO(Go2RoughCfgPPO):
             "rough_go2",
             "Jul19_13-30-09_hold_from_2000_to_10000",
         )
-        checkpoint = 8400
+        checkpoint = 9700
         ckpt_manipulator = "reinitialize_height_encoders"
         max_iterations = 2000

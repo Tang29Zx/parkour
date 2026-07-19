@@ -56,6 +56,8 @@ class BoxProgressTracker:
         self.box_passed_buf = torch.zeros(
             self.num_envs, dtype=torch.bool, device=device
         )
+        self.first_foot_contact_buf = torch.zeros_like(self.box_passed_buf)
+        self.second_foot_contact_buf = torch.zeros_like(self.box_passed_buf)
         self.success_buf = torch.zeros_like(self.box_passed_buf)
         self.missed_box_buf = torch.zeros_like(self.box_passed_buf)
         self.out_of_track_buf = torch.zeros_like(self.box_passed_buf)
@@ -75,6 +77,8 @@ class BoxProgressTracker:
         if env_ids is None:
             env_ids = slice(None)
         self.box_passed_buf[env_ids] = False
+        self.first_foot_contact_buf[env_ids] = False
+        self.second_foot_contact_buf[env_ids] = False
         self.success_buf[env_ids] = False
         self.missed_box_buf[env_ids] = False
         self.out_of_track_buf[env_ids] = False
@@ -103,6 +107,7 @@ class BoxProgressTracker:
         target_indices = self.next_box_idx.clamp(max=self.num_boxes - 1)
         target_bounds = box_bounds[env_ids, target_indices]
 
+        previous_contact_count = self.foot_contact_mask.sum(dim=1)
         top_contact = self._get_top_contacts(
             active,
             target_bounds,
@@ -111,9 +116,14 @@ class BoxProgressTracker:
             feet_contact_forces,
         )
         self.foot_contact_mask |= top_contact
-        enough_feet = (
-            self.foot_contact_mask.sum(dim=1) >= self.required_distinct_feet
+        current_contact_count = self.foot_contact_mask.sum(dim=1)
+        self.first_foot_contact_buf[:] = (
+            active & (previous_contact_count < 1) & (current_contact_count >= 1)
         )
+        self.second_foot_contact_buf[:] = (
+            active & (previous_contact_count < 2) & (current_contact_count >= 2)
+        )
+        enough_feet = current_contact_count >= self.required_distinct_feet
         crossed_target = active & (
             base_positions[:, 0] > target_bounds[:, 1] + self.pass_margin
         )
