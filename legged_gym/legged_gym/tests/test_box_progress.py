@@ -164,23 +164,28 @@ class BoxProgressTrackerTest(unittest.TestCase):
         self.assertFalse(self.tracker.box_passed_buf[0])
         self.assertEqual(self.tracker.passed_box_count[0].item(), 1)
 
-    def test_landing_requires_ten_uninterrupted_steps(self):
+    def test_landing_accumulates_distinct_feet_and_upright_steps(self):
         self.tracker.next_box_idx[0] = 5
         self.tracker.passed_box_count[0] = 5
         self.feet_positions[0, :, 0] = 10.5
         self.feet_positions[0, :, 1] = self.torch.tensor([-0.3, 0.3, -0.3, 0.3])
         self.feet_positions[0, :, 2] = 0.0
+        self.base_positions[0, 0] = 10.5
         self.terrain_heights[0] = 0.0
-        self.contact_forces[0, :, 2] = 2.0
 
-        for _ in range(9):
+        for foot_idx in range(4):
+            self.contact_forces[0].zero_()
+            self.contact_forces[0, foot_idx, 2] = 2.0
             self.update()
+        self.assertTrue(self.tracker.landing_foot_contact_mask[0].all())
         self.assertFalse(self.tracker.success_buf[0])
-        self.contact_forces[0, 0] = 0.0
+
+        self.roll[0] = 1.5
         self.update()
         self.assertEqual(self.tracker.landing_counter[0].item(), 0)
 
-        self.contact_forces[0, 0, 2] = 2.0
+        self.roll[0] = 0.0
+        self.contact_forces[0].zero_()
         self.natural_timeout[0] = True
         for _ in range(10):
             self.update()
@@ -215,6 +220,7 @@ class BoxProgressTrackerTest(unittest.TestCase):
         self.tracker.next_box_idx[:] = 3
         self.tracker.passed_box_count[:] = 3
         self.tracker.foot_contact_mask[:] = True
+        self.tracker.landing_foot_contact_mask[:] = True
         self.tracker.body_contact_counter[:] = 4
         self.tracker.landing_counter[:] = 5
         self.tracker.box_passed_buf[:] = True
@@ -231,6 +237,7 @@ class BoxProgressTrackerTest(unittest.TestCase):
             self.tracker.next_box_idx,
             self.tracker.passed_box_count,
             self.tracker.foot_contact_mask,
+            self.tracker.landing_foot_contact_mask,
             self.tracker.body_contact_counter,
             self.tracker.landing_counter,
             self.tracker.box_passed_buf,
@@ -248,6 +255,9 @@ class BoxProgressTrackerTest(unittest.TestCase):
         tracker = self.BoxProgressTracker(4096, 4, 5, "cpu")
         self.assertEqual(tuple(tracker.next_box_idx.shape), (4096,))
         self.assertEqual(tuple(tracker.foot_contact_mask.shape), (4096, 4))
+        self.assertEqual(
+            tuple(tracker.landing_foot_contact_mask.shape), (4096, 4)
+        )
         self.assertEqual(tuple(tracker.first_foot_contact_buf.shape), (4096,))
         self.assertEqual(tuple(tracker.second_foot_contact_buf.shape), (4096,))
         self.assertEqual(tuple(tracker.success_buf.shape), (4096,))

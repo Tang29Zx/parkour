@@ -50,6 +50,9 @@ class BoxProgressTracker:
         self.foot_contact_mask = torch.zeros(
             self.num_envs, self.num_feet, dtype=torch.bool, device=device
         )
+        self.landing_foot_contact_mask = torch.zeros_like(
+            self.foot_contact_mask
+        )
         self.body_contact_counter = torch.zeros_like(self.next_box_idx)
         self.landing_counter = torch.zeros_like(self.next_box_idx)
 
@@ -69,6 +72,7 @@ class BoxProgressTracker:
         self.next_box_idx[env_ids] = 0
         self.passed_box_count[env_ids] = 0
         self.foot_contact_mask[env_ids] = False
+        self.landing_foot_contact_mask[env_ids] = False
         self.body_contact_counter[env_ids] = 0
         self.landing_counter[env_ids] = 0
         self._clear_events(env_ids)
@@ -150,22 +154,39 @@ class BoxProgressTracker:
                 <= self.top_contact_tolerance
             )
             & force_contact
-        ).all(dim=1)
+        )
         course_complete = self.next_box_idx == self.num_boxes
-        stable_landing = course_complete & post_box_ground
+        self.landing_foot_contact_mask |= (
+            course_complete.unsqueeze(1) & post_box_ground
+        )
+        all_feet_landed = self.landing_foot_contact_mask.all(dim=1)
+        base_height = base_positions[:, 2] - env_origins[:, 2]
+        stable_landing = (
+            course_complete
+            & (base_positions[:, 0] > final_rear)
+            & (base_positions[:, 0] < track_end_x)
+            & (
+                torch.abs(base_positions[:, 1] - env_origins[:, 1])
+                <= self.lateral_limit
+            )
+            & (roll.abs() <= self.roll_threshold)
+            & (pitch.abs() <= self.pitch_threshold)
+            & (base_height >= self.base_height_threshold)
+        )
         self.landing_counter[:] = torch.where(
             stable_landing,
             self.landing_counter + 1,
             torch.zeros_like(self.landing_counter),
         )
-        self.success_buf[:] = self.landing_counter >= self.landing_steps
+        self.success_buf[:] = all_feet_landed & (
+            self.landing_counter >= self.landing_steps
+        )
 
         self.body_contact_counter[:] = torch.where(
             body_contact,
             self.body_contact_counter + 1,
             torch.zeros_like(self.body_contact_counter),
         )
-        base_height = base_positions[:, 2] - env_origins[:, 2]
         self.fall_buf[:] = (
             (roll.abs() > self.roll_threshold)
             | (pitch.abs() > self.pitch_threshold)

@@ -60,6 +60,7 @@ class LeggedRobotBox(LeggedRobot):
         self.next_box_idx = tracker.next_box_idx
         self.passed_box_count = tracker.passed_box_count
         self.foot_contact_mask = tracker.foot_contact_mask
+        self.landing_foot_contact_mask = tracker.landing_foot_contact_mask
         self.box_passed_buf = tracker.box_passed_buf
         self.first_foot_contact_buf = tracker.first_foot_contact_buf
         self.second_foot_contact_buf = tracker.second_foot_contact_buf

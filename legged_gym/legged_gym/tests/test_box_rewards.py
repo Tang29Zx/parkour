@@ -396,15 +396,15 @@ class BoxRewardTest(unittest.TestCase):
     def test_checkpoint_source_is_locked(self):
         runner = self.train_cfg.runner
         self.assertTrue(runner.resume)
-        self.assertEqual(runner.checkpoint, 10100)
+        self.assertEqual(runner.checkpoint, 10900)
         self.assertEqual(
             runner.run_name,
-            "five_box_reward_v3_from10100",
+            "five_box_landing_v2_from10900",
         )
         self.assertIsNone(runner.ckpt_manipulator)
         self.assertTrue(
             runner.load_run.endswith(
-                "Jul19_21-11-13_five_box_contact_v2_encoder_expand_from9700"
+                "Jul19_21-37-13_five_box_reward_v3_from10200"
             )
         )
 

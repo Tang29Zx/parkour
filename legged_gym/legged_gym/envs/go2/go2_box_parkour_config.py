@@ -103,14 +103,14 @@ class Go2BoxParkourCfgPPO(Go2RoughCfgPPO):
 
     class runner(Go2RoughCfgPPO.runner):
         experiment_name = "go2_box_parkour"
-        run_name = "five_box_reward_v3_from10100"
+        run_name = "five_box_landing_v2_from10900"
         resume = True
         load_run = osp.join(
             osp.dirname(osp.dirname(osp.dirname(osp.dirname(__file__)))),
             "logs",
             "go2_box_parkour",
-            "Jul19_21-11-13_five_box_contact_v2_encoder_expand_from9700",
+            "Jul19_21-37-13_five_box_reward_v3_from10200",
         )
-        checkpoint = 10100
+        checkpoint = 10900
         ckpt_manipulator = None
         max_iterations = 2000
