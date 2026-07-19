@@ -58,9 +58,11 @@ class Go2BoxParkourCfg(DebugGo2BoxCfg):
 
     class rewards(DebugGo2BoxCfg.rewards):
         class scales:
-            tracking_lin_vel = 1.0
-            tracking_ang_vel = 1.0
-            lin_vel_x = 0.5
+            # Reduce rewards that can be collected while bracing at a box.
+            tracking_lin_vel = 0.5
+            tracking_ang_vel = 0.2
+            # Make signed forward displacement matter during the full episode.
+            lin_vel_x = 2.0
             lin_pos_y = -0.1
             yaw_abs = -0.1
             energy_substeps = -2e-7
@@ -71,11 +73,11 @@ class Go2BoxParkourCfg(DebugGo2BoxCfg):
             exceed_dof_pos_limits = -0.1
             exceed_torque_limits_l1norm = -0.1
             box_first_foot_contact = 25.0
-            box_second_foot_contact = 25.0
+            box_second_foot_contact = 100.0
             box_passed = 250.0
             success = 500.0
             termination = -100.0
-            episode_timeout = -150.0
+            episode_timeout = -250.0
 
         only_positive_rewards = False
 
@@ -101,14 +103,14 @@ class Go2BoxParkourCfgPPO(Go2RoughCfgPPO):
 
     class runner(Go2RoughCfgPPO.runner):
         experiment_name = "go2_box_parkour"
-        run_name = "five_box_contact_v2_encoder_expand_from9700"
+        run_name = "five_box_reward_v3_from10100"
         resume = True
         load_run = osp.join(
             osp.dirname(osp.dirname(osp.dirname(osp.dirname(__file__)))),
             "logs",
-            "rough_go2",
-            "Jul19_13-30-09_hold_from_2000_to_10000",
+            "go2_box_parkour",
+            "Jul19_21-11-13_five_box_contact_v2_encoder_expand_from9700",
         )
-        checkpoint = 9700
-        ckpt_manipulator = "expand_height_encoder_inputs"
+        checkpoint = 10100
+        ckpt_manipulator = None
         max_iterations = 2000

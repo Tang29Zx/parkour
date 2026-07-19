@@ -262,9 +262,9 @@ class BoxRewardTest(unittest.TestCase):
     def test_event_scale_values_after_control_dt(self):
         scales = self.env_cfg.rewards.scales
         expected_scales = {
-            "tracking_lin_vel": 1.0,
-            "tracking_ang_vel": 1.0,
-            "lin_vel_x": 0.5,
+            "tracking_lin_vel": 0.5,
+            "tracking_ang_vel": 0.2,
+            "lin_vel_x": 2.0,
             "lin_pos_y": -0.1,
             "yaw_abs": -0.1,
             "energy_substeps": -2e-7,
@@ -279,11 +279,11 @@ class BoxRewardTest(unittest.TestCase):
             self.assertEqual(getattr(scales, name), expected)
         dt = 0.02
         self.assertAlmostEqual(scales.box_first_foot_contact * dt, 0.5)
-        self.assertAlmostEqual(scales.box_second_foot_contact * dt, 0.5)
+        self.assertAlmostEqual(scales.box_second_foot_contact * dt, 2.0)
         self.assertAlmostEqual(scales.box_passed * dt, 5.0)
         self.assertAlmostEqual(scales.success * dt, 10.0)
         self.assertAlmostEqual(scales.termination * dt, -2.0)
-        self.assertAlmostEqual(scales.episode_timeout * dt, -3.0)
+        self.assertAlmostEqual(scales.episode_timeout * dt, -5.0)
         self.assertFalse(self.env_cfg.rewards.only_positive_rewards)
         self.assertFalse(hasattr(scales, "lazy_stop"))
 
@@ -396,15 +396,17 @@ class BoxRewardTest(unittest.TestCase):
     def test_checkpoint_source_is_locked(self):
         runner = self.train_cfg.runner
         self.assertTrue(runner.resume)
-        self.assertEqual(runner.checkpoint, 9700)
+        self.assertEqual(runner.checkpoint, 10100)
         self.assertEqual(
             runner.run_name,
-            "five_box_contact_v2_encoder_expand_from9700",
+            "five_box_reward_v3_from10100",
         )
-        self.assertEqual(
-            runner.ckpt_manipulator, "expand_height_encoder_inputs"
+        self.assertIsNone(runner.ckpt_manipulator)
+        self.assertTrue(
+            runner.load_run.endswith(
+                "Jul19_21-11-13_five_box_contact_v2_encoder_expand_from9700"
+            )
         )
-        self.assertTrue(runner.load_run.endswith("Jul19_13-30-09_hold_from_2000_to_10000"))
 
 
 if __name__ == "__main__":
