@@ -102,16 +102,22 @@ class Go2BoxParkourCfgPPO(Go2RoughCfgPPO):
         critic_encoder_component_names = ["height_measurements"]
         encoder_output_size = 32
 
+    class algorithm(Go2RoughCfgPPO.algorithm):
+        # Use conservative fixed settings while fine-tuning a learned policy.
+        schedule = "fixed"
+        learning_rate = 5e-5
+        entropy_coef = 0.003
+
     class runner(Go2RoughCfgPPO.runner):
         experiment_name = "go2_box_parkour"
-        run_name = "five_box_landing_speed_v2_from10900"
+        run_name = "five_box_v5_stable_from11000"
         resume = True
         load_run = osp.join(
             osp.dirname(osp.dirname(osp.dirname(osp.dirname(__file__)))),
             "logs",
             "go2_box_parkour",
-            "Jul19_21-37-13_five_box_reward_v3_from10200",
+            "Jul19_22-39-47_five_box_v5_from10900",
         )
-        checkpoint = 10900
-        ckpt_manipulator = None
+        checkpoint = 11000
+        ckpt_manipulator = "reset_optimizer_state"
         max_iterations = 2000

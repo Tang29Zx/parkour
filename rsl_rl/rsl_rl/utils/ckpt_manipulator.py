@@ -13,6 +13,43 @@ import torch
 from collections import OrderedDict
 
 
+def reset_optimizer_state(source_state_dict, algo_state_dict):
+    """Keep every model parameter while discarding optimizer state."""
+    source_model = source_state_dict["model_state_dict"]
+    target_model = algo_state_dict["model_state_dict"]
+
+    source_keys = set(source_model)
+    target_keys = set(target_model)
+    if source_keys != target_keys:
+        missing = sorted(target_keys - source_keys)
+        unexpected = sorted(source_keys - target_keys)
+        raise KeyError(
+            "Checkpoint model keys do not match the target model. "
+            f"Missing: {missing}; unexpected: {unexpected}."
+        )
+
+    new_model_state_dict = OrderedDict()
+    for key, target_value in target_model.items():
+        source_value = source_model[key]
+        if source_value.shape != target_value.shape:
+            raise ValueError(
+                f"Parameter {key!r} has incompatible shapes: checkpoint "
+                f"{tuple(source_value.shape)} versus target "
+                f"{tuple(target_value.shape)}."
+            )
+        new_model_state_dict[key] = source_value
+
+    print(
+        "\033[1;36m Kept all checkpoint model parameters; "
+        "reset optimizer and scheduler state. \033[0m"
+    )
+    return dict(
+        model_state_dict=new_model_state_dict,
+        iter=source_state_dict["iter"],
+        infos=source_state_dict.get("infos"),
+    )
+
+
 def reinitialize_height_encoders(source_state_dict, algo_state_dict):
     """Keep the walking policy while reinitializing both height encoders."""
     encoder_prefixes = ("encoders.0.", "critic_encoders.0.")

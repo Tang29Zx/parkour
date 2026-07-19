@@ -109,6 +109,46 @@ class HeightEncoderMigrationTest(unittest.TestCase):
         target = dict(model_state_dict=target_model)
         return source, target
 
+    def test_reset_optimizer_keeps_model_and_discards_training_state(self):
+        source, _ = self.make_states()
+        target_model = OrderedDict(
+            (key, torch.zeros_like(value))
+            for key, value in source["model_state_dict"].items()
+        )
+        migrated = self.module.reset_optimizer_state(
+            source,
+            dict(model_state_dict=target_model),
+        )
+
+        for key, source_value in source["model_state_dict"].items():
+            self.assertTrue(
+                torch.equal(migrated["model_state_dict"][key], source_value)
+            )
+        self.assertNotIn("optimizer_state_dict", migrated)
+        self.assertNotIn("lr_scheduler_state_dict", migrated)
+        self.assertEqual(migrated["iter"], source["iter"])
+        self.assertEqual(migrated["infos"], source["infos"])
+
+    def test_reset_optimizer_rejects_model_mismatches(self):
+        source, _ = self.make_states()
+        target_model = OrderedDict(
+            (key, torch.zeros_like(value))
+            for key, value in source["model_state_dict"].items()
+        )
+        target_model["actor.weight"] = torch.zeros(3, 2)
+        with self.assertRaises(ValueError):
+            self.module.reset_optimizer_state(
+                source,
+                dict(model_state_dict=target_model),
+            )
+
+        del target_model["actor.weight"]
+        with self.assertRaises(KeyError):
+            self.module.reset_optimizer_state(
+                source,
+                dict(model_state_dict=target_model),
+            )
+
     def test_reinitializes_both_encoders_and_keeps_other_model_weights(self):
         source, target = self.make_states()
         migrated = self.module.reinitialize_height_encoders(source, target)
@@ -412,18 +452,22 @@ class BoxRewardTest(unittest.TestCase):
 
     def test_checkpoint_source_is_locked(self):
         runner = self.train_cfg.runner
+        algorithm = self.train_cfg.algorithm
         self.assertTrue(runner.resume)
-        self.assertEqual(runner.checkpoint, 10900)
+        self.assertEqual(runner.checkpoint, 11000)
         self.assertEqual(
             runner.run_name,
-            "five_box_landing_speed_v2_from10900",
+            "five_box_v5_stable_from11000",
         )
-        self.assertIsNone(runner.ckpt_manipulator)
+        self.assertEqual(runner.ckpt_manipulator, "reset_optimizer_state")
         self.assertTrue(
             runner.load_run.endswith(
-                "Jul19_21-37-13_five_box_reward_v3_from10200"
+                "Jul19_22-39-47_five_box_v5_from10900"
             )
         )
+        self.assertEqual(algorithm.schedule, "fixed")
+        self.assertEqual(algorithm.learning_rate, 5e-5)
+        self.assertEqual(algorithm.entropy_coef, 0.003)
 
 
 if __name__ == "__main__":
