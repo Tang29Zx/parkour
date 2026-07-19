@@ -58,11 +58,12 @@ class Go2BoxParkourCfg(DebugGo2BoxCfg):
 
     class rewards(DebugGo2BoxCfg.rewards):
         class scales:
-            # Reduce rewards that can be collected while bracing at a box.
-            tracking_lin_vel = 0.5
+            tracking_lin_vel = 1.0
             tracking_ang_vel = 0.2
-            # Make signed forward displacement matter during the full episode.
-            lin_vel_x = 2.0
+            # Keep progress useful but cap its raw reward at 1.2 m/s.
+            lin_vel_x = 0.5
+            # Allow short jump bursts up to 0.4 m/s above the command.
+            overspeed = -1.0
             lin_pos_y = -0.1
             yaw_abs = -0.1
             energy_substeps = -2e-7
@@ -103,7 +104,7 @@ class Go2BoxParkourCfgPPO(Go2RoughCfgPPO):
 
     class runner(Go2RoughCfgPPO.runner):
         experiment_name = "go2_box_parkour"
-        run_name = "five_box_landing_v2_from10900"
+        run_name = "five_box_landing_speed_v2_from10900"
         resume = True
         load_run = osp.join(
             osp.dirname(osp.dirname(osp.dirname(osp.dirname(__file__)))),

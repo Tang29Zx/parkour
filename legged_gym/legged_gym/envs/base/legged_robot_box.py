@@ -149,8 +149,14 @@ class LeggedRobotBox(LeggedRobot):
             self.box_progress.reset(env_ids)
 
     def _reward_lin_vel_x(self):
-        """Reward signed forward velocity in the world x direction."""
-        return self.root_states[:, 7]
+        """Reward signed world-x velocity without rewarding excess speed."""
+        return torch.clamp(self.root_states[:, 7], max=1.2)
+
+    def _reward_overspeed(self):
+        """Penalize body-frame speed above the command plus a jump margin."""
+        return torch.relu(
+            self.base_lin_vel[:, 0] - self.commands[:, 0] - 0.4
+        )
 
     def _reward_lin_pos_y(self):
         """Penalize lateral displacement from the course centerline."""

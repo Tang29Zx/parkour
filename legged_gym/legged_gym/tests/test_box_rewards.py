@@ -262,9 +262,10 @@ class BoxRewardTest(unittest.TestCase):
     def test_event_scale_values_after_control_dt(self):
         scales = self.env_cfg.rewards.scales
         expected_scales = {
-            "tracking_lin_vel": 0.5,
+            "tracking_lin_vel": 1.0,
             "tracking_ang_vel": 0.2,
-            "lin_vel_x": 2.0,
+            "lin_vel_x": 0.5,
+            "overspeed": -1.0,
             "lin_pos_y": -0.1,
             "yaw_abs": -0.1,
             "energy_substeps": -2e-7,
@@ -312,11 +313,27 @@ class BoxRewardTest(unittest.TestCase):
         self.assertEqual(termination.tolist(), [0, 0, 1])
 
     def test_signed_forward_reward(self):
-        env = SimpleNamespace(root_states=torch.zeros(2, 13))
-        env.root_states[:, 7] = torch.tensor([0.8, -0.3])
+        env = SimpleNamespace(root_states=torch.zeros(3, 13))
+        env.root_states[:, 7] = torch.tensor([0.8, -0.3, 2.0])
         reward = self.LeggedRobotBox._reward_lin_vel_x(env)
         self.assertAlmostEqual(reward[0].item(), 0.8)
         self.assertAlmostEqual(reward[1].item(), -0.3)
+        self.assertAlmostEqual(reward[2].item(), 1.2)
+
+    def test_overspeed_reward_has_command_relative_margin(self):
+        env = SimpleNamespace(
+            base_lin_vel=torch.tensor([[0.8, 0.0, 0.0],
+                                       [1.0, 0.0, 0.0],
+                                       [1.5, 0.0, 0.0],
+                                       [2.8, 0.0, 0.0]]),
+            commands=torch.tensor([[0.6, 0.0, 0.0]]).repeat(4, 1),
+        )
+        reward = self.LeggedRobotBox._reward_overspeed(env)
+
+        torch.testing.assert_close(
+            reward,
+            torch.tensor([0.0, 0.0, 0.5, 1.8]),
+        )
 
     def test_4096_event_reward_shapes(self):
         env = SimpleNamespace(
@@ -399,7 +416,7 @@ class BoxRewardTest(unittest.TestCase):
         self.assertEqual(runner.checkpoint, 10900)
         self.assertEqual(
             runner.run_name,
-            "five_box_landing_v2_from10900",
+            "five_box_landing_speed_v2_from10900",
         )
         self.assertIsNone(runner.ckpt_manipulator)
         self.assertTrue(
