@@ -101,7 +101,7 @@ class Go2BoxParkourCfgPPO(Go2RoughCfgPPO):
 
     class runner(Go2RoughCfgPPO.runner):
         experiment_name = "go2_box_parkour"
-        run_name = "five_box_contact_v2_from9700"
+        run_name = "five_box_contact_v2_encoder_expand_from9700"
         resume = True
         load_run = osp.join(
             osp.dirname(osp.dirname(osp.dirname(osp.dirname(__file__)))),
@@ -110,5 +110,5 @@ class Go2BoxParkourCfgPPO(Go2RoughCfgPPO):
             "Jul19_13-30-09_hold_from_2000_to_10000",
         )
         checkpoint = 9700
-        ckpt_manipulator = "reinitialize_height_encoders"
+        ckpt_manipulator = "expand_height_encoder_inputs"
         max_iterations = 2000

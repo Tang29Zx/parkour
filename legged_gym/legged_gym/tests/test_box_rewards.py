@@ -65,6 +65,50 @@ class HeightEncoderMigrationTest(unittest.TestCase):
         target = dict(model_state_dict=target_model)
         return source, target
 
+    def make_expand_states(self):
+        source_model = OrderedDict(
+            [
+                ("actor.weight", torch.full((2, 2), 1.0)),
+                (
+                    "encoders.0.model.0.weight",
+                    torch.arange(12, dtype=torch.float32).reshape(3, 4),
+                ),
+                ("encoders.0.model.0.bias", torch.arange(3, dtype=torch.float32)),
+                ("encoders.0.model.2.weight", torch.full((2, 3), 2.0)),
+                ("encoders.0.model.2.bias", torch.full((2,), 3.0)),
+                (
+                    "critic_encoders.0.model.0.weight",
+                    torch.arange(12, 24, dtype=torch.float32).reshape(3, 4),
+                ),
+                (
+                    "critic_encoders.0.model.0.bias",
+                    torch.arange(3, 6, dtype=torch.float32),
+                ),
+                ("critic_encoders.0.model.2.weight", torch.full((2, 3), 4.0)),
+                ("critic_encoders.0.model.2.bias", torch.full((2,), 5.0)),
+                ("memory_a.rnn.weight", torch.full((2, 2), 6.0)),
+            ]
+        )
+        target_model = OrderedDict(
+            (
+                key,
+                (
+                    torch.full((3, 12), 99.0)
+                    if key.endswith("model.0.weight")
+                    else torch.full_like(value, 99.0)
+                ),
+            )
+            for key, value in source_model.items()
+        )
+        source = dict(
+            model_state_dict=source_model,
+            optimizer_state_dict={"old": True},
+            iter=9700,
+            infos={"source": "walking"},
+        )
+        target = dict(model_state_dict=target_model)
+        return source, target
+
     def test_reinitializes_both_encoders_and_keeps_other_model_weights(self):
         source, target = self.make_states()
         migrated = self.module.reinitialize_height_encoders(source, target)
@@ -102,6 +146,95 @@ class HeightEncoderMigrationTest(unittest.TestCase):
         with self.assertRaises(KeyError):
             self.module.reinitialize_height_encoders(source, target)
 
+    def test_expands_aligned_encoder_inputs_and_copies_every_other_parameter(self):
+        source, target = self.make_expand_states()
+        migrated = self.module.expand_height_encoder_inputs(
+            source,
+            target,
+            source_grid_shape=(2, 2),
+            target_grid_shape=(3, 4),
+        )
+
+        input_keys = (
+            "encoders.0.model.0.weight",
+            "critic_encoders.0.model.0.weight",
+        )
+        for key in input_keys:
+            source_grid = source["model_state_dict"][key].reshape(3, 2, 2)
+            migrated_grid = migrated["model_state_dict"][key].reshape(3, 3, 4)
+            self.assertTrue(torch.equal(migrated_grid[:, :2, 1:3], source_grid))
+
+            extra_mask = torch.ones(3, 4, dtype=torch.bool)
+            extra_mask[:2, 1:3] = False
+            self.assertTrue((migrated_grid[:, extra_mask] == 0.0).all())
+
+        for key, source_value in source["model_state_dict"].items():
+            if key not in input_keys:
+                self.assertTrue(
+                    torch.equal(migrated["model_state_dict"][key], source_value)
+                )
+        self.assertNotIn("optimizer_state_dict", migrated)
+        self.assertEqual(migrated["iter"], 9700)
+
+    def test_expanded_encoder_preserves_output_for_the_source_grid(self):
+        source, target = self.make_expand_states()
+        migrated = self.module.expand_height_encoder_inputs(
+            source,
+            target,
+            source_grid_shape=(2, 2),
+            target_grid_shape=(3, 4),
+        )
+        source_observations = torch.randn(8, 2, 2)
+        target_observations = torch.randn(8, 3, 4)
+        target_observations[:, :2, 1:3] = source_observations
+
+        for prefix in ("encoders.0.", "critic_encoders.0."):
+            input_key = prefix + "model.0.weight"
+            bias_key = prefix + "model.0.bias"
+            source_output = torch.nn.functional.linear(
+                source_observations.flatten(1),
+                source["model_state_dict"][input_key],
+                source["model_state_dict"][bias_key],
+            )
+            migrated_output = torch.nn.functional.linear(
+                target_observations.flatten(1),
+                migrated["model_state_dict"][input_key],
+                migrated["model_state_dict"][bias_key],
+            )
+            torch.testing.assert_close(migrated_output, source_output)
+
+    def test_expand_rejects_unexpected_grid_or_parameter_shapes(self):
+        source, target = self.make_expand_states()
+        source["model_state_dict"]["encoders.0.model.0.weight"] = torch.zeros(
+            3, 5
+        )
+        with self.assertRaises(ValueError):
+            self.module.expand_height_encoder_inputs(
+                source,
+                target,
+                source_grid_shape=(2, 2),
+                target_grid_shape=(3, 4),
+            )
+
+        source, target = self.make_expand_states()
+        target["model_state_dict"]["actor.weight"] = torch.zeros(2, 3)
+        with self.assertRaises(ValueError):
+            self.module.expand_height_encoder_inputs(
+                source,
+                target,
+                source_grid_shape=(2, 2),
+                target_grid_shape=(3, 4),
+            )
+
+        source, target = self.make_expand_states()
+        with self.assertRaises(ValueError):
+            self.module.expand_height_encoder_inputs(
+                source,
+                target,
+                source_grid_shape=(2, 2),
+                target_grid_shape=(3, 3),
+            )
+
 
 @unittest.skipUnless(
     TORCH_AVAILABLE and ISAAC_GYM_AVAILABLE,
@@ -116,6 +249,7 @@ class BoxRewardTest(unittest.TestCase):
             Go2BoxParkourCfg,
             Go2BoxParkourCfgPPO,
         )
+        from legged_gym.envs.go2.go2_config import Go2RoughCfg
         from legged_gym.envs.go2.debug_go2_box_config import DebugGo2BoxCfg
 
         cls.LeggedRobot = LeggedRobot
@@ -123,6 +257,7 @@ class BoxRewardTest(unittest.TestCase):
         cls.env_cfg = Go2BoxParkourCfg
         cls.train_cfg = Go2BoxParkourCfgPPO
         cls.debug_cfg = DebugGo2BoxCfg
+        cls.walk_cfg = Go2RoughCfg
 
     def test_event_scale_values_after_control_dt(self):
         scales = self.env_cfg.rewards.scales
@@ -219,6 +354,26 @@ class BoxRewardTest(unittest.TestCase):
         self.assertEqual(commands.ranges.ang_vel_yaw, [0.0, 0.0])
         self.assertGreater(commands.resampling_time, self.env_cfg.env.episode_length_s)
 
+    def test_expanded_height_grid_contains_the_original_grid_at_locked_indices(self):
+        import numpy as np
+
+        source = self.walk_cfg.terrain
+        target = self.env_cfg.terrain
+        self.assertEqual(
+            (len(source.measured_points_x), len(source.measured_points_y)),
+            (21, 11),
+        )
+        self.assertEqual(
+            (len(target.measured_points_x), len(target.measured_points_y)),
+            (36, 17),
+        )
+        np.testing.assert_allclose(
+            target.measured_points_x[:21], source.measured_points_x, atol=1e-12
+        )
+        np.testing.assert_allclose(
+            target.measured_points_y[3:14], source.measured_points_y, atol=1e-12
+        )
+
     def test_4096_environments_use_many_physical_tracks(self):
         terrain = self.env_cfg.terrain
         physical_tracks = terrain.num_rows * terrain.num_cols
@@ -242,9 +397,12 @@ class BoxRewardTest(unittest.TestCase):
         runner = self.train_cfg.runner
         self.assertTrue(runner.resume)
         self.assertEqual(runner.checkpoint, 9700)
-        self.assertEqual(runner.run_name, "five_box_contact_v2_from9700")
         self.assertEqual(
-            runner.ckpt_manipulator, "reinitialize_height_encoders"
+            runner.run_name,
+            "five_box_contact_v2_encoder_expand_from9700",
+        )
+        self.assertEqual(
+            runner.ckpt_manipulator, "expand_height_encoder_inputs"
         )
         self.assertTrue(runner.load_run.endswith("Jul19_13-30-09_hold_from_2000_to_10000"))
 
