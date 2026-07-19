@@ -305,7 +305,7 @@ class BoxRewardTest(unittest.TestCase):
             "tracking_lin_vel": 1.0,
             "tracking_ang_vel": 0.2,
             "lin_vel_x": 0.5,
-            "overspeed": -1.0,
+            "overspeed": -1.5,
             "lin_pos_y": -0.1,
             "yaw_abs": -0.1,
             "energy_substeps": -2e-7,
@@ -454,15 +454,15 @@ class BoxRewardTest(unittest.TestCase):
         runner = self.train_cfg.runner
         algorithm = self.train_cfg.algorithm
         self.assertTrue(runner.resume)
-        self.assertEqual(runner.checkpoint, 11000)
+        self.assertEqual(runner.checkpoint, 11500)
         self.assertEqual(
             runner.run_name,
-            "five_box_v5_stable_from11000",
+            "five_box_v5_overspeed15_from11500",
         )
         self.assertEqual(runner.ckpt_manipulator, "reset_optimizer_state")
         self.assertTrue(
             runner.load_run.endswith(
-                "Jul19_22-39-47_five_box_v5_from10900"
+                "Jul19_23-03-03_five_box_v5_stable_from11000"
             )
         )
         self.assertEqual(algorithm.schedule, "fixed")

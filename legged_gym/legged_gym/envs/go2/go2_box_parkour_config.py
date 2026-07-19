@@ -63,7 +63,7 @@ class Go2BoxParkourCfg(DebugGo2BoxCfg):
             # Keep progress useful but cap its raw reward at 1.2 m/s.
             lin_vel_x = 0.5
             # Allow short jump bursts up to 0.4 m/s above the command.
-            overspeed = -1.0
+            overspeed = -1.5
             lin_pos_y = -0.1
             yaw_abs = -0.1
             energy_substeps = -2e-7
@@ -110,14 +110,14 @@ class Go2BoxParkourCfgPPO(Go2RoughCfgPPO):
 
     class runner(Go2RoughCfgPPO.runner):
         experiment_name = "go2_box_parkour"
-        run_name = "five_box_v5_stable_from11000"
+        run_name = "five_box_v5_overspeed15_from11500"
         resume = True
         load_run = osp.join(
             osp.dirname(osp.dirname(osp.dirname(osp.dirname(__file__)))),
             "logs",
             "go2_box_parkour",
-            "Jul19_22-39-47_five_box_v5_from10900",
+            "Jul19_23-03-03_five_box_v5_stable_from11000",
         )
-        checkpoint = 11000
+        checkpoint = 11500
         ckpt_manipulator = "reset_optimizer_state"
         max_iterations = 2000
