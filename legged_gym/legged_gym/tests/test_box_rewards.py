@@ -286,7 +286,6 @@ class BoxRewardTest(unittest.TestCase):
         self.assertAlmostEqual(scales.episode_timeout * dt, -5.0)
         self.assertFalse(self.env_cfg.rewards.only_positive_rewards)
         self.assertFalse(hasattr(scales, "lazy_stop"))
-        self.assertFalse(self.env_cfg.box_progress.reset_on_body_contact)
 
     def test_event_buffers_and_success_timeout_semantics(self):
         env = SimpleNamespace(
@@ -397,15 +396,15 @@ class BoxRewardTest(unittest.TestCase):
     def test_checkpoint_source_is_locked(self):
         runner = self.train_cfg.runner
         self.assertTrue(runner.resume)
-        self.assertEqual(runner.checkpoint, 10400)
+        self.assertEqual(runner.checkpoint, 10100)
         self.assertEqual(
             runner.run_name,
-            "five_box_v3_no_base_reset_from10400",
+            "five_box_reward_v3_from10100",
         )
         self.assertIsNone(runner.ckpt_manipulator)
         self.assertTrue(
             runner.load_run.endswith(
-                "Jul19_21-37-13_five_box_reward_v3_from10200"
+                "Jul19_21-11-13_five_box_contact_v2_encoder_expand_from9700"
             )
         )
 

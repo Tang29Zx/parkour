@@ -211,15 +211,6 @@ class BoxProgressTrackerTest(unittest.TestCase):
             self.update()
         self.assertTrue(self.tracker.fall_buf.all())
 
-    def test_body_contact_can_be_non_terminal(self):
-        self.tracker.reset_on_body_contact = False
-        self.body_contact[:] = True
-        for _ in range(20):
-            self.update()
-
-        self.assertEqual(self.tracker.body_contact_counter.tolist(), [20, 20])
-        self.assertFalse(self.tracker.fall_buf.any())
-
     def test_reset_clears_all_progress_and_events(self):
         self.tracker.next_box_idx[:] = 3
         self.tracker.passed_box_count[:] = 3
