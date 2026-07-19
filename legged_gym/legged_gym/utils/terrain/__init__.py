@@ -3,6 +3,7 @@ import importlib
 terrain_registry = dict(
     Terrain= "legged_gym.utils.terrain.terrain:Terrain",
     BarrierTrack= "legged_gym.utils.terrain.barrier_track:BarrierTrack",
+    RandomBoxTrack= "legged_gym.utils.terrain.random_box_track:RandomBoxTrack",
     TerrainPerlin= "legged_gym.utils.terrain.perlin:TerrainPerlin",
 )
 

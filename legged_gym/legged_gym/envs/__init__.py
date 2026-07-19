@@ -31,6 +31,7 @@
 from legged_gym import LEGGED_GYM_ROOT_DIR, LEGGED_GYM_ENVS_DIR
 from legged_gym.envs.a1.a1_config import A1RoughCfg, A1RoughCfgPPO, A1PlaneCfg, A1RoughCfgTPPO
 from .base.legged_robot import LeggedRobot
+from .base.legged_robot_box import LeggedRobotBox
 from .base.legged_robot_field import LeggedRobotField
 from .base.robot_field_noisy import RobotFieldNoisy
 from .anymal_c.anymal import Anymal
@@ -47,6 +48,7 @@ from .go1.go1_field_distill_config import Go1FieldDistillCfg, Go1FieldDistillCfg
 from .go2.go2_config import Go2RoughCfg, Go2RoughCfgPPO
 from .go2.go2_field_config import Go2FieldCfg, Go2FieldCfgPPO
 from .go2.debug_go2_box_config import DebugGo2BoxCfg, DebugGo2BoxCfgPPO
+from .go2.go2_box_parkour_config import Go2BoxParkourCfg, Go2BoxParkourCfgPPO
 from .go2.go2_distill_config import Go2DistillCfg, Go2DistillCfgPPO
 
 
@@ -63,7 +65,8 @@ task_registry.register( "go1_field", LeggedRobot, Go1FieldCfg(), Go1FieldCfgPPO(
 task_registry.register( "go1_distill", LeggedRobot, Go1FieldDistillCfg(), Go1FieldDistillCfgPPO())
 task_registry.register( "go2", LeggedRobot, Go2RoughCfg(), Go2RoughCfgPPO() )
 task_registry.register( "go2_field", RobotFieldNoisy, Go2FieldCfg(), Go2FieldCfgPPO() )
-task_registry.register( "debug_go2_box", RobotFieldNoisy, DebugGo2BoxCfg(), DebugGo2BoxCfgPPO() )
+task_registry.register( "debug_go2_box", LeggedRobot, DebugGo2BoxCfg(), DebugGo2BoxCfgPPO() )
+task_registry.register( "go2_box_parkour", LeggedRobotBox, Go2BoxParkourCfg(), Go2BoxParkourCfgPPO() )
 task_registry.register( "go2_distill", RobotFieldNoisy, Go2DistillCfg(), Go2DistillCfgPPO() )
 
 ## The following tasks are for the convinience of opensource
