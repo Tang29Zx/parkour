@@ -1830,31 +1830,31 @@ class LeggedRobot(BaseTask):
         # Penalize motion at zero commands
         return torch.sum(torch.abs(self.dof_pos - self.default_dof_pos), dim=1) \
             * (torch.norm(self.commands[:, :2], dim=1) < 0.1) \
-            * (torch.abs(self.commands[:, 2] < 0.2))
+            * (torch.abs(self.commands[:, 2]) < 0.2)
     
     def _reward_stop_lin_vel(self):
         # Penalize x/y/z speed at zero commands
         return torch.sum(torch.square(self.base_lin_vel), dim=1) \
             * (torch.norm(self.commands[:, :2], dim=1) < 0.1) \
-            * (torch.abs(self.commands[:, 2] < 0.2))
+            * (torch.abs(self.commands[:, 2]) < 0.2)
     
     def _reward_stop_ang_vel(self):
         # Penalize angular speed at zero commands
         return torch.sum(torch.square(self.base_ang_vel), dim=1) \
             * (torch.norm(self.commands[:, :2], dim=1) < 0.1) \
-            * (torch.abs(self.commands[:, 2] < 0.2))
+            * (torch.abs(self.commands[:, 2]) < 0.2)
     
     def _reward_stop_dof_vel(self):
         # Penalize dof velocities at zero commands
         return torch.sum(torch.square(self.dof_vel), dim=1) \
             * (torch.norm(self.commands[:, :2], dim=1) < 0.1) \
-            * (torch.abs(self.commands[:, 2] < 0.2))
+            * (torch.abs(self.commands[:, 2]) < 0.2)
     
     def _reward_stop_yaw_vel(self):
         # Penalize yaw speed at zero commands
         return torch.square(self.base_ang_vel[:, 2]) \
             * (torch.norm(self.commands[:, :2], dim=1) < 0.1) \
-            * (torch.abs(self.commands[:, 2] < 0.2))
+            * (torch.abs(self.commands[:, 2]) < 0.2)
     
     def _reward_lazy_stop(self):
         # Penalize too slow when command is not below cutoff threshold

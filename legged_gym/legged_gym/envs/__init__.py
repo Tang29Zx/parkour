@@ -46,6 +46,7 @@ from .go1.go1_field_config import Go1FieldCfg, Go1FieldCfgPPO
 from .go1.go1_field_distill_config import Go1FieldDistillCfg, Go1FieldDistillCfgPPO
 from .go2.go2_config import Go2RoughCfg, Go2RoughCfgPPO
 from .go2.go2_field_config import Go2FieldCfg, Go2FieldCfgPPO
+from .go2.debug_go2_box_config import DebugGo2BoxCfg, DebugGo2BoxCfgPPO
 from .go2.go2_distill_config import Go2DistillCfg, Go2DistillCfgPPO
 
 
@@ -62,6 +63,7 @@ task_registry.register( "go1_field", LeggedRobot, Go1FieldCfg(), Go1FieldCfgPPO(
 task_registry.register( "go1_distill", LeggedRobot, Go1FieldDistillCfg(), Go1FieldDistillCfgPPO())
 task_registry.register( "go2", LeggedRobot, Go2RoughCfg(), Go2RoughCfgPPO() )
 task_registry.register( "go2_field", RobotFieldNoisy, Go2FieldCfg(), Go2FieldCfgPPO() )
+task_registry.register( "debug_go2_box", RobotFieldNoisy, DebugGo2BoxCfg(), DebugGo2BoxCfgPPO() )
 task_registry.register( "go2_distill", RobotFieldNoisy, Go2DistillCfg(), Go2DistillCfgPPO() )
 
 ## The following tasks are for the convinience of opensource

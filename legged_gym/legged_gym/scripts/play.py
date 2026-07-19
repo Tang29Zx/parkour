@@ -79,6 +79,8 @@ def create_recording_camera(gym, env_handle,
 @torch.no_grad()
 def play(args):
     env_cfg, train_cfg = task_registry.get_cfgs(name=args.task)
+    debug_geometry = getattr(env_cfg.env, "debug_geometry", False)
+    debug_zero_actions = getattr(env_cfg.env, "debug_zero_actions", False)
     if args.load_cfg:
         with open(os.path.join("logs", train_cfg.runner.experiment_name, args.load_run, "config.json"), "r") as f:
             d = json.load(f, object_pairs_hook= OrderedDict)
@@ -86,7 +88,10 @@ def play(args):
             update_class_from_dict(train_cfg, d, strict= True)
 
     # override some parameters for testing
-    if env_cfg.terrain.selected == "BarrierTrack":
+    if debug_geometry:
+        env_cfg.env.num_envs = min(env_cfg.env.num_envs, 4)
+        env_cfg.terrain.max_init_terrain_level = 0
+    elif env_cfg.terrain.selected == "BarrierTrack":
         env_cfg.env.num_envs = min(env_cfg.env.num_envs, 1)
         env_cfg.env.episode_length_s = 20
         env_cfg.terrain.max_init_terrain_level = 0
@@ -116,12 +121,14 @@ def play(args):
     # env_cfg.asset.fix_base_link = True
     env_cfg.env.episode_length_s = 1000
     env_cfg.commands.resampling_time = int(1e16)
-    env_cfg.commands.ranges.lin_vel_x = [1.2, 1.2]
+    if not debug_geometry:
+        env_cfg.commands.ranges.lin_vel_x = [1.2, 1.2]
     env_cfg.domain_rand.push_robots = False
-    env_cfg.domain_rand.init_base_pos_range = dict(
-        x= [0.6, 0.6],
-        y= [-0.05, 0.05],
-    )
+    if not debug_geometry:
+        env_cfg.domain_rand.init_base_pos_range = dict(
+            x= [0.6, 0.6],
+            y= [-0.05, 0.05],
+        )
     # env_cfg.termination.termination_terms = []
     env_cfg.termination.timeout_at_border = False
     env_cfg.termination.timeout_at_finished = False
@@ -130,7 +137,7 @@ def play(args):
     env_cfg.viewer.draw_height_measurements = False
     env_cfg.viewer.draw_volume_sample_points = False
     env_cfg.viewer.draw_sensors = False
-    if hasattr(env_cfg.terrain, "BarrierTrack_kwargs"):
+    if hasattr(env_cfg.terrain, "BarrierTrack_kwargs") and not debug_geometry:
         env_cfg.terrain.BarrierTrack_kwargs["draw_virtual_terrain"] = True
     train_cfg.runner.resume = (args.load_run is not None)
     train_cfg.runner_class_name = "OnPolicyRunner"
@@ -238,7 +245,10 @@ def play(args):
         if "obs_slice" in locals().keys():
             obs_component = obs[:, obs_slice[0]].reshape(-1, *obs_slice[1])
             print(obs_component[robot_index])
-        actions = policy(obs.detach())
+        if debug_zero_actions:
+            actions = torch.zeros(env.num_envs, env.num_actions, device=env.device)
+        else:
+            actions = policy(obs.detach())
         teacher_actions = actions
         obs, critic_obs, rews, dones, infos = env.step(actions.detach())
         if RECORD_FRAMES:
