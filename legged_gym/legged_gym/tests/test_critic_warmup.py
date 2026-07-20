@@ -256,6 +256,8 @@ class CriticWarmupTest(unittest.TestCase):
 
         current_hidden = ppo.actor_critic.memory_a.hidden_states
         reference_hidden = ppo.reference_actor_critic.memory_a.hidden_states
+        self.assertEqual(ppo.rollout_actor_output_max_diff.item(), 0.0)
+        self.assertEqual(ppo.rollout_actor_std_max_diff.item(), 0.0)
         self.assertIsNot(current_hidden, reference_hidden)
         self.assertNotEqual(
             current_hidden.data_ptr(), reference_hidden.data_ptr()

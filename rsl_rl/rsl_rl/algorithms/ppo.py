@@ -155,6 +155,12 @@ class PPO:
         ) < 0.0:
             raise ValueError("Actor equivalence tolerances must be non-negative.")
         self.reference_actor_critic = None
+        self.rollout_actor_output_max_diff = torch.zeros(
+            (), device=self.device
+        )
+        self.rollout_actor_std_max_diff = torch.zeros(
+            (), device=self.device
+        )
         self.quality_level = 0.0
         self.quality_up_windows = 0
         self.quality_down_windows = 0
@@ -376,6 +382,28 @@ class PPO:
                 self.transition.reference_action_sigma = (
                     self.reference_actor_critic.action_std.detach()
                 )
+                # Both policies run the same one-step recurrent path here.
+                # This is the valid equivalence check during Critic warmup;
+                # comparing this rollout against padded batch replay also
+                # includes expected CUDA GRU accumulation-order differences.
+                self.rollout_actor_output_max_diff = torch.maximum(
+                    self.rollout_actor_output_max_diff,
+                    torch.max(
+                        torch.abs(
+                            self.transition.action_mean
+                            - self.transition.reference_action_mean
+                        )
+                    ),
+                )
+                self.rollout_actor_std_max_diff = torch.maximum(
+                    self.rollout_actor_std_max_diff,
+                    torch.max(
+                        torch.abs(
+                            self.transition.action_sigma
+                            - self.transition.reference_action_sigma
+                        )
+                    ),
+                )
         else:
             self.transition.reference_action_mean = (
                 self.transition.action_mean
@@ -427,8 +455,8 @@ class PPO:
         average_stats = defaultdict(lambda :0.)
         maximum_stat_names = {
             "reference_kl_max",
-            "actor_output_max_diff",
-            "actor_std_max_diff",
+            "actor_batched_replay_output_max_diff",
+            "actor_batched_replay_std_max_diff",
         }
         if self.actor_critic.is_recurrent:
             generator = self.storage.reccurent_mini_batch_generator(self.num_mini_batches, self.num_learning_epochs)
@@ -499,6 +527,12 @@ class PPO:
         average_stats["actor_parameter_max_diff"] = torch.tensor(
             self.actor_parameter_max_diff(), device=self.device
         )
+        average_stats["actor_output_max_diff"] = (
+            self.rollout_actor_output_max_diff.detach().clone()
+        )
+        average_stats["actor_std_max_diff"] = (
+            self.rollout_actor_std_max_diff.detach().clone()
+        )
         if critic_warmup_active:
             parameter_diff = average_stats[
                 "actor_parameter_max_diff"
@@ -527,6 +561,8 @@ class PPO:
                     f"std_max_diff={std_diff:.3e} (limit "
                     f"{self.actor_std_equivalence_tolerance:.3e})."
                 )
+        self.rollout_actor_output_max_diff.zero_()
+        self.rollout_actor_std_max_diff.zero_()
         self.storage.clear()
         if (
             not critic_warmup_active
@@ -635,10 +671,10 @@ class PPO:
                 reference_kl_loss.detach().abs()
                 / surrogate_loss.detach().abs().clamp_min(1e-8)
             )
-            stats["actor_output_max_diff"] = torch.max(
+            stats["actor_batched_replay_output_max_diff"] = torch.max(
                 torch.abs(mu_batch.detach() - reference_mu)
             )
-            stats["actor_std_max_diff"] = torch.max(
+            stats["actor_batched_replay_std_max_diff"] = torch.max(
                 torch.abs(sigma_batch.detach() - reference_sigma)
             )
         else:
@@ -648,21 +684,21 @@ class PPO:
             stats["reference_kl_p95"] = zero
             stats["reference_to_surrogate_ratio"] = zero
             if self.reference_actor_critic is not None:
-                stats["actor_output_max_diff"] = torch.max(
+                stats["actor_batched_replay_output_max_diff"] = torch.max(
                     torch.abs(
                         mu_batch.detach()
                         - minibatch.reference_mu.detach()
                     )
                 )
-                stats["actor_std_max_diff"] = torch.max(
+                stats["actor_batched_replay_std_max_diff"] = torch.max(
                     torch.abs(
                         sigma_batch.detach()
                         - minibatch.reference_sigma.detach()
                     )
                 )
             else:
-                stats["actor_output_max_diff"] = zero
-                stats["actor_std_max_diff"] = zero
+                stats["actor_batched_replay_output_max_diff"] = zero
+                stats["actor_batched_replay_std_max_diff"] = zero
         
         inter_vars = dict(
             ratio= ratio,

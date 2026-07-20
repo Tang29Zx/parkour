@@ -937,7 +937,7 @@ class BoxRewardTest(unittest.TestCase):
             algorithm.actor_parameter_equivalence_tolerance, 0.0
         )
         self.assertEqual(
-            algorithm.actor_output_equivalence_tolerance, 5e-4
+            algorithm.actor_output_equivalence_tolerance, 1e-5
         )
         self.assertEqual(algorithm.actor_std_equivalence_tolerance, 1e-7)
         self.assertEqual(runner.max_iterations, 100)

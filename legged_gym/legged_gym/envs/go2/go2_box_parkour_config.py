@@ -141,11 +141,11 @@ class Go2BoxParkourCfgPPO(Go2RoughCfgPPO):
         # Keep a non-zero behavior anchor even at maximum quality difficulty.
         reference_kl_min_coef = 0.05
         reference_kl_max_coef = 1.0
-        # Step-wise CUDA GRU rollout and padded batched GRU replay can differ
-        # slightly in float32 even with bit-identical Actor parameters. The
-        # scaled joint-target tolerance remains below 1.25e-4 rad.
+        # Current and frozen Actors are compared on the same one-step GRU path.
+        # Padded batch replay has a separate diagnostic because CUDA float32
+        # accumulation order can differ without any parameter mutation.
         actor_parameter_equivalence_tolerance = 0.0
-        actor_output_equivalence_tolerance = 5e-4
+        actor_output_equivalence_tolerance = 1e-5
         actor_std_equivalence_tolerance = 1e-7
         quality_min_episodes = 256
         quality_required_windows = 2
