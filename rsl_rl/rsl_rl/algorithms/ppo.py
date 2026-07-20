@@ -429,12 +429,22 @@ class PPO:
 
     def set_quality_levels(self, speed_penalty_level, motion_quality_level):
         """Clamp and store independent speed and motion penalty levels."""
-        self.speed_penalty_level = min(
-            max(float(speed_penalty_level), 0.0), 1.0
+        self.speed_penalty_level = self._normalize_curriculum_level(
+            speed_penalty_level
         )
-        self.motion_quality_level = min(
-            max(float(motion_quality_level), 0.0), 1.0
+        self.motion_quality_level = self._normalize_curriculum_level(
+            motion_quality_level
         )
+
+    @staticmethod
+    def _normalize_curriculum_level(level):
+        """Clamp a level and snap floating-point endpoint noise to 0 or 1."""
+        level = min(max(float(level), 0.0), 1.0)
+        if level <= 1e-8:
+            return 0.0
+        if level >= 1.0 - 1e-8:
+            return 1.0
+        return level
 
     def set_quality_level(self, level):
         """Backward-compatible helper that sets both curriculum levels."""
@@ -545,14 +555,22 @@ class PPO:
             >= self.curriculum_regression_windows_required
         ):
             if self.quality_phase == 0:
-                self.speed_penalty_level = max(
-                    self.speed_penalty_initial_level,
-                    self.speed_penalty_level - self.curriculum_level_step,
+                self.set_quality_levels(
+                    max(
+                        self.speed_penalty_initial_level,
+                        self.speed_penalty_level
+                        - self.curriculum_level_step,
+                    ),
+                    self.motion_quality_level,
                 )
             elif self.quality_phase == 1:
-                self.motion_quality_level = max(
-                    0.0,
-                    self.motion_quality_level - self.curriculum_level_step,
+                self.set_quality_levels(
+                    self.speed_penalty_level,
+                    max(
+                        0.0,
+                        self.motion_quality_level
+                        - self.curriculum_level_step,
+                    ),
                 )
             self.set_reference_kl_coef(
                 max(
@@ -577,9 +595,10 @@ class PPO:
         )
         if self.quality_phase == 0:
             if self.speed_penalty_level < 1.0 and can_advance:
-                self.speed_penalty_level = min(
-                    1.0,
-                    self.speed_penalty_level + self.curriculum_level_step,
+                self.set_quality_levels(
+                    self.speed_penalty_level
+                    + self.curriculum_level_step,
+                    self.motion_quality_level,
                 )
                 self.curriculum_promoted = True
                 self.curriculum_stable_windows = 0
@@ -599,10 +618,13 @@ class PPO:
             )
             if self.speed_master_windows >= self.speed_master_windows_required:
                 self.quality_phase = 1
-                self.motion_quality_level = max(
-                    self.motion_quality_level,
-                    self.motion_quality_initial_level,
-                    self.curriculum_level_step,
+                self.set_quality_levels(
+                    self.speed_penalty_level,
+                    max(
+                        self.motion_quality_level,
+                        self.motion_quality_initial_level,
+                        self.curriculum_level_step,
+                    ),
                 )
                 self.curriculum_phase_transition = True
                 self.curriculum_stable_windows = 0
@@ -612,9 +634,10 @@ class PPO:
                 )
         elif self.quality_phase == 1:
             if self.motion_quality_level < 1.0 and can_advance:
-                self.motion_quality_level = min(
-                    1.0,
-                    self.motion_quality_level + self.curriculum_level_step,
+                self.set_quality_levels(
+                    self.speed_penalty_level,
+                    self.motion_quality_level
+                    + self.curriculum_level_step,
                 )
                 self.curriculum_promoted = True
                 self.curriculum_stable_windows = 0

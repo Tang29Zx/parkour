@@ -188,6 +188,9 @@ class Go2BoxParkourCfgPPO(Go2RoughCfgPPO):
     class runner(Go2RoughCfgPPO.runner):
         experiment_name = "go2_box_parkour"
         run_name = "five_box_v11_speed_phase_from11800"
+        # Partial episodes generated at process startup do not represent the
+        # checkpoint policy and must not drive the box curriculum or KL state.
+        init_at_random_ep_len = False
         resume = True
         load_run = osp.join(
             osp.dirname(osp.dirname(osp.dirname(osp.dirname(__file__)))),

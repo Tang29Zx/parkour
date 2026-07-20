@@ -1120,6 +1120,7 @@ class BoxRewardTest(unittest.TestCase):
     def test_checkpoint_source_is_locked(self):
         runner = self.train_cfg.runner
         algorithm = self.train_cfg.algorithm
+        self.assertFalse(runner.init_at_random_ep_len)
         self.assertTrue(runner.resume)
         self.assertEqual(runner.checkpoint, 11800)
         self.assertEqual(

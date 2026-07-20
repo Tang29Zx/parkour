@@ -197,6 +197,27 @@ class CriticWarmupTest(unittest.TestCase):
         self.assertTrue(ppo.collapse_warning)
         self.assertEqual(ppo.reference_kl_coef, 1.0)
 
+    def test_curriculum_levels_snap_floating_point_endpoint_noise(self):
+        ppo = self.make_ppo()
+
+        ppo.set_quality_levels(0.9999999999999999, 1e-12)
+
+        self.assertEqual(ppo.speed_penalty_level, 1.0)
+        self.assertEqual(ppo.motion_quality_level, 0.0)
+
+        ppo.current_learning_iteration = 1000
+        ppo.update_quality_curriculum(
+            success_rate=0.95,
+            box_pass_rate=0.96,
+            fall_rate=0.02,
+            episode_count=256,
+            flat_speed_mean=2.0,
+            flat_severe_overspeed_ratio=0.7,
+        )
+
+        self.assertEqual(ppo.speed_penalty_level, 1.0)
+        self.assertFalse(ppo.curriculum_promoted)
+
     def test_speed_mastery_transitions_to_motion_phase(self):
         ppo = self.make_ppo()
         ppo.speed_penalty_level = 1.0
