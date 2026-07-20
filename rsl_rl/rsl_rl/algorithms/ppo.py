@@ -62,6 +62,9 @@ class PPO:
                  reference_kl_initial_coef=None,
                  reference_kl_min_coef=0.0,
                  reference_kl_max_coef=0.0,
+                 actor_parameter_equivalence_tolerance=0.0,
+                 actor_output_equivalence_tolerance=1e-4,
+                 actor_std_equivalence_tolerance=1e-7,
                  quality_min_episodes=256,
                  quality_required_windows=2,
                  quality_increase=0.05,
@@ -136,6 +139,21 @@ class PPO:
             raise ValueError(
                 "Reference KL coefficients must satisfy 0 <= min <= max."
             )
+        self.actor_parameter_equivalence_tolerance = float(
+            actor_parameter_equivalence_tolerance
+        )
+        self.actor_output_equivalence_tolerance = float(
+            actor_output_equivalence_tolerance
+        )
+        self.actor_std_equivalence_tolerance = float(
+            actor_std_equivalence_tolerance
+        )
+        if min(
+            self.actor_parameter_equivalence_tolerance,
+            self.actor_output_equivalence_tolerance,
+            self.actor_std_equivalence_tolerance,
+        ) < 0.0:
+            raise ValueError("Actor equivalence tolerances must be non-negative.")
         self.reference_actor_critic = None
         self.quality_level = 0.0
         self.quality_up_windows = 0
@@ -482,22 +500,32 @@ class PPO:
             self.actor_parameter_max_diff(), device=self.device
         )
         if critic_warmup_active:
+            parameter_diff = average_stats[
+                "actor_parameter_max_diff"
+            ].item()
+            output_diff = average_stats.get(
+                "actor_output_max_diff",
+                torch.zeros((), device=self.device),
+            ).item()
+            std_diff = average_stats.get(
+                "actor_std_max_diff",
+                torch.zeros((), device=self.device),
+            ).item()
             if (
-                average_stats["actor_parameter_max_diff"].item() > 0.0
-                or average_stats.get(
-                    "actor_output_max_diff",
-                    torch.zeros((), device=self.device),
-                ).item()
-                > 1e-5
-                or average_stats.get(
-                    "actor_std_max_diff",
-                    torch.zeros((), device=self.device),
-                ).item()
-                > 1e-7
+                parameter_diff
+                > self.actor_parameter_equivalence_tolerance
+                or output_diff > self.actor_output_equivalence_tolerance
+                or std_diff > self.actor_std_equivalence_tolerance
             ):
                 raise RuntimeError(
-                    "Actor changed during Critic-only warmup. Refusing to "
-                    "continue from a non-equivalent warmup checkpoint."
+                    "Actor equivalence check failed during Critic-only "
+                    "warmup: parameter_max_diff="
+                    f"{parameter_diff:.3e} (limit "
+                    f"{self.actor_parameter_equivalence_tolerance:.3e}), "
+                    f"output_max_diff={output_diff:.3e} (limit "
+                    f"{self.actor_output_equivalence_tolerance:.3e}), "
+                    f"std_max_diff={std_diff:.3e} (limit "
+                    f"{self.actor_std_equivalence_tolerance:.3e})."
                 )
         self.storage.clear()
         if (

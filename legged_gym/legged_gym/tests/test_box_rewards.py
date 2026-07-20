@@ -933,6 +933,13 @@ class BoxRewardTest(unittest.TestCase):
         self.assertEqual(algorithm.actor_finetune_entropy_coef, 0.001)
         self.assertEqual(algorithm.reference_kl_min_coef, 0.05)
         self.assertEqual(algorithm.reference_kl_max_coef, 1.0)
+        self.assertEqual(
+            algorithm.actor_parameter_equivalence_tolerance, 0.0
+        )
+        self.assertEqual(
+            algorithm.actor_output_equivalence_tolerance, 5e-4
+        )
+        self.assertEqual(algorithm.actor_std_equivalence_tolerance, 1e-7)
         self.assertEqual(runner.max_iterations, 100)
         self.assertEqual(runner.save_interval, 100)
         self.assertEqual(runner.log_interval, 10)

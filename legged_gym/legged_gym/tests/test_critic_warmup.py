@@ -395,6 +395,13 @@ class CriticWarmupTest(unittest.TestCase):
                 DummyActorCritic(), critic_warmup_iterations=-1
             )
 
+    def test_negative_actor_equivalence_tolerance_is_rejected(self):
+        with self.assertRaises(ValueError):
+            LossControlledPPO(
+                DummyActorCritic(),
+                actor_output_equivalence_tolerance=-1e-4,
+            )
+
 
 if __name__ == "__main__":
     unittest.main()
