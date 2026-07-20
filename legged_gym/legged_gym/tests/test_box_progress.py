@@ -58,6 +58,8 @@ class BoxProgressTrackerTest(unittest.TestCase):
         self.roll = torch.zeros(2)
         self.pitch = torch.zeros(2)
         self.body_contact = torch.zeros(2, dtype=torch.bool)
+        self.body_contact_force = torch.zeros(2)
+        self.base_vertical_velocity = torch.zeros(2)
         self.natural_timeout = torch.zeros(2, dtype=torch.bool)
 
     def update(self):
@@ -73,6 +75,8 @@ class BoxProgressTrackerTest(unittest.TestCase):
             roll=self.roll,
             pitch=self.pitch,
             body_contact=self.body_contact,
+            body_contact_force=self.body_contact_force,
+            base_vertical_velocity=self.base_vertical_velocity,
             natural_timeout=self.natural_timeout,
             landing_end_x=self.landing_end_x,
         )
@@ -89,11 +93,13 @@ class BoxProgressTrackerTest(unittest.TestCase):
         self.terrain_heights[env_idx, foot_idx] = bounds[4]
         self.contact_forces[env_idx, foot_idx, 2] = 2.0
 
-    def test_two_distinct_feet_may_contact_sequentially(self):
+    def test_front_and_rear_contacts_may_qualify_sequentially(self):
         self.put_foot_on_box(0, 0, 0)
         self.update()
+        self.update()
         self.contact_forces.zero_()
-        self.put_foot_on_box(0, 1, 0)
+        self.put_foot_on_box(0, 2, 0)
+        self.update()
         self.update()
         self.contact_forces.zero_()
         self.base_positions[0, 0] = 2.16
@@ -103,39 +109,47 @@ class BoxProgressTrackerTest(unittest.TestCase):
         self.assertEqual(self.tracker.passed_box_count[0].item(), 1)
         self.assertEqual(self.tracker.next_box_idx[0].item(), 1)
 
-    def test_first_and_second_foot_events_are_distinct_and_one_shot(self):
+    def test_front_and_rear_events_fire_after_two_steps_once(self):
         self.put_foot_on_box(0, 0, 0)
         self.update()
-        self.assertTrue(self.tracker.first_foot_contact_buf[0])
-        self.assertFalse(self.tracker.second_foot_contact_buf[0])
+        self.assertFalse(self.tracker.front_foot_contact_buf[0])
+        self.assertFalse(self.tracker.rear_foot_contact_buf[0])
 
         self.update()
-        self.assertFalse(self.tracker.first_foot_contact_buf[0])
-        self.assertFalse(self.tracker.second_foot_contact_buf[0])
+        self.assertTrue(self.tracker.front_foot_contact_buf[0])
+        self.assertFalse(self.tracker.rear_foot_contact_buf[0])
 
-        self.put_foot_on_box(0, 1, 0)
         self.update()
-        self.assertFalse(self.tracker.first_foot_contact_buf[0])
-        self.assertTrue(self.tracker.second_foot_contact_buf[0])
+        self.assertFalse(self.tracker.front_foot_contact_buf[0])
+        self.assertFalse(self.tracker.rear_foot_contact_buf[0])
 
+        self.contact_forces.zero_()
         self.put_foot_on_box(0, 2, 0)
         self.update()
-        self.assertFalse(self.tracker.first_foot_contact_buf[0])
-        self.assertFalse(self.tracker.second_foot_contact_buf[0])
+        self.assertFalse(self.tracker.front_foot_contact_buf[0])
+        self.assertFalse(self.tracker.rear_foot_contact_buf[0])
 
-    def test_two_feet_on_the_same_step_emit_both_events_once(self):
+        self.update()
+        self.assertFalse(self.tracker.front_foot_contact_buf[0])
+        self.assertTrue(self.tracker.rear_foot_contact_buf[0])
+
+    def test_front_and_rear_on_same_steps_emit_both_events_once(self):
+        self.put_foot_on_box(0, 0, 0)
+        self.put_foot_on_box(0, 2, 0)
+        self.update()
+        self.assertFalse(self.tracker.front_foot_contact_buf[0])
+        self.assertFalse(self.tracker.rear_foot_contact_buf[0])
+
+        self.update()
+        self.assertTrue(self.tracker.front_foot_contact_buf[0])
+        self.assertTrue(self.tracker.rear_foot_contact_buf[0])
+        self.update()
+        self.assertFalse(self.tracker.front_foot_contact_buf[0])
+        self.assertFalse(self.tracker.rear_foot_contact_buf[0])
+
+    def test_two_front_feet_do_not_satisfy_rear_contact_rule(self):
         self.put_foot_on_box(0, 0, 0)
         self.put_foot_on_box(0, 1, 0)
-        self.update()
-
-        self.assertTrue(self.tracker.first_foot_contact_buf[0])
-        self.assertTrue(self.tracker.second_foot_contact_buf[0])
-        self.update()
-        self.assertFalse(self.tracker.first_foot_contact_buf[0])
-        self.assertFalse(self.tracker.second_foot_contact_buf[0])
-
-    def test_repeating_one_foot_does_not_satisfy_two_foot_rule(self):
-        self.put_foot_on_box(0, 0, 0)
         self.update()
         self.update()
         self.base_positions[0, 0] = 2.16
@@ -146,15 +160,18 @@ class BoxProgressTrackerTest(unittest.TestCase):
 
     def test_non_target_box_contact_does_not_change_progress(self):
         self.put_foot_on_box(0, 0, 1)
-        self.put_foot_on_box(0, 1, 1)
+        self.put_foot_on_box(0, 2, 1)
         self.update()
 
         self.assertFalse(self.tracker.foot_contact_mask[0].any())
+        self.assertEqual(self.tracker.front_contact_counter[0].item(), 0)
+        self.assertEqual(self.tracker.rear_contact_counter[0].item(), 0)
         self.assertEqual(self.tracker.passed_box_count[0].item(), 0)
 
     def test_pass_event_is_one_step_and_backtracking_cannot_repeat_it(self):
         self.put_foot_on_box(0, 0, 0)
-        self.put_foot_on_box(0, 1, 0)
+        self.put_foot_on_box(0, 2, 0)
+        self.update()
         self.update()
         self.base_positions[0, 0] = 2.16
         self.update()
@@ -166,7 +183,7 @@ class BoxProgressTrackerTest(unittest.TestCase):
         self.assertFalse(self.tracker.box_passed_buf[0])
         self.assertEqual(self.tracker.passed_box_count[0].item(), 1)
 
-    def test_landing_accumulates_sequential_feet_and_safe_steps(self):
+    def test_landing_requires_current_rear_support_for_ten_steps(self):
         self.tracker.next_box_idx[0] = 5
         self.tracker.passed_box_count[0] = 5
         self.feet_positions[0, :, 0] = 10.5
@@ -174,21 +191,13 @@ class BoxProgressTrackerTest(unittest.TestCase):
         self.feet_positions[0, :, 2] = 0.0
         self.base_positions[0, 0] = 10.5
         self.terrain_heights[0] = 0.0
-
-        for foot_idx in range(4):
-            self.contact_forces[0].zero_()
-            self.contact_forces[0, foot_idx, 2] = 2.0
-            self.update()
-        self.assertTrue(self.tracker.landing_foot_contact_mask[0].all())
-        self.assertFalse(self.tracker.success_buf[0])
-        self.assertEqual(self.tracker.landing_counter[0].item(), 4)
-
-        self.contact_forces[0].zero_()
-        for _ in range(5):
+        # One front and one rear foot are enough, but both must support the
+        # robot on every stable landing step.
+        self.contact_forces[0, [0, 2], 2] = 2.0
+        for _ in range(9):
             self.update()
         self.assertFalse(self.tracker.success_buf[0])
         self.assertEqual(self.tracker.landing_counter[0].item(), 9)
-        self.assertTrue(self.tracker.landing_foot_contact_mask[0].all())
 
         self.natural_timeout[0] = True
         self.update()
@@ -200,6 +209,62 @@ class BoxProgressTrackerTest(unittest.TestCase):
         self.tracker.apply_termination(reset_buf, time_out_buf)
         self.assertFalse(time_out_buf[0])
         self.assertTrue(reset_buf[0])
+
+    def test_landing_stability_failure_resets_the_counter(self):
+        self.tracker.next_box_idx[0] = 5
+        self.tracker.passed_box_count[0] = 5
+        self.feet_positions[0, :, 0] = 10.5
+        self.feet_positions[0, :, 1] = self.torch.tensor(
+            [-0.3, 0.3, -0.3, 0.3]
+        )
+        self.feet_positions[0, :, 2] = 0.0
+        self.base_positions[0, 0] = 10.5
+        self.contact_forces[0, [0, 2], 2] = 2.0
+        for _ in range(5):
+            self.update()
+        self.assertEqual(self.tracker.landing_counter[0].item(), 5)
+
+        self.contact_forces[0, 2, 2] = 0.0
+        self.update()
+        self.assertEqual(self.tracker.landing_counter[0].item(), 0)
+
+    def test_landing_uses_stricter_posture_height_and_body_contact_limits(self):
+        self.tracker.next_box_idx[0] = 5
+        self.tracker.passed_box_count[0] = 5
+        self.feet_positions[0, :, 0] = 10.5
+        self.feet_positions[0, :, 1] = self.torch.tensor(
+            [-0.3, 0.3, -0.3, 0.3]
+        )
+        self.feet_positions[0, :, 2] = 0.0
+        self.base_positions[0, 0] = 10.5
+        self.contact_forces[0, [0, 2], 2] = 2.0
+
+        invalid_cases = (
+            (self.roll, 0.36),
+            (self.pitch, 0.46),
+        )
+        for tensor, value in invalid_cases:
+            tensor[0] = value
+            self.update()
+            self.assertEqual(self.tracker.landing_counter[0].item(), 0)
+            tensor[0] = 0.0
+
+        self.base_positions[0, 2] = 0.21
+        self.update()
+        self.assertEqual(self.tracker.landing_counter[0].item(), 0)
+        self.base_positions[0, 2] = 0.5
+
+        self.body_contact[0] = True
+        self.body_contact_force[0] = 2.0
+        self.update()
+        self.assertEqual(self.tracker.landing_counter[0].item(), 0)
+
+        self.body_contact[0] = False
+        self.body_contact_force[0] = 0.0
+        self.contact_forces[0, 2, 2] = 2.0
+        self.base_vertical_velocity[0] = 0.51
+        self.update()
+        self.assertEqual(self.tracker.landing_counter[0].item(), 0)
 
     def test_failure_causes_and_true_timeout_are_separate(self):
         self.base_positions[0, 1] = 0.81
@@ -214,10 +279,25 @@ class BoxProgressTrackerTest(unittest.TestCase):
         self.roll.zero_()
         self.base_positions[:] = self.torch.tensor([0.0, 0.0, 0.5])
         self.natural_timeout.zero_()
-        self.body_contact[:] = True
-        for _ in range(15):
+        # Intermittent contact must accumulate inside the 25-step window.
+        for step in range(14):
+            self.body_contact[:] = step % 2 == 0
+            self.body_contact_force[:] = self.body_contact.float() * 2.0
             self.update()
+        self.assertFalse(self.tracker.fall_buf.any())
+
+        self.body_contact[:] = True
+        self.body_contact_force[:] = 2.0
+        self.update()
         self.assertTrue(self.tracker.fall_buf.all())
+
+    def test_single_severe_body_impact_fails_immediately(self):
+        self.body_contact[0] = True
+        self.body_contact_force[0] = 80.0
+        self.update()
+
+        self.assertTrue(self.tracker.severe_body_impact_buf[0])
+        self.assertTrue(self.tracker.fall_buf[0])
 
     def test_task_deadline_is_incomplete_without_timeout_bootstrap(self):
         self.natural_timeout[0] = True
@@ -247,6 +327,8 @@ class BoxProgressTrackerTest(unittest.TestCase):
             roll=self.roll,
             pitch=self.pitch,
             body_contact=self.body_contact,
+            body_contact_force=self.body_contact_force,
+            base_vertical_velocity=self.base_vertical_velocity,
             natural_timeout=self.natural_timeout,
             landing_end_x=self.landing_end_x,
             external_timeout=external_timeout,
@@ -262,14 +344,15 @@ class BoxProgressTrackerTest(unittest.TestCase):
         self.tracker.next_box_idx[0] = 5
         self.tracker.passed_box_count[0] = 5
         self.tracker.landing_counter[0] = 9
-        self.tracker.body_contact_counter[0] = 14
+        self.tracker.body_contact_history[0, 1:8] = True
         self.body_contact[0] = True
+        self.body_contact_force[0] = 2.0
         self.feet_positions[0, :, 0] = 10.5
         self.feet_positions[0, :, 1] = self.torch.tensor(
             [-0.3, 0.3, -0.3, 0.3]
         )
         self.feet_positions[0, :, 2] = 0.0
-        self.contact_forces[0, :, 2] = 2.0
+        self.contact_forces[0, [0, 2], 2] = 2.0
         self.base_positions[0, 0] = 10.5
         self.update()
 
@@ -281,12 +364,17 @@ class BoxProgressTrackerTest(unittest.TestCase):
         self.tracker.next_box_idx[:] = 3
         self.tracker.passed_box_count[:] = 3
         self.tracker.foot_contact_mask[:] = True
-        self.tracker.landing_foot_contact_mask[:] = True
-        self.tracker.body_contact_counter[:] = 4
+        self.tracker.front_contact_counter[:] = 2
+        self.tracker.rear_contact_counter[:] = 2
+        self.tracker.body_contact_history[:] = True
+        self.tracker.body_contact_window_count[:] = 4
+        self.tracker.max_body_contact_window_count[:] = 4
         self.tracker.landing_counter[:] = 5
         self.tracker.box_passed_buf[:] = True
-        self.tracker.first_foot_contact_buf[:] = True
-        self.tracker.second_foot_contact_buf[:] = True
+        self.tracker.front_foot_contact_buf[:] = True
+        self.tracker.rear_foot_contact_buf[:] = True
+        self.tracker.body_contact_window_failure_buf[:] = True
+        self.tracker.severe_body_impact_buf[:] = True
         self.tracker.success_buf[:] = True
         self.tracker.missed_box_buf[:] = True
         self.tracker.out_of_track_buf[:] = True
@@ -301,12 +389,17 @@ class BoxProgressTrackerTest(unittest.TestCase):
             self.tracker.next_box_idx,
             self.tracker.passed_box_count,
             self.tracker.foot_contact_mask,
-            self.tracker.landing_foot_contact_mask,
-            self.tracker.body_contact_counter,
+            self.tracker.front_contact_counter,
+            self.tracker.rear_contact_counter,
+            self.tracker.body_contact_history,
+            self.tracker.body_contact_window_count,
+            self.tracker.max_body_contact_window_count,
             self.tracker.landing_counter,
             self.tracker.box_passed_buf,
-            self.tracker.first_foot_contact_buf,
-            self.tracker.second_foot_contact_buf,
+            self.tracker.front_foot_contact_buf,
+            self.tracker.rear_foot_contact_buf,
+            self.tracker.body_contact_window_failure_buf,
+            self.tracker.severe_body_impact_buf,
             self.tracker.success_buf,
             self.tracker.missed_box_buf,
             self.tracker.out_of_track_buf,
@@ -326,13 +419,13 @@ class BoxProgressTrackerTest(unittest.TestCase):
             self.assertEqual(tuple(tracker.next_box_idx.shape), (4096,))
             self.assertEqual(tuple(tracker.foot_contact_mask.shape), (4096, 4))
             self.assertEqual(
-                tuple(tracker.landing_foot_contact_mask.shape), (4096, 4)
+                tuple(tracker.body_contact_history.shape), (4096, 25)
             )
             self.assertEqual(
-                tuple(tracker.first_foot_contact_buf.shape), (4096,)
+                tuple(tracker.front_foot_contact_buf.shape), (4096,)
             )
             self.assertEqual(
-                tuple(tracker.second_foot_contact_buf.shape), (4096,)
+                tuple(tracker.rear_foot_contact_buf.shape), (4096,)
             )
             self.assertEqual(tuple(tracker.success_buf.shape), (4096,))
             self.assertEqual(tuple(tracker.incomplete_buf.shape), (4096,))
@@ -362,7 +455,8 @@ class BoxProgressTrackerTest(unittest.TestCase):
         self.landing_end_x = self.box_bounds[:, 1, 0].clone()
 
         self.put_foot_on_box(0, 0, 0)
-        self.put_foot_on_box(0, 1, 0)
+        self.put_foot_on_box(0, 2, 0)
+        self.update()
         self.update()
         self.base_positions[0, 0] = 2.16
         self.update()
@@ -371,10 +465,10 @@ class BoxProgressTrackerTest(unittest.TestCase):
 
         self.contact_forces.zero_()
         self.put_foot_on_box(0, 0, 1)
-        self.put_foot_on_box(0, 1, 1)
+        self.put_foot_on_box(0, 2, 1)
         self.update()
-        self.assertFalse(self.tracker.first_foot_contact_buf[0])
-        self.assertFalse(self.tracker.second_foot_contact_buf[0])
+        self.assertFalse(self.tracker.front_foot_contact_buf[0])
+        self.assertFalse(self.tracker.rear_foot_contact_buf[0])
         self.assertEqual(self.tracker.passed_box_count[0].item(), 1)
 
         self.feet_positions[0, :, 0] = 2.5

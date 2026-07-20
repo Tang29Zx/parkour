@@ -421,11 +421,16 @@ class OnPolicyRunner:
             * max_action_scale
         )
         if self.alg.collapse_warning:
+            protection_message = (
+                " and a stronger reference-policy constraint"
+                if self.alg.reference_kl_max_coef > 0.0
+                else ""
+            )
             print(
                 "\033[1;31m"
-                "WARNING: protected Actor metrics indicate policy collapse. "
-                "Training continues with reduced quality difficulty and a "
-                "stronger reference-policy constraint."
+                "WARNING: Actor metrics indicate policy collapse. Training "
+                "continues with reduced quality difficulty"
+                f"{protection_message}."
                 "\033[0m"
             )
         if self.alg.reward_order_warning:
@@ -667,7 +672,10 @@ class OnPolicyRunner:
         if manipulator_name == "reset_critic_and_optimizer":
             self.alg.start_critic_warmup(self.current_learning_iteration)
             self.alg.set_quality_levels(0.0, 0.0)
-            self.alg.snapshot_reference_policy()
+            if self.alg.reference_kl_max_coef > 0.0:
+                self.alg.snapshot_reference_policy()
+            else:
+                self.alg.reference_actor_critic = None
         self._apply_quality_levels_to_env()
         if manipulator_name:
             try:

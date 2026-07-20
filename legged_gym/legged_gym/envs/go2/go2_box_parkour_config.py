@@ -58,27 +58,27 @@ class Go2BoxParkourCfg(DebugGo2BoxCfg):
     class rewards(DebugGo2BoxCfg.rewards):
         class scales:
             tracking_ang_vel = 0.2
-            forward_speed_tracking = 2.0
+            forward_speed_tracking = 0.5
             course_progress = 1000.0
-            speed_error_square = -1.0
-            overspeed = -1.5
+            # V15 restores valid four-leg motion before precise speed control.
+            speed_error_square = 0.0
+            overspeed = 0.0
             action_rate = -0.01
-            flat_orientation = -0.2
+            flat_orientation = -0.5
             lin_pos_y = -0.1
             yaw_abs = -0.1
             energy_substeps = -2e-7
             torques = -1e-7
             dof_error_named = -1.0
             dof_error = -0.005
-            # Base contact is a hard safety cost. Leg rubbing is introduced by
-            # the action-quality curriculum to preserve the source behavior.
-            body_collision = -0.05
-            thigh_collision = -0.05
-            calf_collision = -0.05
+            body_collision = -5.0
+            thigh_collision = -0.5
+            calf_collision = -0.5
+            rear_support_missing = -0.5
             exceed_dof_pos_limits = -0.1
             exceed_torque_limits_l1norm = -0.1
-            box_first_foot_contact = 5.0
-            box_second_foot_contact = 10.0
+            box_front_foot_contact = 5.0
+            box_rear_foot_contact = 10.0
             box_passed = 25.0
             success = 500.0
             termination = -2000.0
@@ -86,8 +86,14 @@ class Go2BoxParkourCfg(DebugGo2BoxCfg):
 
         only_positive_rewards = False
         forward_speed_tracking_sigma = 0.25
-        speed_penalty_initial_level = 0.1
+        speed_penalty_initial_level = 0.0
         motion_quality_initial_level = 0.0
+        body_collision_floor = 1.0
+        leg_collision_floor = 0.25
+        flat_orientation_floor = 0.25
+        action_rate_floor = 0.10
+        dof_error_floor = 0.10
+        rear_support_grace_steps = 15
         # Track the command closely on flat ground. Near a box, allow a brief
         # positive speed error for jumping or climbing without rewarding it.
         # Smoothly blend the local speed limit over these distances. Only the
@@ -113,9 +119,18 @@ class Go2BoxParkourCfg(DebugGo2BoxCfg):
         pass_margin = 0.15
         top_contact_tolerance = 0.06
         contact_force_threshold = 1.0
-        required_distinct_feet = 2
+        front_contact_required_steps = 2
+        rear_contact_required_steps = 2
         landing_steps = 10
-        body_contact_steps = 15
+        landing_min_current_feet = 2
+        landing_require_rear_foot = True
+        landing_roll_threshold = 0.35
+        landing_pitch_threshold = 0.45
+        landing_base_height_threshold = 0.22
+        landing_vertical_speed_threshold = 0.5
+        body_contact_window_steps = 25
+        body_contact_failure_steps = 8
+        severe_body_impact_force = 80.0
         roll_threshold = 1.4
         pitch_threshold = 1.6
         base_height_threshold = 0.15
@@ -137,27 +152,25 @@ class Go2BoxParkourCfgPPO(Go2RoughCfgPPO):
         gamma = 0.999
         lam = 0.95
         critic_warmup_iterations = 100
-        actor_finetune_learning_rate = 1e-5
+        actor_finetune_learning_rate = 2e-5
         actor_finetune_clip_param = 0.1
         actor_finetune_entropy_coef = 0.001
-        # Adapt behavior protection from task capability rather than coupling
-        # it directly to the active penalty level.
-        reference_kl_min_coef = 0.002
-        reference_kl_max_coef = 1.0
-        reference_kl_start_coef = 0.20
+        # The 11300 Actor initializes V15 but is not a behavior reference.
+        reference_kl_min_coef = 0.0
+        reference_kl_max_coef = 0.0
+        reference_kl_start_coef = 0.0
         reference_kl_stable_windows = 2
         reference_kl_stable_decrease = 0.02
         reference_kl_regression_increase = 0.10
         reference_kl_regression_floor = 0.50
-        # Current and frozen Actors are compared on the same one-step GRU path.
-        # Padded batch replay has a separate diagnostic because CUDA float32
-        # accumulation order can differ without any parameter mutation.
+        # Keep the checkpoint schema compatible; with KL max set to zero no
+        # frozen reference policy is created and these limits remain inactive.
         actor_parameter_equivalence_tolerance = 0.0
         actor_output_equivalence_tolerance = 1e-5
         actor_std_equivalence_tolerance = 1e-7
         require_v11_curriculum_state = True
         quality_min_episodes = 256
-        speed_penalty_initial_level = 0.10
+        speed_penalty_initial_level = 0.0
         motion_quality_initial_level = 0.0
         curriculum_level_step = 0.10
         curriculum_stage_min_iterations = 200
@@ -187,7 +200,7 @@ class Go2BoxParkourCfgPPO(Go2RoughCfgPPO):
 
     class runner(Go2RoughCfgPPO.runner):
         experiment_name = "go2_box_parkour"
-        run_name = "five_box_v14_speed_priority_from14600"
+        run_name = "five_box_v15_gait_repair_from11300"
         # Partial episodes generated at process startup do not represent the
         # checkpoint policy and must not drive the box curriculum or KL state.
         init_at_random_ep_len = False
@@ -196,13 +209,13 @@ class Go2BoxParkourCfgPPO(Go2RoughCfgPPO):
             osp.dirname(osp.dirname(osp.dirname(osp.dirname(__file__)))),
             "logs",
             "go2_box_parkour",
-            "Jul20_22-17-25_five_box_v13_from14400",
+            "Jul19_22-22-00_five_box_v4_from11200",
         )
-        checkpoint = 14600
-        # Select the v14 KL migration explicitly on the first CLI launch. Keep
-        # this disabled so later v14 resumes do not rewrite learned KL state.
+        checkpoint = 11300
+        # Select Critic reset explicitly on the first CLI launch. Later V15
+        # resumes must not reset the learned Critic again.
         ckpt_manipulator = None
-        max_iterations = 200
+        max_iterations = 300
         save_interval = 100
         log_interval = 10
 

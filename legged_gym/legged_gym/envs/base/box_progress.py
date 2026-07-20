@@ -18,18 +18,50 @@ class BoxProgressTracker:
         pass_margin=0.15,
         top_contact_tolerance=0.06,
         contact_force_threshold=1.0,
-        required_distinct_feet=2,
+        front_foot_indices=(0, 1),
+        rear_foot_indices=(2, 3),
+        front_contact_required_steps=2,
+        rear_contact_required_steps=2,
         landing_steps=10,
-        body_contact_steps=15,
+        landing_min_current_feet=2,
+        landing_require_rear_foot=True,
+        landing_roll_threshold=0.35,
+        landing_pitch_threshold=0.45,
+        landing_base_height_threshold=0.22,
+        landing_vertical_speed_threshold=0.5,
+        body_contact_window_steps=25,
+        body_contact_failure_steps=8,
+        severe_body_impact_force=80.0,
         roll_threshold=1.4,
         pitch_threshold=1.6,
         base_height_threshold=0.15,
         lateral_limit=0.8,
     ):
-        if num_feet < required_distinct_feet:
-            raise ValueError("required_distinct_feet exceeds the available feet.")
-        if landing_steps <= 0 or body_contact_steps <= 0:
-            raise ValueError("Contact counters must contain at least one step.")
+        front_foot_indices = tuple(int(index) for index in front_foot_indices)
+        rear_foot_indices = tuple(int(index) for index in rear_foot_indices)
+        all_group_indices = front_foot_indices + rear_foot_indices
+        if not front_foot_indices or not rear_foot_indices:
+            raise ValueError("Front and rear foot groups must both be non-empty.")
+        if len(set(all_group_indices)) != len(all_group_indices):
+            raise ValueError("Front and rear foot groups must be disjoint.")
+        if min(all_group_indices) < 0 or max(all_group_indices) >= num_feet:
+            raise ValueError("Foot group index is outside the available feet.")
+        if min(front_contact_required_steps, rear_contact_required_steps) <= 0:
+            raise ValueError("Box contact requirements must be positive.")
+        if landing_steps <= 0:
+            raise ValueError("landing_steps must be positive.")
+        if not 1 <= landing_min_current_feet <= num_feet:
+            raise ValueError(
+                "landing_min_current_feet must be between 1 and num_feet."
+            )
+        if body_contact_window_steps <= 0:
+            raise ValueError("body_contact_window_steps must be positive.")
+        if not 1 <= body_contact_failure_steps <= body_contact_window_steps:
+            raise ValueError(
+                "body_contact_failure_steps must be within the contact window."
+            )
+        if severe_body_impact_force <= 0.0:
+            raise ValueError("severe_body_impact_force must be positive.")
 
         self.num_envs = int(num_envs)
         self.num_feet = int(num_feet)
@@ -48,9 +80,28 @@ class BoxProgressTracker:
         self.pass_margin = float(pass_margin)
         self.top_contact_tolerance = float(top_contact_tolerance)
         self.contact_force_threshold = float(contact_force_threshold)
-        self.required_distinct_feet = int(required_distinct_feet)
+        self.front_foot_indices = torch.tensor(
+            front_foot_indices, dtype=torch.long, device=device
+        )
+        self.rear_foot_indices = torch.tensor(
+            rear_foot_indices, dtype=torch.long, device=device
+        )
+        self.front_contact_required_steps = int(front_contact_required_steps)
+        self.rear_contact_required_steps = int(rear_contact_required_steps)
         self.landing_steps = int(landing_steps)
-        self.body_contact_steps = int(body_contact_steps)
+        self.landing_min_current_feet = int(landing_min_current_feet)
+        self.landing_require_rear_foot = bool(landing_require_rear_foot)
+        self.landing_roll_threshold = float(landing_roll_threshold)
+        self.landing_pitch_threshold = float(landing_pitch_threshold)
+        self.landing_base_height_threshold = float(
+            landing_base_height_threshold
+        )
+        self.landing_vertical_speed_threshold = float(
+            landing_vertical_speed_threshold
+        )
+        self.body_contact_window_steps = int(body_contact_window_steps)
+        self.body_contact_failure_steps = int(body_contact_failure_steps)
+        self.severe_body_impact_force = float(severe_body_impact_force)
         self.roll_threshold = float(roll_threshold)
         self.pitch_threshold = float(pitch_threshold)
         self.base_height_threshold = float(base_height_threshold)
@@ -63,17 +114,30 @@ class BoxProgressTracker:
         self.foot_contact_mask = torch.zeros(
             self.num_envs, self.num_feet, dtype=torch.bool, device=device
         )
-        self.landing_foot_contact_mask = torch.zeros_like(
-            self.foot_contact_mask
+        self.front_contact_counter = torch.zeros_like(self.next_box_idx)
+        self.rear_contact_counter = torch.zeros_like(self.next_box_idx)
+        self.body_contact_history = torch.zeros(
+            self.num_envs,
+            self.body_contact_window_steps,
+            dtype=torch.bool,
+            device=device,
         )
-        self.body_contact_counter = torch.zeros_like(self.next_box_idx)
+        self.body_contact_history_index = 0
+        self.body_contact_window_count = torch.zeros_like(self.next_box_idx)
+        self.max_body_contact_window_count = torch.zeros_like(
+            self.next_box_idx
+        )
         self.landing_counter = torch.zeros_like(self.next_box_idx)
 
         self.box_passed_buf = torch.zeros(
             self.num_envs, dtype=torch.bool, device=device
         )
-        self.first_foot_contact_buf = torch.zeros_like(self.box_passed_buf)
-        self.second_foot_contact_buf = torch.zeros_like(self.box_passed_buf)
+        self.front_foot_contact_buf = torch.zeros_like(self.box_passed_buf)
+        self.rear_foot_contact_buf = torch.zeros_like(self.box_passed_buf)
+        self.body_contact_window_failure_buf = torch.zeros_like(
+            self.box_passed_buf
+        )
+        self.severe_body_impact_buf = torch.zeros_like(self.box_passed_buf)
         self.success_buf = torch.zeros_like(self.box_passed_buf)
         self.missed_box_buf = torch.zeros_like(self.box_passed_buf)
         self.out_of_track_buf = torch.zeros_like(self.box_passed_buf)
@@ -90,8 +154,11 @@ class BoxProgressTracker:
         self.next_box_idx[env_ids] = 0
         self.passed_box_count[env_ids] = 0
         self.foot_contact_mask[env_ids] = False
-        self.landing_foot_contact_mask[env_ids] = False
-        self.body_contact_counter[env_ids] = 0
+        self.front_contact_counter[env_ids] = 0
+        self.rear_contact_counter[env_ids] = 0
+        self.body_contact_history[env_ids] = False
+        self.body_contact_window_count[env_ids] = 0
+        self.max_body_contact_window_count[env_ids] = 0
         self.landing_counter[env_ids] = 0
         self._clear_events(env_ids)
 
@@ -99,8 +166,10 @@ class BoxProgressTracker:
         if env_ids is None:
             env_ids = slice(None)
         self.box_passed_buf[env_ids] = False
-        self.first_foot_contact_buf[env_ids] = False
-        self.second_foot_contact_buf[env_ids] = False
+        self.front_foot_contact_buf[env_ids] = False
+        self.rear_foot_contact_buf[env_ids] = False
+        self.body_contact_window_failure_buf[env_ids] = False
+        self.severe_body_impact_buf[env_ids] = False
         self.success_buf[env_ids] = False
         self.missed_box_buf[env_ids] = False
         self.out_of_track_buf[env_ids] = False
@@ -123,6 +192,8 @@ class BoxProgressTracker:
         roll,
         pitch,
         body_contact,
+        body_contact_force,
+        base_vertical_velocity,
         natural_timeout,
         landing_end_x=None,
         external_timeout=None,
@@ -136,7 +207,6 @@ class BoxProgressTracker:
         target_indices = self.next_box_idx.clamp(max=self.required_boxes - 1)
         target_bounds = box_bounds[env_ids, target_indices]
 
-        previous_contact_count = self.foot_contact_mask.sum(dim=1)
         top_contact = self._get_top_contacts(
             active,
             target_bounds,
@@ -145,24 +215,41 @@ class BoxProgressTracker:
             feet_contact_forces,
         )
         self.foot_contact_mask |= top_contact
-        current_contact_count = self.foot_contact_mask.sum(dim=1)
-        self.first_foot_contact_buf[:] = (
-            active & (previous_contact_count < 1) & (current_contact_count >= 1)
+        front_contact = top_contact[:, self.front_foot_indices].any(dim=1)
+        rear_contact = top_contact[:, self.rear_foot_indices].any(dim=1)
+        previous_front_count = self.front_contact_counter.clone()
+        previous_rear_count = self.rear_contact_counter.clone()
+        self.front_contact_counter += active & front_contact
+        self.rear_contact_counter += active & rear_contact
+        self.front_contact_counter.clamp_(
+            max=self.front_contact_required_steps
         )
-        self.second_foot_contact_buf[:] = (
-            active & (previous_contact_count < 2) & (current_contact_count >= 2)
+        self.rear_contact_counter.clamp_(max=self.rear_contact_required_steps)
+        self.front_foot_contact_buf[:] = (
+            active
+            & (previous_front_count < self.front_contact_required_steps)
+            & (self.front_contact_counter >= self.front_contact_required_steps)
         )
-        enough_feet = current_contact_count >= self.required_distinct_feet
+        self.rear_foot_contact_buf[:] = (
+            active
+            & (previous_rear_count < self.rear_contact_required_steps)
+            & (self.rear_contact_counter >= self.rear_contact_required_steps)
+        )
+        contact_requirements_met = (
+            self.front_contact_counter >= self.front_contact_required_steps
+        ) & (self.rear_contact_counter >= self.rear_contact_required_steps)
         crossed_target = active & (
             base_positions[:, 0] > target_bounds[:, 1] + self.pass_margin
         )
-        self.missed_box_buf[:] = crossed_target & ~enough_feet
-        self.box_passed_buf[:] = crossed_target & enough_feet
+        self.missed_box_buf[:] = crossed_target & ~contact_requirements_met
+        self.box_passed_buf[:] = crossed_target & contact_requirements_met
 
         passed_envs = self.box_passed_buf.nonzero(as_tuple=False).flatten()
         self.next_box_idx[passed_envs] += 1
         self.passed_box_count[passed_envs] += 1
         self.foot_contact_mask[passed_envs] = False
+        self.front_contact_counter[passed_envs] = 0
+        self.rear_contact_counter[passed_envs] = 0
 
         force_contact = feet_contact_forces.norm(dim=-1) > self.contact_force_threshold
         course_rear = box_bounds[:, self.required_boxes - 1, 1]
@@ -181,10 +268,10 @@ class BoxProgressTracker:
             & force_contact
         )
         course_complete = self.next_box_idx == self.required_boxes
-        self.landing_foot_contact_mask |= (
-            course_complete.unsqueeze(1) & post_box_ground
+        current_landing_feet = post_box_ground.sum(dim=1)
+        rear_foot_support = post_box_ground[:, self.rear_foot_indices].any(
+            dim=1
         )
-        all_feet_landed = self.landing_foot_contact_mask.all(dim=1)
         base_height = base_positions[:, 2] - env_origins[:, 2]
         stable_landing = (
             course_complete
@@ -194,29 +281,51 @@ class BoxProgressTracker:
                 torch.abs(base_positions[:, 1] - env_origins[:, 1])
                 <= self.lateral_limit
             )
-            & (roll.abs() <= self.roll_threshold)
-            & (pitch.abs() <= self.pitch_threshold)
-            & (base_height >= self.base_height_threshold)
+            & (current_landing_feet >= self.landing_min_current_feet)
+            & (
+                rear_foot_support
+                if self.landing_require_rear_foot
+                else torch.ones_like(rear_foot_support)
+            )
+            & ~body_contact
+            & (roll.abs() <= self.landing_roll_threshold)
+            & (pitch.abs() <= self.landing_pitch_threshold)
+            & (base_height >= self.landing_base_height_threshold)
+            & (
+                base_vertical_velocity.abs()
+                <= self.landing_vertical_speed_threshold
+            )
         )
         self.landing_counter[:] = torch.where(
             stable_landing,
             self.landing_counter + 1,
             torch.zeros_like(self.landing_counter),
         )
-        landing_success = all_feet_landed & (
-            self.landing_counter >= self.landing_steps
-        )
+        landing_success = self.landing_counter >= self.landing_steps
 
-        self.body_contact_counter[:] = torch.where(
-            body_contact,
-            self.body_contact_counter + 1,
-            torch.zeros_like(self.body_contact_counter),
+        self.body_contact_history[:, self.body_contact_history_index] = (
+            body_contact
+        )
+        self.body_contact_history_index = (
+            self.body_contact_history_index + 1
+        ) % self.body_contact_window_steps
+        self.body_contact_window_count[:] = self.body_contact_history.sum(dim=1)
+        self.max_body_contact_window_count[:] = torch.maximum(
+            self.max_body_contact_window_count,
+            self.body_contact_window_count,
+        )
+        self.body_contact_window_failure_buf[:] = (
+            self.body_contact_window_count >= self.body_contact_failure_steps
+        )
+        self.severe_body_impact_buf[:] = (
+            body_contact_force >= self.severe_body_impact_force
         )
         raw_fall = (
             (roll.abs() > self.roll_threshold)
             | (pitch.abs() > self.pitch_threshold)
             | (base_height < self.base_height_threshold)
-            | (self.body_contact_counter >= self.body_contact_steps)
+            | self.body_contact_window_failure_buf
+            | self.severe_body_impact_buf
         )
 
         lateral_offset = (base_positions[:, 1] - env_origins[:, 1]).abs()

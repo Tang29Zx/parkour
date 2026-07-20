@@ -531,6 +531,7 @@ class CriticWarmupTest(unittest.TestCase):
             self.assertEqual(
                 runner.alg.critic_warmup_until_iteration, 11800
             )
+            self.assertIsNone(runner.alg.reference_actor_critic)
             manipulated_path = Path(temp_dir) / "model_11700.pt"
             self.assertTrue(manipulated_path.is_file())
 
