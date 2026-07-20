@@ -25,6 +25,10 @@ class EpisodeAudit:
         self.episode_count = 0.0
         self.weighted = defaultdict(float)
         self.weights = defaultdict(float)
+        self.discounted_total = 0.0
+        self.discounted_count = 0.0
+        self.discounted_success_total = 0.0
+        self.discounted_success_count = 0.0
 
     def add(self, episode):
         count = _scalar(episode.get("num_terminated", 0.0))
@@ -45,10 +49,28 @@ class EpisodeAudit:
             self.weighted[key] += _scalar(value) * weight
             self.weights[key] += weight
 
+    def add_discounted(self, returns, successes):
+        """Accumulate true discounted returns before reset buffers are cleared."""
+        if returns.numel() == 0:
+            return
+        self.discounted_total += float(returns.sum().item())
+        self.discounted_count += float(returns.numel())
+        successful_returns = returns[successes]
+        self.discounted_success_total += float(successful_returns.sum().item())
+        self.discounted_success_count += float(successful_returns.numel())
+
     def summary(self):
         result = {"episode_count": self.episode_count}
         for key, total in self.weighted.items():
             result[key] = total / max(self.weights[key], 1.0)
+        if self.discounted_count > 0.0:
+            result["discounted/mean_return"] = (
+                self.discounted_total / self.discounted_count
+            )
+        if self.discounted_success_count > 0.0:
+            result["discounted/success_mean_return"] = (
+                self.discounted_success_total / self.discounted_success_count
+            )
         return result
 
 
@@ -75,6 +97,9 @@ def run_mode(mode, env, actor_critic, args):
     episode_age = torch.zeros(
         env.num_envs, dtype=torch.long, device=env.device
     )
+    discounted_return = torch.zeros(
+        env.num_envs, dtype=torch.float, device=env.device
+    )
     audit = EpisodeAudit()
 
     while audit.episode_count < args.audit_episodes:
@@ -100,21 +125,39 @@ def run_mode(mode, env, actor_critic, args):
         actions = _actions_for_mode(
             mode, actor_critic, obs.detach(), env, episode_age, args
         )
-        obs, _, _, dones, infos = env.step(actions.detach())
+        obs, _, rewards, dones, infos = env.step(actions.detach())
+        discounted_return += (
+            torch.pow(
+                torch.full_like(discounted_return, args.audit_gamma),
+                episode_age.float(),
+            )
+            * rewards
+        )
         episode_age += 1
         # ``env.extras`` is persistent, so an old episode dictionary can be
         # returned again on non-terminal steps. Count it only with fresh dones.
         if dones.any() and "episode" in infos and infos["episode"]:
             audit.add(infos["episode"])
         if dones.any():
+            successes = infos.get(
+                "successes",
+                torch.zeros_like(dones, dtype=torch.bool),
+            ).bool()
+            audit.add_discounted(
+                discounted_return[dones], successes[dones]
+            )
             actor_critic.reset(dones)
             episode_age[dones] = 0
+            discounted_return[dones] = 0.0
     return audit.summary()
 
 
 def _reward_audit_warnings(results):
     normal = results.get("policy", {})
     success_return = normal.get("raw/success_mean_return")
+    discounted_success_return = normal.get(
+        "discounted/success_mean_return"
+    )
     comparisons = (
         ("zero", "raw/incomplete_mean_return", "standing/zero-action"),
         ("early_failure", "raw/early_failure_mean_return", "early failure"),
@@ -137,6 +180,15 @@ def _reward_audit_warnings(results):
                     f"Successful return {success_return:.3f} is not greater "
                     f"than {label} return {baseline:.3f}."
                 )
+    if discounted_success_return is not None:
+        for mode, _, label in comparisons:
+            baseline = results.get(mode, {}).get("discounted/mean_return")
+            if baseline is not None and discounted_success_return <= baseline:
+                warnings.append(
+                    f"Discounted successful return "
+                    f"{discounted_success_return:.3f} is not greater than "
+                    f"{label} discounted return {baseline:.3f}."
+                )
     if warnings:
         print("\033[1;31mREWARD LOOPHOLE WARNING")
         for warning in warnings:
@@ -151,7 +203,8 @@ def audit(args):
     if args.num_envs is None:
         env_cfg.env.num_envs = 256
     train_cfg.runner.resume = True
-    train_cfg.runner.ckpt_manipulator = None
+    if args.ckpt_manipulator is not None:
+        train_cfg.runner.ckpt_manipulator = args.ckpt_manipulator
     env, env_cfg = task_registry.make_env(
         args.task, args=args, env_cfg=env_cfg
     )
@@ -165,6 +218,11 @@ def audit(args):
     )
     actor_critic = runner.alg.actor_critic
     actor_critic.eval()
+    if hasattr(env, "set_quality_levels"):
+        env.set_quality_levels(
+            args.speed_penalty_level,
+            args.motion_quality_level,
+        )
 
     modes = [mode.strip() for mode in args.audit_modes.split(",") if mode.strip()]
     supported = {
@@ -191,6 +249,24 @@ if __name__ == "__main__":
     audit(
         get_args(
             [
+                {
+                    "name": "--audit_gamma",
+                    "type": float,
+                    "default": 0.999,
+                    "help": "Discount factor used only for audit reporting.",
+                },
+                {
+                    "name": "--speed_penalty_level",
+                    "type": float,
+                    "default": 1.0,
+                    "help": "Speed-penalty level used during the frozen audit.",
+                },
+                {
+                    "name": "--motion_quality_level",
+                    "type": float,
+                    "default": 0.0,
+                    "help": "Motion-quality level used during the frozen audit.",
+                },
                 {
                     "name": "--audit_episodes",
                     "type": int,

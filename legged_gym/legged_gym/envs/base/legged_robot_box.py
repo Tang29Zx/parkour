@@ -105,8 +105,31 @@ class LeggedRobotBox(LeggedRobot):
         self.body_collision_count = torch.zeros_like(
             self.dof_near_limit_count
         )
-        self.quality_level = float(
-            getattr(self.cfg.rewards, "quality_initial_level", 0.0)
+        self.speed_penalty_level = float(
+            getattr(
+                self.cfg.rewards,
+                "speed_penalty_initial_level",
+                0.0,
+            )
+        )
+        self.motion_quality_level = float(
+            getattr(
+                self.cfg.rewards,
+                "motion_quality_initial_level",
+                0.0,
+            )
+        )
+        self.progress_reward_start = torch.zeros_like(
+            self.forward_speed_sum
+        )
+        self.rewarded_progress_ratio = torch.zeros_like(
+            self.forward_speed_sum
+        )
+        self.course_progress_delta_buf = torch.zeros_like(
+            self.forward_speed_sum
+        )
+        self.progress_reward_initialized = torch.zeros(
+            self.num_envs, dtype=torch.bool, device=self.device
         )
 
         rigid_body_names = self.gym.get_actor_rigid_body_names(
@@ -191,6 +214,31 @@ class LeggedRobotBox(LeggedRobot):
         self.body_contact_counter = tracker.body_contact_counter
         self.landing_counter = tracker.landing_counter
         self.episode_timeout_buf = tracker.episode_timeout_buf
+
+    def _update_course_progress_reward(self):
+        """Reward only a new per-episode high-water mark in course progress."""
+        current_progress = self.task_progress_buf.clamp(0.0, 1.0)
+        uninitialized = ~self.progress_reward_initialized
+        if uninitialized.any():
+            self.progress_reward_start[uninitialized] = current_progress[
+                uninitialized
+            ]
+            self.rewarded_progress_ratio[uninitialized] = 0.0
+            self.progress_reward_initialized[uninitialized] = True
+
+        denominator = (1.0 - self.progress_reward_start).clamp_min(1e-6)
+        normalized_progress = (
+            (current_progress - self.progress_reward_start) / denominator
+        ).clamp(0.0, 1.0)
+        new_high_water_mark = torch.maximum(
+            self.rewarded_progress_ratio,
+            normalized_progress,
+        )
+        self.course_progress_delta_buf[:] = (
+            new_high_water_mark - self.rewarded_progress_ratio
+        ).clamp_min(0.0)
+        self.course_progress_delta_buf[uninitialized] = 0.0
+        self.rewarded_progress_ratio[:] = new_high_water_mark
 
     def _refresh_box_course_data(self):
         track_indices = torch.stack(
@@ -607,6 +655,7 @@ class LeggedRobotBox(LeggedRobot):
             natural_timeout=natural_timeout,
             landing_end_x=self.course_landing_end_x,
         )
+        self._update_course_progress_reward()
         self.box_progress.apply_termination(
             self.reset_buf, self.time_out_buf
         )
@@ -650,6 +699,9 @@ class LeggedRobotBox(LeggedRobot):
             self.passed_box_count[env_ids].float().mean()
             / self.box_progress.required_boxes
         )
+        episode["rewarded_progress_ratio"] = self.rewarded_progress_ratio[
+            env_ids
+        ].mean()
         episode.update(self._get_speed_statistics(env_ids))
         episode.update(self._get_motion_quality_statistics(env_ids))
         for name, values in raw_reward_sums.items():
@@ -722,6 +774,11 @@ class LeggedRobotBox(LeggedRobot):
             self._reset_speed_statistics(env_ids)
         if hasattr(self, "abs_roll_sum"):
             self._reset_motion_quality_statistics(env_ids)
+        if hasattr(self, "progress_reward_initialized"):
+            self.progress_reward_start[env_ids] = 0.0
+            self.rewarded_progress_ratio[env_ids] = 0.0
+            self.course_progress_delta_buf[env_ids] = 0.0
+            self.progress_reward_initialized[env_ids] = False
 
     def _near_box_for_speed_control(self):
         """Return environments with a non-zero current-box speed blend."""
@@ -776,12 +833,17 @@ class LeggedRobotBox(LeggedRobot):
             self.base_lin_vel.dtype
         ) * self.cfg.rewards.box_speed_allowance
 
+    def set_quality_levels(self, speed_penalty_level, motion_quality_level):
+        """Set independent speed and motion-quality curriculum levels."""
+        levels = (float(speed_penalty_level), float(motion_quality_level))
+        if not all(np.isfinite(level) for level in levels):
+            raise ValueError("Quality curriculum levels must be finite.")
+        self.speed_penalty_level = min(max(levels[0], 0.0), 1.0)
+        self.motion_quality_level = min(max(levels[1], 0.0), 1.0)
+
     def set_quality_level(self, level):
-        """Set the global action-quality curriculum level."""
-        level = float(level)
-        if not np.isfinite(level):
-            raise ValueError("quality_level must be finite.")
-        self.quality_level = min(max(level, 0.0), 1.0)
+        """Backward-compatible helper that sets both curriculum levels."""
+        self.set_quality_levels(level, level)
 
     def _reward_speed_error_square(self):
         """Penalize command error while preserving a short box-speed allowance."""
@@ -793,7 +855,7 @@ class LeggedRobotBox(LeggedRobot):
             speed_error,
         )
         return torch.square(adjusted_error) * float(
-            getattr(self, "quality_level", 1.0)
+            getattr(self, "speed_penalty_level", 1.0)
         )
 
     def _reward_forward_speed_tracking(self):
@@ -822,7 +884,7 @@ class LeggedRobotBox(LeggedRobot):
         return (
             action_rate
             * (self.episode_length_buf > 1).float()
-            * float(getattr(self, "quality_level", 1.0))
+            * float(getattr(self, "motion_quality_level", 1.0))
         )
 
     def _reward_overspeed(self):
@@ -838,8 +900,12 @@ class LeggedRobotBox(LeggedRobot):
         )
         excess_speed = torch.relu(self.base_lin_vel[:, 0] - speed_limit)
         return torch.square(excess_speed) * float(
-            getattr(self, "quality_level", 1.0)
+            getattr(self, "speed_penalty_level", 1.0)
         )
+
+    def _reward_course_progress(self):
+        """Return the non-repeatable normalized course-progress increment."""
+        return self.course_progress_delta_buf
 
     def _reward_termination(self):
         """Penalize failure by spatial task progress, never by elapsed time."""
@@ -865,17 +931,17 @@ class LeggedRobotBox(LeggedRobot):
         return (
             tilt_square
             * (1.0 - self._box_speed_blend())
-            * float(getattr(self, "quality_level", 1.0))
+            * float(getattr(self, "motion_quality_level", 1.0))
         )
 
     def _reward_dof_error_named(self):
         return super()._reward_dof_error_named() * float(
-            getattr(self, "quality_level", 1.0)
+            getattr(self, "motion_quality_level", 1.0)
         )
 
     def _reward_dof_error(self):
         return super()._reward_dof_error() * float(
-            getattr(self, "quality_level", 1.0)
+            getattr(self, "motion_quality_level", 1.0)
         )
 
     def _contact_count(self, indices, threshold):
@@ -899,14 +965,14 @@ class LeggedRobotBox(LeggedRobot):
         return self._contact_count(
             self.thigh_contact_indices,
             self.cfg.rewards.leg_contact_force_threshold,
-        ) * float(getattr(self, "quality_level", 1.0))
+        ) * float(getattr(self, "motion_quality_level", 1.0))
 
     def _reward_calf_collision(self):
         """Gradually discourage light calf contacts."""
         return self._contact_count(
             self.calf_contact_indices,
             self.cfg.rewards.leg_contact_force_threshold,
-        ) * float(getattr(self, "quality_level", 1.0))
+        ) * float(getattr(self, "motion_quality_level", 1.0))
 
     def _reward_lin_pos_y(self):
         """Penalize lateral displacement from the course centerline."""

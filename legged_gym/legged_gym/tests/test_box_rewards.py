@@ -229,6 +229,71 @@ class HeightEncoderMigrationTest(unittest.TestCase):
                 dict(model_state_dict=target_model),
             )
 
+    def test_v11_initializer_preserves_verified_warmup_checkpoint(self):
+        model = OrderedDict(
+            [("actor.weight", torch.ones(2, 2)), ("critic.weight", torch.ones(1, 2))]
+        )
+        source = {
+            "model_state_dict": model,
+            "optimizer_state_dict": {"state": "warm"},
+            "reference_model_state_dict": {"actor.weight": torch.ones(2, 2)},
+            "algorithm_state_dict": {
+                "critic_warmup_until_iteration": 11800,
+                "actor_finetune_active": False,
+            },
+            "iter": 11800,
+        }
+        target = {
+            "model_state_dict": OrderedDict(
+                (name, torch.zeros_like(value)) for name, value in model.items()
+            ),
+            "algorithm_state_dict": {
+                "curriculum_state_version": 11,
+                "quality_phase": 0,
+                "speed_penalty_level": 0.1,
+                "motion_quality_level": 0.0,
+                "curriculum_stable_windows": 0,
+                "curriculum_regression_windows": 0,
+                "speed_master_windows": 0,
+                "motion_master_windows": 0,
+                "reference_kl_stable_window_count": 0,
+                "collapse_windows": 0,
+                "collapse_warning": False,
+                "reward_order_warning": False,
+                "current_reference_kl_coef": 0.2,
+            },
+        }
+
+        migrated = self.module.initialize_v11_from_v10_warmup(source, target)
+
+        for name, value in model.items():
+            self.assertTrue(torch.equal(migrated["model_state_dict"][name], value))
+        self.assertEqual(migrated["optimizer_state_dict"], {"state": "warm"})
+        self.assertEqual(
+            migrated["algorithm_state_dict"]["curriculum_state_version"], 11
+        )
+        self.assertEqual(
+            migrated["algorithm_state_dict"]["quality_stage_start_iteration"],
+            11800,
+        )
+
+    def test_v11_initializer_rejects_non_warmup_checkpoint(self):
+        source = {
+            "model_state_dict": OrderedDict([("actor.weight", torch.ones(1))]),
+            "reference_model_state_dict": {"actor.weight": torch.ones(1)},
+            "algorithm_state_dict": {
+                "critic_warmup_until_iteration": 11800,
+                "actor_finetune_active": False,
+            },
+            "iter": 12100,
+        }
+        target = {
+            "model_state_dict": OrderedDict([("actor.weight", torch.ones(1))]),
+            "algorithm_state_dict": {},
+        }
+        with self.assertRaises(ValueError):
+            self.module.initialize_v11_from_v10_warmup(source, target)
+
     def test_reinitializes_both_encoders_and_keeps_other_model_weights(self):
         source, target = self.make_states()
         migrated = self.module.reinitialize_height_encoders(source, target)
@@ -421,8 +486,9 @@ class BoxRewardTest(unittest.TestCase):
         self.assertAlmostEqual(scales.box_second_foot_contact * dt, 0.2)
         self.assertAlmostEqual(scales.box_passed * dt, 0.5)
         self.assertAlmostEqual(scales.success * dt, 10.0)
-        self.assertAlmostEqual(scales.termination * dt, -20.0)
-        self.assertAlmostEqual(scales.incomplete * dt, -20.0)
+        self.assertAlmostEqual(scales.course_progress * dt, 20.0)
+        self.assertAlmostEqual(scales.termination * dt, -40.0)
+        self.assertAlmostEqual(scales.incomplete * dt, -40.0)
         self.assertEqual(
             self.env_cfg.rewards.forward_speed_tracking_sigma, 0.02
         )
@@ -443,7 +509,7 @@ class BoxRewardTest(unittest.TestCase):
             ),
             task_progress_buf=torch.tensor([1.0, 0.5, 0.25]),
             cfg=SimpleNamespace(
-                rewards=SimpleNamespace(failure_progress_floor=0.25)
+                rewards=SimpleNamespace(failure_progress_floor=0.5)
             ),
         )
         first_foot = self.LeggedRobotBox._reward_box_first_foot_contact(env)
@@ -457,8 +523,8 @@ class BoxRewardTest(unittest.TestCase):
         self.assertEqual(second_foot.tolist(), [0.0, 1.0, 0.0])
         self.assertEqual(passed.tolist(), [1.0, 0.0, 0.0])
         self.assertEqual(success.tolist(), [1.0, 0.0, 0.0])
-        self.assertEqual(incomplete.tolist(), [0.0, 0.625, 0.0])
-        self.assertEqual(termination.tolist(), [0.0, 0.0, 0.8125])
+        self.assertEqual(incomplete.tolist(), [0.0, 0.75, 0.0])
+        self.assertEqual(termination.tolist(), [0.0, 0.0, 0.875])
 
     def test_failure_cost_depends_on_progress_not_elapsed_time(self):
         env = SimpleNamespace(
@@ -467,14 +533,14 @@ class BoxRewardTest(unittest.TestCase):
             ),
             task_progress_buf=torch.tensor([0.0, 0.0, 0.8]),
             cfg=SimpleNamespace(
-                rewards=SimpleNamespace(failure_progress_floor=0.25)
+                rewards=SimpleNamespace(failure_progress_floor=0.5)
             ),
         )
         multiplier = self.LeggedRobotBox._reward_termination(env)
         actual = multiplier * self.env_cfg.rewards.scales.termination * 0.02
 
         torch.testing.assert_close(
-            actual, torch.tensor([-20.0, -20.0, -8.0])
+            actual, torch.tensor([-40.0, -40.0, -24.0])
         )
         self.assertEqual(actual[0].item(), actual[1].item())
         self.assertLess(actual[0].item(), actual[2].item())
@@ -512,7 +578,8 @@ class BoxRewardTest(unittest.TestCase):
         env.commands = torch.tensor(
             [[0.5, 0.0, 0.0]]
         ).repeat(6, 1)
-        env.quality_level = 1.0
+        env.speed_penalty_level = 1.0
+        env.motion_quality_level = 1.0
         return env
 
     def test_only_current_box_opens_speed_window(self):
@@ -556,9 +623,10 @@ class BoxRewardTest(unittest.TestCase):
         limits = 0.7 + blend * 0.5
         torch.testing.assert_close(reward, torch.square(torch.relu(1.0 - limits)))
 
-    def test_quality_level_scales_only_staged_penalties(self):
+    def test_speed_and_motion_levels_scale_separate_penalties(self):
         env = self.make_speed_reward_env()
-        env.quality_level = 0.0
+        env.speed_penalty_level = 0.0
+        env.motion_quality_level = 0.0
         torch.testing.assert_close(
             self.LeggedRobotBox._reward_speed_error_square(env),
             torch.zeros(6),
@@ -568,7 +636,7 @@ class BoxRewardTest(unittest.TestCase):
             torch.zeros(6),
         )
 
-        env.quality_level = 0.5
+        env.speed_penalty_level = 0.5
         torch.testing.assert_close(
             self.LeggedRobotBox._reward_speed_error_square(env),
             0.5 * torch.square(
@@ -576,10 +644,56 @@ class BoxRewardTest(unittest.TestCase):
             ),
         )
         tracking = self.LeggedRobotBox._reward_forward_speed_tracking(env)
-        env.quality_level = 1.0
+        env.speed_penalty_level = 1.0
         torch.testing.assert_close(
             self.LeggedRobotBox._reward_forward_speed_tracking(env), tracking
         )
+
+        env.actions = torch.ones(6, 2)
+        env.last_actions = torch.zeros(6, 2)
+        env.episode_length_buf = torch.full((6,), 2)
+        env.motion_quality_level = 0.0
+        torch.testing.assert_close(
+            self.LeggedRobotBox._reward_action_rate(env), torch.zeros(6)
+        )
+        env.motion_quality_level = 0.5
+        torch.testing.assert_close(
+            self.LeggedRobotBox._reward_action_rate(env), torch.ones(6)
+        )
+
+    def test_course_progress_reward_is_monotonic_and_non_repeatable(self):
+        env = SimpleNamespace(
+            task_progress_buf=torch.tensor([0.2]),
+            progress_reward_start=torch.zeros(1),
+            rewarded_progress_ratio=torch.zeros(1),
+            course_progress_delta_buf=torch.zeros(1),
+            progress_reward_initialized=torch.zeros(1, dtype=torch.bool),
+        )
+        method = self.LeggedRobotBox._update_course_progress_reward
+
+        method(env)
+        self.assertEqual(env.course_progress_delta_buf.item(), 0.0)
+        env.task_progress_buf[:] = 0.5
+        method(env)
+        first_delta = env.course_progress_delta_buf.item()
+        env.task_progress_buf[:] = 0.3
+        method(env)
+        self.assertEqual(env.course_progress_delta_buf.item(), 0.0)
+        env.task_progress_buf[:] = 0.5
+        method(env)
+        self.assertEqual(env.course_progress_delta_buf.item(), 0.0)
+        env.task_progress_buf[:] = 1.0
+        method(env)
+
+        self.assertAlmostEqual(
+            first_delta + env.course_progress_delta_buf.item(), 1.0
+        )
+        actual_total = (
+            env.rewarded_progress_ratio.item()
+            * self.env_cfg.rewards.scales.course_progress
+            * 0.02
+        )
+        self.assertAlmostEqual(actual_total, 20.0)
 
     def test_forward_speed_tracking_peaks_only_at_the_command(self):
         env = self.make_speed_reward_env()
@@ -633,7 +747,7 @@ class BoxRewardTest(unittest.TestCase):
         dt = 0.02
         command = 0.5
         course_distance = 3.0
-        event_total = 5 * (0.1 + 0.2 + 0.5) + 10.0
+        event_total = 5 * (0.1 + 0.2 + 0.5) + 10.0 + 20.0
         target_steps = int(course_distance / command / dt)
         target_return = event_total + target_steps * dt * (
             scales.forward_speed_tracking
@@ -668,6 +782,23 @@ class BoxRewardTest(unittest.TestCase):
         self.assertGreater(target_return, sprint_return)
         self.assertGreater(target_return, immediate_failure_return)
         self.assertLess(waiting_return, immediate_failure_return)
+
+        gamma = self.train_cfg.algorithm.gamma
+        target_tracking = 0.0
+        target_discounted = sum(
+            gamma ** step * target_tracking for step in range(target_steps)
+        ) + gamma ** target_steps * event_total
+        sprint_step_reward = dt * (
+            scales.forward_speed_tracking * sprint_tracking
+            + scales.speed_error_square * (sprint_speed - command) ** 2
+            + scales.overspeed
+            * (sprint_speed - self.env_cfg.rewards.flat_speed_limit) ** 2
+        )
+        sprint_discounted = sum(
+            gamma ** step * sprint_step_reward
+            for step in range(sprint_steps)
+        ) + gamma ** sprint_steps * event_total
+        self.assertGreater(target_discounted, sprint_discounted)
 
     def test_speed_statistics_are_finite_and_reset_to_zero(self):
         env = self.make_speed_reward_env()
@@ -786,7 +917,7 @@ class BoxRewardTest(unittest.TestCase):
             incomplete_buf=torch.zeros(4096, dtype=torch.bool),
             task_progress_buf=torch.zeros(4096),
             cfg=SimpleNamespace(
-                rewards=SimpleNamespace(failure_progress_floor=0.25)
+                rewards=SimpleNamespace(failure_progress_floor=0.5)
             ),
         )
         self.assertEqual(
@@ -911,15 +1042,15 @@ class BoxRewardTest(unittest.TestCase):
         runner = self.train_cfg.runner
         algorithm = self.train_cfg.algorithm
         self.assertTrue(runner.resume)
-        self.assertEqual(runner.checkpoint, 11700)
+        self.assertEqual(runner.checkpoint, 11800)
         self.assertEqual(
             runner.run_name,
-            "five_box_v10_critic_warmup_from11700",
+            "five_box_v11_speed_phase_from11800",
         )
         self.assertIsNone(runner.ckpt_manipulator)
         self.assertTrue(
             runner.load_run.endswith(
-                "Jul19_23-03-03_five_box_v5_stable_from11000"
+                "Jul20_18-38-38_five_box_v10_retry3_warmup100_train900"
             )
         )
         self.assertEqual(algorithm.schedule, "fixed")
@@ -931,8 +1062,12 @@ class BoxRewardTest(unittest.TestCase):
         self.assertEqual(algorithm.actor_finetune_learning_rate, 1e-5)
         self.assertEqual(algorithm.actor_finetune_clip_param, 0.1)
         self.assertEqual(algorithm.actor_finetune_entropy_coef, 0.001)
-        self.assertEqual(algorithm.reference_kl_min_coef, 0.05)
+        self.assertEqual(algorithm.reference_kl_min_coef, 0.02)
         self.assertEqual(algorithm.reference_kl_max_coef, 1.0)
+        self.assertEqual(algorithm.reference_kl_start_coef, 0.2)
+        self.assertEqual(algorithm.speed_penalty_initial_level, 0.1)
+        self.assertEqual(algorithm.motion_quality_initial_level, 0.0)
+        self.assertEqual(algorithm.curriculum_stage_min_iterations, 200)
         self.assertEqual(
             algorithm.actor_parameter_equivalence_tolerance, 0.0
         )
@@ -940,7 +1075,7 @@ class BoxRewardTest(unittest.TestCase):
             algorithm.actor_output_equivalence_tolerance, 1e-5
         )
         self.assertEqual(algorithm.actor_std_equivalence_tolerance, 1e-7)
-        self.assertEqual(runner.max_iterations, 100)
+        self.assertEqual(runner.max_iterations, 200)
         self.assertEqual(runner.save_interval, 100)
         self.assertEqual(runner.log_interval, 10)
 

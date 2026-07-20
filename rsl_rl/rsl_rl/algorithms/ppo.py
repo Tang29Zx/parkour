@@ -77,6 +77,37 @@ class PPO:
                  quality_fall_down=0.35,
                  collapse_success_threshold=0.60,
                  collapse_fall_threshold=0.50,
+                 require_v11_curriculum_state=False,
+                 speed_penalty_initial_level=0.10,
+                 motion_quality_initial_level=0.0,
+                 curriculum_level_step=0.10,
+                 curriculum_stage_min_iterations=200,
+                 curriculum_stable_windows=3,
+                 curriculum_regression_windows=2,
+                 speed_success_up=0.90,
+                 speed_box_pass_up=0.92,
+                 speed_fall_up=0.10,
+                 curriculum_success_down=0.85,
+                 curriculum_box_pass_down=0.88,
+                 curriculum_fall_down=0.15,
+                 speed_master_windows=5,
+                 speed_master_flat_min=0.45,
+                 speed_master_flat_max=0.70,
+                 speed_master_severe_overspeed=0.05,
+                 motion_success_up=0.88,
+                 motion_box_pass_up=0.90,
+                 motion_fall_up=0.12,
+                 motion_flat_speed_max=0.75,
+                 motion_severe_overspeed_max=0.10,
+                 motion_master_windows=5,
+                 motion_master_action_rate=2.0,
+                 motion_master_action_saturation=0.20,
+                 motion_master_dof_near_limit=0.10,
+                 reference_kl_start_coef=0.20,
+                 reference_kl_stable_windows=2,
+                 reference_kl_stable_decrease=0.02,
+                 reference_kl_regression_increase=0.10,
+                 reference_kl_regression_floor=0.50,
                  device='cpu',
                  ):
 
@@ -156,11 +187,84 @@ class PPO:
             raise ValueError("Actor equivalence tolerances must be non-negative.")
         self.reference_actor_critic = None
         self._reset_rollout_actor_equivalence_statistics()
-        self.quality_level = 0.0
-        self.quality_up_windows = 0
-        self.quality_down_windows = 0
+        self.require_v11_curriculum_state = bool(
+            require_v11_curriculum_state
+        )
+        self.speed_penalty_initial_level = float(
+            speed_penalty_initial_level
+        )
+        self.motion_quality_initial_level = float(
+            motion_quality_initial_level
+        )
+        self.curriculum_level_step = float(curriculum_level_step)
+        self.curriculum_stage_min_iterations = int(
+            curriculum_stage_min_iterations
+        )
+        self.curriculum_stable_windows_required = int(
+            curriculum_stable_windows
+        )
+        self.curriculum_regression_windows_required = int(
+            curriculum_regression_windows
+        )
+        self.speed_success_up = float(speed_success_up)
+        self.speed_box_pass_up = float(speed_box_pass_up)
+        self.speed_fall_up = float(speed_fall_up)
+        self.curriculum_success_down = float(curriculum_success_down)
+        self.curriculum_box_pass_down = float(curriculum_box_pass_down)
+        self.curriculum_fall_down = float(curriculum_fall_down)
+        self.speed_master_windows_required = int(speed_master_windows)
+        self.speed_master_flat_min = float(speed_master_flat_min)
+        self.speed_master_flat_max = float(speed_master_flat_max)
+        self.speed_master_severe_overspeed = float(
+            speed_master_severe_overspeed
+        )
+        self.motion_success_up = float(motion_success_up)
+        self.motion_box_pass_up = float(motion_box_pass_up)
+        self.motion_fall_up = float(motion_fall_up)
+        self.motion_flat_speed_max = float(motion_flat_speed_max)
+        self.motion_severe_overspeed_max = float(
+            motion_severe_overspeed_max
+        )
+        self.motion_master_windows_required = int(motion_master_windows)
+        self.motion_master_action_rate = float(motion_master_action_rate)
+        self.motion_master_action_saturation = float(
+            motion_master_action_saturation
+        )
+        self.motion_master_dof_near_limit = float(
+            motion_master_dof_near_limit
+        )
+        self.reference_kl_start_coef = float(reference_kl_start_coef)
+        self.reference_kl_stable_windows_required = int(
+            reference_kl_stable_windows
+        )
+        self.reference_kl_stable_decrease = float(
+            reference_kl_stable_decrease
+        )
+        self.reference_kl_regression_increase = float(
+            reference_kl_regression_increase
+        )
+        self.reference_kl_regression_floor = float(
+            reference_kl_regression_floor
+        )
+        self.speed_penalty_level = 0.0
+        self.motion_quality_level = 0.0
+        self.quality_phase = 0
+        self.quality_stage_start_iteration = 0
+        self.curriculum_stable_windows = 0
+        self.curriculum_regression_windows = 0
+        self.speed_master_windows = 0
+        self.motion_master_windows = 0
+        self.reference_kl_stable_window_count = 0
         self.collapse_windows = 0
         self.collapse_warning = False
+        self.curriculum_promoted = False
+        self.curriculum_regressed = False
+        self.curriculum_phase_transition = False
+        self.reward_order_warning = False
+        self.current_reference_kl_coef = min(
+            max(self.reference_kl_start_coef, self.reference_kl_min_coef),
+            self.reference_kl_max_coef,
+        )
         self.quality_min_episodes = int(quality_min_episodes)
         self.quality_required_windows = int(quality_required_windows)
         self.quality_increase = float(quality_increase)
@@ -177,6 +281,28 @@ class PPO:
             raise ValueError("quality_min_episodes must be positive.")
         if self.quality_required_windows < 1:
             raise ValueError("quality_required_windows must be positive.")
+        if not 0.0 <= self.speed_penalty_initial_level <= 1.0:
+            raise ValueError("speed_penalty_initial_level must be in [0, 1].")
+        if not 0.0 <= self.motion_quality_initial_level <= 1.0:
+            raise ValueError("motion_quality_initial_level must be in [0, 1].")
+        if self.curriculum_level_step <= 0.0:
+            raise ValueError("curriculum_level_step must be positive.")
+        if self.curriculum_stage_min_iterations < 1:
+            raise ValueError(
+                "curriculum_stage_min_iterations must be positive."
+            )
+        if min(
+            self.curriculum_stable_windows_required,
+            self.curriculum_regression_windows_required,
+            self.speed_master_windows_required,
+            self.motion_master_windows_required,
+            self.reference_kl_stable_windows_required,
+        ) < 1:
+            raise ValueError("Curriculum window counts must be positive.")
+        self.set_quality_levels(
+            self.speed_penalty_initial_level,
+            self.motion_quality_initial_level,
+        )
         
         # algorithm status
         self.current_learning_iteration = 0
@@ -215,6 +341,9 @@ class PPO:
             int(start_iteration) + self.critic_warmup_iterations
         )
         self.actor_finetune_active = False
+        self.set_quality_levels(0.0, 0.0)
+        self.quality_phase = 0
+        self.quality_stage_start_iteration = self.critic_warmup_until_iteration
         self.learning_rate = self.warmup_learning_rate
         self._rebuild_optimizer(
             actor_enabled=False,
@@ -289,13 +418,27 @@ class PPO:
 
     @property
     def reference_kl_coef(self):
-        return self.reference_kl_min_coef + (1.0 - self.quality_level) * (
-            self.reference_kl_max_coef - self.reference_kl_min_coef
+        return self.current_reference_kl_coef
+
+    def set_reference_kl_coef(self, coefficient):
+        """Clamp the adaptive reference-policy KL coefficient."""
+        self.current_reference_kl_coef = min(
+            max(float(coefficient), self.reference_kl_min_coef),
+            self.reference_kl_max_coef,
+        )
+
+    def set_quality_levels(self, speed_penalty_level, motion_quality_level):
+        """Clamp and store independent speed and motion penalty levels."""
+        self.speed_penalty_level = min(
+            max(float(speed_penalty_level), 0.0), 1.0
+        )
+        self.motion_quality_level = min(
+            max(float(motion_quality_level), 0.0), 1.0
         )
 
     def set_quality_level(self, level):
-        """Clamp and store the global action-quality curriculum level."""
-        self.quality_level = min(max(float(level), 0.0), 1.0)
+        """Backward-compatible helper that sets both curriculum levels."""
+        self.set_quality_levels(level, level)
 
     def activate_actor_finetune(self):
         """Switch from Critic warmup to conservative joint PPO updates."""
@@ -309,46 +452,191 @@ class PPO:
             actor_enabled=True,
             learning_rate=self.learning_rate,
         )
+        if self.speed_penalty_level <= 0.0:
+            self.set_quality_levels(
+                self.speed_penalty_initial_level,
+                self.motion_quality_initial_level,
+            )
+            self.quality_stage_start_iteration = self.current_learning_iteration
 
     def update_quality_curriculum(
-        self, success_rate, box_pass_rate, fall_rate, episode_count
+        self,
+        success_rate,
+        box_pass_rate,
+        fall_rate,
+        episode_count,
+        flat_speed_mean=float("inf"),
+        flat_severe_overspeed_ratio=1.0,
+        mean_action_rate=float("inf"),
+        action_saturation_ratio=1.0,
+        dof_near_limit_ratio=1.0,
+        reward_order_ok=True,
     ):
-        """Update quality difficulty from one aggregated logging window."""
+        """Update staged penalties and adaptive reference-policy protection."""
         self.collapse_warning = False
-        if self.is_critic_warmup_active() or episode_count < self.quality_min_episodes:
+        self.curriculum_promoted = False
+        self.curriculum_regressed = False
+        self.curriculum_phase_transition = False
+        self.reward_order_warning = reward_order_ok is False
+        if (
+            self.is_critic_warmup_active()
+            or episode_count < self.quality_min_episodes
+        ):
             return
 
-        promote = (
-            success_rate >= self.quality_success_up
-            and box_pass_rate >= self.quality_box_pass_up
-            and fall_rate <= self.quality_fall_up
+        speed_stable = (
+            success_rate >= self.speed_success_up
+            and box_pass_rate >= self.speed_box_pass_up
+            and fall_rate <= self.speed_fall_up
         )
         regress = (
-            success_rate < self.quality_success_down
-            or box_pass_rate < self.quality_box_pass_down
-            or fall_rate > self.quality_fall_down
+            success_rate < self.curriculum_success_down
+            or box_pass_rate < self.curriculum_box_pass_down
+            or fall_rate > self.curriculum_fall_down
         )
         collapse = (
             success_rate < self.collapse_success_threshold
             or fall_rate > self.collapse_fall_threshold
         )
+        motion_stable = (
+            success_rate >= self.motion_success_up
+            and box_pass_rate >= self.motion_box_pass_up
+            and fall_rate <= self.motion_fall_up
+            and flat_speed_mean <= self.motion_flat_speed_max
+            and flat_severe_overspeed_ratio
+            <= self.motion_severe_overspeed_max
+        )
+        active_stable = speed_stable if self.quality_phase == 0 else motion_stable
 
-        self.quality_up_windows = self.quality_up_windows + 1 if promote else 0
-        self.quality_down_windows = self.quality_down_windows + 1 if regress else 0
+        self.curriculum_stable_windows = (
+            self.curriculum_stable_windows + 1 if active_stable else 0
+        )
+        self.curriculum_regression_windows = (
+            self.curriculum_regression_windows + 1 if regress else 0
+        )
         self.collapse_windows = self.collapse_windows + 1 if collapse else 0
 
-        if self.quality_up_windows >= self.quality_required_windows:
-            self.set_quality_level(self.quality_level + self.quality_increase)
-            self.quality_up_windows = 0
-            self.quality_down_windows = 0
-        elif self.quality_down_windows >= self.quality_required_windows:
-            self.set_quality_level(self.quality_level - self.quality_decrease)
-            self.quality_down_windows = 0
-            self.quality_up_windows = 0
+        if speed_stable:
+            self.reference_kl_stable_window_count += 1
+            if (
+                self.reference_kl_stable_window_count
+                >= self.reference_kl_stable_windows_required
+            ):
+                self.set_reference_kl_coef(
+                    self.reference_kl_coef
+                    - self.reference_kl_stable_decrease
+                )
+                self.reference_kl_stable_window_count = 0
+        else:
+            self.reference_kl_stable_window_count = 0
+        if regress:
+            self.set_reference_kl_coef(
+                self.reference_kl_coef
+                + self.reference_kl_regression_increase
+            )
 
         if self.collapse_windows >= self.quality_required_windows:
             self.collapse_warning = True
+            self.set_reference_kl_coef(self.reference_kl_max_coef)
             self.collapse_windows = 0
+
+        if (
+            self.curriculum_regression_windows
+            >= self.curriculum_regression_windows_required
+        ):
+            if self.quality_phase == 0:
+                self.speed_penalty_level = max(
+                    self.speed_penalty_initial_level,
+                    self.speed_penalty_level - self.curriculum_level_step,
+                )
+            elif self.quality_phase == 1:
+                self.motion_quality_level = max(
+                    0.0,
+                    self.motion_quality_level - self.curriculum_level_step,
+                )
+            self.set_reference_kl_coef(
+                max(
+                    self.reference_kl_coef,
+                    self.reference_kl_regression_floor,
+                )
+            )
+            self.curriculum_regressed = True
+            self.curriculum_regression_windows = 0
+            self.curriculum_stable_windows = 0
+            self.quality_stage_start_iteration = self.current_learning_iteration
+            return
+
+        stage_age = (
+            self.current_learning_iteration
+            - self.quality_stage_start_iteration
+        )
+        can_advance = (
+            stage_age >= self.curriculum_stage_min_iterations
+            and self.curriculum_stable_windows
+            >= self.curriculum_stable_windows_required
+        )
+        if self.quality_phase == 0:
+            if self.speed_penalty_level < 1.0 and can_advance:
+                self.speed_penalty_level = min(
+                    1.0,
+                    self.speed_penalty_level + self.curriculum_level_step,
+                )
+                self.curriculum_promoted = True
+                self.curriculum_stable_windows = 0
+                self.quality_stage_start_iteration = (
+                    self.current_learning_iteration
+                )
+            speed_mastered = (
+                self.speed_penalty_level >= 1.0
+                and speed_stable
+                and self.speed_master_flat_min <= flat_speed_mean
+                <= self.speed_master_flat_max
+                and flat_severe_overspeed_ratio
+                <= self.speed_master_severe_overspeed
+            )
+            self.speed_master_windows = (
+                self.speed_master_windows + 1 if speed_mastered else 0
+            )
+            if self.speed_master_windows >= self.speed_master_windows_required:
+                self.quality_phase = 1
+                self.motion_quality_level = max(
+                    self.motion_quality_level,
+                    self.motion_quality_initial_level,
+                    self.curriculum_level_step,
+                )
+                self.curriculum_phase_transition = True
+                self.curriculum_stable_windows = 0
+                self.speed_master_windows = 0
+                self.quality_stage_start_iteration = (
+                    self.current_learning_iteration
+                )
+        elif self.quality_phase == 1:
+            if self.motion_quality_level < 1.0 and can_advance:
+                self.motion_quality_level = min(
+                    1.0,
+                    self.motion_quality_level + self.curriculum_level_step,
+                )
+                self.curriculum_promoted = True
+                self.curriculum_stable_windows = 0
+                self.quality_stage_start_iteration = (
+                    self.current_learning_iteration
+                )
+            motion_mastered = (
+                self.motion_quality_level >= 1.0
+                and motion_stable
+                and mean_action_rate <= self.motion_master_action_rate
+                and action_saturation_ratio
+                <= self.motion_master_action_saturation
+                and dof_near_limit_ratio
+                <= self.motion_master_dof_near_limit
+            )
+            self.motion_master_windows = (
+                self.motion_master_windows + 1 if motion_mastered else 0
+            )
+            if self.motion_master_windows >= self.motion_master_windows_required:
+                self.quality_phase = 2
+                self.curriculum_phase_transition = True
+                self.motion_master_windows = 0
 
     def is_critic_warmup_active(self, iteration=None):
         """Return whether Actor-side losses must remain frozen."""
@@ -519,14 +807,42 @@ class PPO:
         average_stats["critic_warmup_remaining"] = torch.tensor(
             float(warmup_remaining), device=self.device
         )
-        average_stats["quality_level"] = torch.tensor(
-            self.quality_level, device=self.device
+        average_stats["quality_phase"] = torch.tensor(
+            float(self.quality_phase), device=self.device
+        )
+        average_stats["speed_penalty_level"] = torch.tensor(
+            self.speed_penalty_level, device=self.device
+        )
+        average_stats["motion_quality_level"] = torch.tensor(
+            self.motion_quality_level, device=self.device
+        )
+        average_stats["quality_stage_age"] = torch.tensor(
+            float(
+                max(
+                    self.current_learning_iteration
+                    - self.quality_stage_start_iteration,
+                    0,
+                )
+            ),
+            device=self.device,
+        )
+        average_stats["curriculum_promoted"] = torch.tensor(
+            float(self.curriculum_promoted), device=self.device
+        )
+        average_stats["curriculum_regressed"] = torch.tensor(
+            float(self.curriculum_regressed), device=self.device
+        )
+        average_stats["curriculum_phase_transition"] = torch.tensor(
+            float(self.curriculum_phase_transition), device=self.device
         )
         average_stats["reference_kl_coef"] = torch.tensor(
             self.reference_kl_coef, device=self.device
         )
         average_stats["collapse_warning"] = torch.tensor(
             float(self.collapse_warning), device=self.device
+        )
+        average_stats["reward_order_warning"] = torch.tensor(
+            float(self.reward_order_warning), device=self.device
         )
         average_stats["actor_parameter_max_diff"] = torch.tensor(
             self.actor_parameter_max_diff(), device=self.device
@@ -735,20 +1051,39 @@ class PPO:
             "optimizer_state_dict": self.optimizer.state_dict(),
             "reference_model_state_dict": self._reference_actor_state_dict(),
             "algorithm_state_dict": {
+                "curriculum_state_version": 11,
                 "critic_warmup_until_iteration": (
                     self.critic_warmup_until_iteration
                 ),
-                "quality_level": self.quality_level,
-                "quality_up_windows": self.quality_up_windows,
-                "quality_down_windows": self.quality_down_windows,
+                "quality_phase": self.quality_phase,
+                "speed_penalty_level": self.speed_penalty_level,
+                "motion_quality_level": self.motion_quality_level,
+                "quality_stage_start_iteration": (
+                    self.quality_stage_start_iteration
+                ),
+                "curriculum_stable_windows": (
+                    self.curriculum_stable_windows
+                ),
+                "curriculum_regression_windows": (
+                    self.curriculum_regression_windows
+                ),
+                "speed_master_windows": self.speed_master_windows,
+                "motion_master_windows": self.motion_master_windows,
+                "reference_kl_stable_window_count": (
+                    self.reference_kl_stable_window_count
+                ),
                 "collapse_windows": self.collapse_windows,
                 "collapse_warning": self.collapse_warning,
+                "reward_order_warning": self.reward_order_warning,
                 "actor_finetune_active": self.actor_finetune_active,
                 "learning_rate": self.learning_rate,
                 "clip_param": self.clip_param,
                 "entropy_coef": self.entropy_coef,
                 "reference_kl_min_coef": self.reference_kl_min_coef,
                 "reference_kl_max_coef": self.reference_kl_max_coef,
+                "current_reference_kl_coef": (
+                    self.current_reference_kl_coef
+                ),
             },
         }
         if hasattr(self, "lr_scheduler"):
@@ -756,24 +1091,66 @@ class PPO:
         
         return state_dict
     
-    def load_state_dict(self, state_dict):
+    def load_state_dict(
+        self, state_dict, allow_missing_curriculum_state=False
+    ):
         self.actor_critic.load_state_dict(state_dict["model_state_dict"])
         algorithm_state = state_dict.get("algorithm_state_dict", {})
+        curriculum_version = algorithm_state.get("curriculum_state_version")
+        if (
+            self.require_v11_curriculum_state
+            and curriculum_version != 11
+            and not allow_missing_curriculum_state
+        ):
+            raise RuntimeError(
+                "This task requires a v11 curriculum checkpoint. Use the "
+                "explicit initialize_v11_from_v10_warmup manipulator once "
+                "for model_11800_warmup.pt; ordinary resume cannot silently "
+                "initialize missing curriculum state."
+            )
         self.critic_warmup_until_iteration = algorithm_state.get(
             "critic_warmup_until_iteration"
         )
-        self.set_quality_level(algorithm_state.get("quality_level", 0.0))
-        self.quality_up_windows = int(
-            algorithm_state.get("quality_up_windows", 0)
+        self.quality_phase = int(algorithm_state.get("quality_phase", 0))
+        self.set_quality_levels(
+            algorithm_state.get(
+                "speed_penalty_level",
+                self.speed_penalty_initial_level,
+            ),
+            algorithm_state.get(
+                "motion_quality_level",
+                self.motion_quality_initial_level,
+            ),
         )
-        self.quality_down_windows = int(
-            algorithm_state.get("quality_down_windows", 0)
+        self.quality_stage_start_iteration = int(
+            algorithm_state.get(
+                "quality_stage_start_iteration",
+                state_dict.get("iter", 0),
+            )
+        )
+        self.curriculum_stable_windows = int(
+            algorithm_state.get("curriculum_stable_windows", 0)
+        )
+        self.curriculum_regression_windows = int(
+            algorithm_state.get("curriculum_regression_windows", 0)
+        )
+        self.speed_master_windows = int(
+            algorithm_state.get("speed_master_windows", 0)
+        )
+        self.motion_master_windows = int(
+            algorithm_state.get("motion_master_windows", 0)
+        )
+        self.reference_kl_stable_window_count = int(
+            algorithm_state.get("reference_kl_stable_window_count", 0)
         )
         self.collapse_windows = int(
             algorithm_state.get("collapse_windows", 0)
         )
         self.collapse_warning = bool(
             algorithm_state.get("collapse_warning", False)
+        )
+        self.reward_order_warning = bool(
+            algorithm_state.get("reward_order_warning", False)
         )
         self.actor_finetune_active = bool(
             algorithm_state.get("actor_finetune_active", False)
@@ -795,6 +1172,12 @@ class PPO:
         self.reference_kl_max_coef = float(
             algorithm_state.get(
                 "reference_kl_max_coef", self.reference_kl_max_coef
+            )
+        )
+        self.set_reference_kl_coef(
+            algorithm_state.get(
+                "current_reference_kl_coef",
+                self.reference_kl_start_coef,
             )
         )
         checkpoint_iteration = int(state_dict.get("iter", 0))

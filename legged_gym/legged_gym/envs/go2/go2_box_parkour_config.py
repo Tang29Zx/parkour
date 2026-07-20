@@ -59,6 +59,7 @@ class Go2BoxParkourCfg(DebugGo2BoxCfg):
         class scales:
             tracking_ang_vel = 0.2
             forward_speed_tracking = 1.0
+            course_progress = 1000.0
             speed_error_square = -1.0
             overspeed = -1.5
             action_rate = -0.01
@@ -80,12 +81,13 @@ class Go2BoxParkourCfg(DebugGo2BoxCfg):
             box_second_foot_contact = 10.0
             box_passed = 25.0
             success = 500.0
-            termination = -1000.0
-            incomplete = -1000.0
+            termination = -2000.0
+            incomplete = -2000.0
 
         only_positive_rewards = False
         forward_speed_tracking_sigma = 0.02
-        quality_initial_level = 0.0
+        speed_penalty_initial_level = 0.1
+        motion_quality_initial_level = 0.0
         # Track the command closely on flat ground. Near a box, allow a brief
         # positive speed error for jumping or climbing without rewarding it.
         # Smoothly blend the local speed limit over these distances. Only the
@@ -99,7 +101,7 @@ class Go2BoxParkourCfg(DebugGo2BoxCfg):
         box_speed_limit = 1.2
         # Task failure remains costly even after all boxes are passed but the
         # landing has not been completed.
-        failure_progress_floor = 0.25
+        failure_progress_floor = 0.5
         leg_contact_force_threshold = 0.1
         body_collision_force_threshold = 1.0
         dof_near_limit_fraction = 0.15
@@ -138,43 +140,66 @@ class Go2BoxParkourCfgPPO(Go2RoughCfgPPO):
         actor_finetune_learning_rate = 1e-5
         actor_finetune_clip_param = 0.1
         actor_finetune_entropy_coef = 0.001
-        # Keep a non-zero behavior anchor even at maximum quality difficulty.
-        reference_kl_min_coef = 0.05
+        # Adapt behavior protection from task capability rather than coupling
+        # it directly to the active penalty level.
+        reference_kl_min_coef = 0.02
         reference_kl_max_coef = 1.0
+        reference_kl_start_coef = 0.20
+        reference_kl_stable_windows = 2
+        reference_kl_stable_decrease = 0.02
+        reference_kl_regression_increase = 0.10
+        reference_kl_regression_floor = 0.50
         # Current and frozen Actors are compared on the same one-step GRU path.
         # Padded batch replay has a separate diagnostic because CUDA float32
         # accumulation order can differ without any parameter mutation.
         actor_parameter_equivalence_tolerance = 0.0
         actor_output_equivalence_tolerance = 1e-5
         actor_std_equivalence_tolerance = 1e-7
+        require_v11_curriculum_state = True
         quality_min_episodes = 256
-        quality_required_windows = 2
-        quality_increase = 0.05
-        quality_decrease = 0.10
-        quality_success_up = 0.80
-        quality_box_pass_up = 0.90
-        quality_fall_up = 0.20
-        quality_success_down = 0.60
-        quality_box_pass_down = 0.70
-        quality_fall_down = 0.35
+        speed_penalty_initial_level = 0.10
+        motion_quality_initial_level = 0.0
+        curriculum_level_step = 0.10
+        curriculum_stage_min_iterations = 200
+        curriculum_stable_windows = 3
+        curriculum_regression_windows = 2
+        speed_success_up = 0.90
+        speed_box_pass_up = 0.92
+        speed_fall_up = 0.10
+        curriculum_success_down = 0.85
+        curriculum_box_pass_down = 0.88
+        curriculum_fall_down = 0.15
+        speed_master_windows = 5
+        speed_master_flat_min = 0.45
+        speed_master_flat_max = 0.70
+        speed_master_severe_overspeed = 0.05
+        motion_success_up = 0.88
+        motion_box_pass_up = 0.90
+        motion_fall_up = 0.12
+        motion_flat_speed_max = 0.75
+        motion_severe_overspeed_max = 0.10
+        motion_master_windows = 5
+        motion_master_action_rate = 2.0
+        motion_master_action_saturation = 0.20
+        motion_master_dof_near_limit = 0.10
         collapse_success_threshold = 0.60
         collapse_fall_threshold = 0.50
 
     class runner(Go2RoughCfgPPO.runner):
         experiment_name = "go2_box_parkour"
-        run_name = "five_box_v10_critic_warmup_from11700"
+        run_name = "five_box_v11_speed_phase_from11800"
         resume = True
         load_run = osp.join(
             osp.dirname(osp.dirname(osp.dirname(osp.dirname(__file__)))),
             "logs",
             "go2_box_parkour",
-            "Jul19_23-03-03_five_box_v5_stable_from11000",
+            "Jul20_18-38-38_five_box_v10_retry3_warmup100_train900",
         )
-        checkpoint = 11700
+        checkpoint = 11800
         # Initial Critic migration is selected explicitly from the CLI. Keeping
         # this disabled prevents later v10 resumes from resetting Critic again.
         ckpt_manipulator = None
-        max_iterations = 100
+        max_iterations = 200
         save_interval = 100
         log_interval = 10
 

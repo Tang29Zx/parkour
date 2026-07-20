@@ -81,11 +81,16 @@ class OnPolicyRunner:
         self.log_interval = self.cfg.get("log_interval", 1)
 
         _, _ = self.env.reset()
-        self._apply_quality_level_to_env()
+        self._apply_quality_levels_to_env()
 
-    def _apply_quality_level_to_env(self):
-        if hasattr(self, "env") and hasattr(self.env, "set_quality_level"):
-            self.env.set_quality_level(self.alg.quality_level)
+    def _apply_quality_levels_to_env(self):
+        if hasattr(self, "env") and hasattr(self.env, "set_quality_levels"):
+            self.env.set_quality_levels(
+                self.alg.speed_penalty_level,
+                self.alg.motion_quality_level,
+            )
+        elif hasattr(self, "env") and hasattr(self.env, "set_quality_level"):
+            self.env.set_quality_level(self.alg.speed_penalty_level)
 
     @staticmethod
     def _config_child(value, key):
@@ -202,53 +207,200 @@ class OnPolicyRunner:
             return float(value.detach().float().mean().item())
         return float(value)
 
-    def _get_quality_window(self, ep_infos):
-        total_episodes = 0.0
-        weighted_success = 0.0
-        weighted_box_pass = 0.0
-        weighted_fall = 0.0
-        for info in ep_infos:
-            required = (
-                "num_terminated",
-                "success_rate",
-                "box_5_pass_rate",
-                "fall_rate",
-            )
-            if not all(key in info for key in required):
-                continue
-            episode_count = self._scalar(info["num_terminated"])
-            if episode_count <= 0.0:
-                continue
-            total_episodes += episode_count
-            weighted_success += (
-                self._scalar(info["success_rate"]) * episode_count
-            )
-            weighted_box_pass += (
-                self._scalar(info["box_5_pass_rate"]) * episode_count
-            )
-            weighted_fall += self._scalar(info["fall_rate"]) * episode_count
-        if total_episodes <= 0.0:
-            return None
-        return dict(
-            episode_count=total_episodes,
-            success_rate=weighted_success / total_episodes,
-            box_pass_rate=weighted_box_pass / total_episodes,
-            fall_rate=weighted_fall / total_episodes,
+    @staticmethod
+    def _is_maximum_episode_key(key):
+        return (
+            key.startswith("max_")
+            or "_max_" in key
+            or key.endswith("_max")
         )
 
-    def _update_quality_curriculum(self, ep_infos, stats):
-        window = self._get_quality_window(ep_infos)
+    @staticmethod
+    def _is_minimum_episode_key(key):
+        return (
+            key.startswith("min_")
+            or "_min_" in key
+            or key.endswith("_min")
+        )
+
+    @staticmethod
+    def _episode_weight_key(key):
+        if key.startswith("raw/") and key.endswith("_mean_return"):
+            result_name = key[len("raw/") : -len("_mean_return")]
+            return f"raw/{result_name}_episode_count"
+        if key.startswith("layout_") and key.endswith("_success_rate"):
+            return key[: -len("_success_rate")] + "_episode_count"
+        return "num_terminated"
+
+    def _aggregate_episode_infos(self, ep_infos):
+        """Aggregate reset-batch summaries with their true episode weights."""
+        if not ep_infos:
+            return {}
+        keys = sorted({key for info in ep_infos for key in info})
+        summary = {}
+        count_keys = {
+            key
+            for key in keys
+            if key == "num_terminated" or key.endswith("_episode_count")
+        }
+        for key in keys:
+            available = [info for info in ep_infos if key in info]
+            if not available:
+                continue
+            values = [self._scalar(info[key]) for info in available]
+            finite_values = [
+                value for value in values if torch.isfinite(torch.tensor(value))
+            ]
+            if self._is_maximum_episode_key(key):
+                value = max(finite_values) if finite_values else float("nan")
+            elif self._is_minimum_episode_key(key):
+                value = min(finite_values) if finite_values else float("nan")
+            elif key in count_keys:
+                value = sum(values)
+            else:
+                weight_key = self._episode_weight_key(key)
+                weighted_total = 0.0
+                total_weight = 0.0
+                for info, item_value in zip(available, values):
+                    if weight_key not in info:
+                        continue
+                    weight = self._scalar(info[weight_key])
+                    if weight <= 0.0:
+                        continue
+                    weighted_total += item_value * weight
+                    total_weight += weight
+                value = (
+                    weighted_total / total_weight
+                    if total_weight > 0.0
+                    else 0.0
+                )
+            summary[key] = torch.tensor(value, device=self.device)
+
+        success_count = self._scalar(
+            summary.get("raw/success_episode_count", 0.0)
+        )
+        eligible_failures = []
+        for result_name in (
+            "fall_failure",
+            "missed_box_failure",
+            "out_of_track_failure",
+            "incomplete",
+            "early_failure",
+        ):
+            count = self._scalar(
+                summary.get(f"raw/{result_name}_episode_count", 0.0)
+            )
+            if count < 32.0:
+                continue
+            eligible_failures.append(
+                self._scalar(
+                    summary[f"raw/{result_name}_mean_return"]
+                )
+            )
+        reward_order_valid = success_count >= 32.0 and bool(eligible_failures)
+        if reward_order_valid:
+            margin = self._scalar(
+                summary["raw/success_mean_return"]
+            ) - max(eligible_failures)
+            summary["raw/success_minus_best_failure_return"] = torch.tensor(
+                margin, device=self.device
+            )
+        summary["reward_order_valid"] = torch.tensor(
+            float(reward_order_valid), device=self.device
+        )
+        return summary
+
+    def _get_quality_window(self, episode_summary):
+        required = (
+            "num_terminated",
+            "success_rate",
+            "box_5_pass_rate",
+            "fall_rate",
+            "flat_forward_speed_mean_mps",
+            "flat_severe_overspeed_ratio",
+            "mean_action_rate_l2",
+            "action_saturation_ratio",
+            "dof_near_limit_ratio",
+        )
+        if not all(key in episode_summary for key in required):
+            return None
+        episode_count = self._scalar(episode_summary["num_terminated"])
+        if episode_count <= 0.0:
+            return None
+        reward_order_valid = bool(
+            self._scalar(episode_summary.get("reward_order_valid", 0.0))
+        )
+        reward_margin = self._scalar(
+            episode_summary.get(
+                "raw/success_minus_best_failure_return", 0.0
+            )
+        )
+        return dict(
+            episode_count=episode_count,
+            success_rate=self._scalar(episode_summary["success_rate"]),
+            box_pass_rate=self._scalar(
+                episode_summary["box_5_pass_rate"]
+            ),
+            fall_rate=self._scalar(episode_summary["fall_rate"]),
+            flat_speed_mean=self._scalar(
+                episode_summary["flat_forward_speed_mean_mps"]
+            ),
+            flat_severe_overspeed_ratio=self._scalar(
+                episode_summary["flat_severe_overspeed_ratio"]
+            ),
+            mean_action_rate=self._scalar(
+                episode_summary["mean_action_rate_l2"]
+            ),
+            action_saturation_ratio=self._scalar(
+                episode_summary["action_saturation_ratio"]
+            ),
+            dof_near_limit_ratio=self._scalar(
+                episode_summary["dof_near_limit_ratio"]
+            ),
+            reward_order_ok=(not reward_order_valid or reward_margin > 0.0),
+        )
+
+    def _update_quality_curriculum(self, episode_summary, stats):
+        window = self._get_quality_window(episode_summary)
         if window is not None:
             self.alg.update_quality_curriculum(**window)
-            self._apply_quality_level_to_env()
-        stats["quality_level"] = torch.tensor(
-            self.alg.quality_level, device=self.device
+            self._apply_quality_levels_to_env()
+        stats["quality_phase"] = torch.tensor(
+            float(self.alg.quality_phase), device=self.device
+        )
+        stats["speed_penalty_level"] = torch.tensor(
+            self.alg.speed_penalty_level, device=self.device
+        )
+        stats["motion_quality_level"] = torch.tensor(
+            self.alg.motion_quality_level, device=self.device
+        )
+        stats["quality_stage_age"] = torch.tensor(
+            float(
+                max(
+                    self.alg.current_learning_iteration
+                    - self.alg.quality_stage_start_iteration,
+                    0,
+                )
+            ),
+            device=self.device,
+        )
+        stats["curriculum_promoted"] = torch.tensor(
+            float(self.alg.curriculum_promoted), device=self.device
+        )
+        stats["curriculum_regressed"] = torch.tensor(
+            float(self.alg.curriculum_regressed), device=self.device
+        )
+        stats["curriculum_phase_transition"] = torch.tensor(
+            float(self.alg.curriculum_phase_transition), device=self.device
         )
         stats["reference_kl_coef"] = torch.tensor(
             self.alg.reference_kl_coef, device=self.device
         )
         stats["collapse_warning"] = torch.tensor(
             float(self.alg.collapse_warning), device=self.device
+        )
+        stats["reward_order_warning"] = torch.tensor(
+            float(self.alg.reward_order_warning), device=self.device
         )
         stats["actor_runtime_config_compatible"] = torch.tensor(
             float(getattr(self, "actor_runtime_config_compatible", False)),
@@ -274,6 +426,13 @@ class OnPolicyRunner:
                 "WARNING: protected Actor metrics indicate policy collapse. "
                 "Training continues with reduced quality difficulty and a "
                 "stronger reference-policy constraint."
+                "\033[0m"
+            )
+        if self.alg.reward_order_warning:
+            print(
+                "\033[1;31m"
+                "WARNING: successful episodes no longer outperform the "
+                "best sufficiently sampled failure outcome."
                 "\033[0m"
             )
 
@@ -355,7 +514,8 @@ class OnPolicyRunner:
             stop = time.time()
             learn_time = stop - start
             if self.log_dir is not None and self.current_learning_iteration % self.log_interval == 0:
-                self._update_quality_curriculum(ep_infos, stats)
+                episode_summary = self._aggregate_episode_infos(ep_infos)
+                self._update_quality_curriculum(episode_summary, stats)
                 self.log(locals())
                 ep_infos.clear()
             is_warmup_boundary = (
@@ -389,24 +549,9 @@ class OnPolicyRunner:
         iteration_time = locs['collection_time'] + locs['learn_time']
 
         ep_string = f''
-        if locs['ep_infos']:
-            for key in locs['ep_infos'][0]:
-                infotensor = torch.tensor([], device=self.device)
-                for ep_info in locs['ep_infos']:
-                    # handle scalar and zero dimensional tensor infos
-                    if not isinstance(ep_info[key], torch.Tensor):
-                        ep_info[key] = torch.Tensor([ep_info[key]])
-                    if len(ep_info[key].shape) == 0:
-                        ep_info[key] = ep_info[key].unsqueeze(0)
-                    infotensor = torch.cat((infotensor, ep_info[key].to(self.device)))
-                if "_max" in key:
-                    infotensor = infotensor[~infotensor.isnan()]
-                    value = torch.max(infotensor) if len(infotensor) > 0 else torch.tensor(float("nan"))
-                elif "_min" in key:
-                    infotensor = infotensor[~infotensor.isnan()]
-                    value = torch.min(infotensor) if len(infotensor) > 0 else torch.tensor(float("nan"))
-                else:
-                    value = torch.nanmean(infotensor)
+        episode_summary = locs.get("episode_summary", {})
+        if episode_summary:
+            for key, value in episode_summary.items():
                 if key.startswith("raw/"):
                     tensorboard_key = "EpisodeRaw/" + key[len("raw/"):]
                 else:
@@ -514,13 +659,16 @@ class OnPolicyRunner:
                 self.alg.state_dict(),
             )
             print("\033[1;36m Done: using a hacky way to load the model. \033[0m")
-        self.alg.load_state_dict(loaded_dict)
+        self.alg.load_state_dict(
+            loaded_dict,
+            allow_missing_curriculum_state=bool(manipulator_name),
+        )
         self.current_learning_iteration = loaded_dict['iter']
         if manipulator_name == "reset_critic_and_optimizer":
             self.alg.start_critic_warmup(self.current_learning_iteration)
-            self.alg.set_quality_level(0.0)
+            self.alg.set_quality_levels(0.0, 0.0)
             self.alg.snapshot_reference_policy()
-        self._apply_quality_level_to_env()
+        self._apply_quality_levels_to_env()
         if manipulator_name:
             try:
                 self.save(os.path.join(self.log_dir, 'model_{}.pt'.format(self.current_learning_iteration)))

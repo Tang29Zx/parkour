@@ -161,20 +161,62 @@ class CriticWarmupTest(unittest.TestCase):
         self.assertTrue(restored.is_critic_warmup_active(11799))
         self.assertFalse(restored.is_critic_warmup_active(11800))
 
-    def test_quality_curriculum_promotes_regresses_and_warns(self):
+    def test_speed_curriculum_obeys_dwell_regresses_and_warns(self):
         ppo = self.make_ppo()
-        ppo.update_quality_curriculum(0.9, 0.95, 0.1, 256)
-        self.assertEqual(ppo.quality_level, 0.0)
-        ppo.update_quality_curriculum(0.9, 0.95, 0.1, 256)
-        self.assertAlmostEqual(ppo.quality_level, 0.05)
+        ppo.reference_kl_min_coef = 0.02
+        ppo.reference_kl_max_coef = 1.0
+        ppo.set_reference_kl_coef(0.2)
+        stable = dict(
+            success_rate=0.95,
+            box_pass_rate=0.96,
+            fall_rate=0.02,
+            episode_count=256,
+            flat_speed_mean=2.0,
+            flat_severe_overspeed_ratio=0.7,
+            mean_action_rate=5.0,
+            action_saturation_ratio=0.6,
+            dof_near_limit_ratio=0.2,
+        )
+        ppo.current_learning_iteration = 199
+        for _ in range(3):
+            ppo.update_quality_curriculum(**stable)
+        self.assertAlmostEqual(ppo.speed_penalty_level, 0.1)
 
-        ppo.update_quality_curriculum(0.5, 0.6, 0.6, 255)
-        self.assertAlmostEqual(ppo.quality_level, 0.05)
+        ppo.current_learning_iteration = 200
+        ppo.update_quality_curriculum(**stable)
+        self.assertAlmostEqual(ppo.speed_penalty_level, 0.2)
+        self.assertTrue(ppo.curriculum_promoted)
+        self.assertLess(ppo.reference_kl_coef, 0.2)
+
+        regressed = dict(stable, success_rate=0.5, fall_rate=0.6)
+        ppo.update_quality_curriculum(**regressed)
         self.assertFalse(ppo.collapse_warning)
-        ppo.update_quality_curriculum(0.5, 0.6, 0.6, 256)
-        ppo.update_quality_curriculum(0.5, 0.6, 0.6, 256)
-        self.assertEqual(ppo.quality_level, 0.0)
+        ppo.update_quality_curriculum(**regressed)
+        self.assertAlmostEqual(ppo.speed_penalty_level, 0.1)
+        self.assertTrue(ppo.curriculum_regressed)
         self.assertTrue(ppo.collapse_warning)
+        self.assertEqual(ppo.reference_kl_coef, 1.0)
+
+    def test_speed_mastery_transitions_to_motion_phase(self):
+        ppo = self.make_ppo()
+        ppo.speed_penalty_level = 1.0
+        mastered = dict(
+            success_rate=0.95,
+            box_pass_rate=0.96,
+            fall_rate=0.02,
+            episode_count=256,
+            flat_speed_mean=0.55,
+            flat_severe_overspeed_ratio=0.02,
+            mean_action_rate=5.0,
+            action_saturation_ratio=0.6,
+            dof_near_limit_ratio=0.2,
+        )
+        for _ in range(ppo.speed_master_windows_required):
+            ppo.update_quality_curriculum(**mastered)
+        self.assertEqual(ppo.quality_phase, 1)
+        self.assertAlmostEqual(ppo.speed_penalty_level, 1.0)
+        self.assertAlmostEqual(ppo.motion_quality_level, 0.1)
+        self.assertTrue(ppo.curriculum_phase_transition)
 
     def test_reference_kl_has_actor_gradients_and_reference_is_frozen(self):
         actor_critic = ActorCritic(
@@ -232,11 +274,13 @@ class CriticWarmupTest(unittest.TestCase):
             ActorCritic(2, 2, 1, actor_hidden_dims=[4], critic_hidden_dims=[4]),
             reference_kl_min_coef=0.05,
             reference_kl_max_coef=1.0,
+            reference_kl_start_coef=0.2,
         )
-        ppo.set_quality_level(0.0)
-        self.assertAlmostEqual(ppo.reference_kl_coef, 1.0)
-        ppo.set_quality_level(1.0)
+        self.assertAlmostEqual(ppo.reference_kl_coef, 0.2)
+        ppo.set_reference_kl_coef(0.0)
         self.assertAlmostEqual(ppo.reference_kl_coef, 0.05)
+        ppo.set_reference_kl_coef(2.0)
+        self.assertAlmostEqual(ppo.reference_kl_coef, 1.0)
 
     def test_reference_recurrent_state_is_independent_and_resets_with_done(self):
         actor_critic = ActorCriticRecurrent(
@@ -343,15 +387,24 @@ class CriticWarmupTest(unittest.TestCase):
     def test_reference_and_quality_state_survive_checkpoint_restore(self):
         source = self.make_ppo()
         source.snapshot_reference_policy()
-        source.set_quality_level(0.35)
-        source.quality_up_windows = 1
+        source.set_quality_levels(0.35, 0.15)
+        source.quality_phase = 1
+        source.curriculum_stable_windows = 1
+        source.quality_stage_start_iteration = 12345
+        source.reference_kl_min_coef = 0.02
+        source.reference_kl_max_coef = 1.0
+        source.set_reference_kl_coef(0.3)
         source.collapse_windows = 1
         checkpoint = source.state_dict()
 
         restored = self.make_ppo()
         restored.load_state_dict(checkpoint)
-        self.assertAlmostEqual(restored.quality_level, 0.35)
-        self.assertEqual(restored.quality_up_windows, 1)
+        self.assertAlmostEqual(restored.speed_penalty_level, 0.35)
+        self.assertAlmostEqual(restored.motion_quality_level, 0.15)
+        self.assertEqual(restored.quality_phase, 1)
+        self.assertEqual(restored.curriculum_stable_windows, 1)
+        self.assertEqual(restored.quality_stage_start_iteration, 12345)
+        self.assertAlmostEqual(restored.reference_kl_coef, 0.3)
         self.assertEqual(restored.collapse_windows, 1)
         for name, value in source._reference_actor_state_dict().items():
             self.assertTrue(
@@ -361,6 +414,64 @@ class CriticWarmupTest(unittest.TestCase):
                 ),
                 name,
             )
+
+    def test_required_v11_state_rejects_ordinary_legacy_resume(self):
+        source = self.make_ppo().state_dict()
+        del source["algorithm_state_dict"]["curriculum_state_version"]
+        target = LossControlledPPO(
+            DummyActorCritic(), require_v11_curriculum_state=True
+        )
+        with self.assertRaises(RuntimeError):
+            target.load_state_dict(source)
+
+    def test_episode_info_aggregation_uses_true_result_counts(self):
+        runner = OnPolicyRunner.__new__(OnPolicyRunner)
+        runner.device = "cpu"
+        infos = [
+            {
+                "num_terminated": torch.tensor(40.0),
+                "success_rate": torch.tensor(1.0),
+                "raw/success_mean_return": torch.tensor(10.0),
+                "raw/success_episode_count": torch.tensor(40.0),
+                "raw/fall_failure_mean_return": torch.tensor(0.0),
+                "raw/fall_failure_episode_count": torch.tensor(0.0),
+                "layout_1_success_rate": torch.tensor(1.0),
+                "layout_1_episode_count": torch.tensor(40.0),
+            },
+            {
+                "num_terminated": torch.tensor(60.0),
+                "success_rate": torch.tensor(1.0 / 3.0),
+                "raw/success_mean_return": torch.tensor(6.0),
+                "raw/success_episode_count": torch.tensor(20.0),
+                "raw/fall_failure_mean_return": torch.tensor(-30.0),
+                "raw/fall_failure_episode_count": torch.tensor(40.0),
+                "layout_1_success_rate": torch.tensor(1.0 / 3.0),
+                "layout_1_episode_count": torch.tensor(60.0),
+            },
+        ]
+
+        summary = runner._aggregate_episode_infos(infos)
+
+        self.assertEqual(summary["num_terminated"].item(), 100.0)
+        self.assertAlmostEqual(summary["success_rate"].item(), 0.6)
+        self.assertAlmostEqual(
+            summary["raw/success_mean_return"].item(),
+            (40.0 * 10.0 + 20.0 * 6.0) / 60.0,
+            places=6,
+        )
+        self.assertEqual(
+            summary["raw/fall_failure_mean_return"].item(), -30.0
+        )
+        self.assertAlmostEqual(
+            summary["layout_1_success_rate"].item(),
+            0.6,
+            places=6,
+        )
+        self.assertAlmostEqual(
+            summary["raw/success_minus_best_failure_return"].item(),
+            (40.0 * 10.0 + 20.0 * 6.0) / 60.0 + 30.0,
+            places=5,
+        )
 
     def test_runner_saves_unique_warmup_boundary_checkpoint(self):
         runner = OnPolicyRunner.__new__(OnPolicyRunner)

@@ -10,6 +10,7 @@ Returns:
     new_state_dict: the state_dict that has been manipulated or directly saved as a checkpoint file.
 """
 import torch
+import copy
 from collections import OrderedDict
 
 
@@ -93,6 +94,65 @@ def reset_critic_and_optimizer(source_state_dict, algo_state_dict):
         iter=source_state_dict["iter"],
         infos=source_state_dict.get("infos"),
     )
+
+
+def initialize_v11_from_v10_warmup(source_state_dict, algo_state_dict):
+    """Initialize v11 curriculum state from the verified v10 warmup boundary."""
+    if int(source_state_dict.get("iter", -1)) != 11800:
+        raise ValueError(
+            "v11 initialization requires model_11800_warmup.pt at iteration "
+            "11800."
+        )
+    source_algorithm = source_state_dict.get("algorithm_state_dict", {})
+    if source_algorithm.get("critic_warmup_until_iteration") != 11800:
+        raise ValueError(
+            "The source checkpoint is not the verified 11800 warmup boundary."
+        )
+    if source_algorithm.get("actor_finetune_active", False):
+        raise ValueError(
+            "The source checkpoint already contains Actor fine-tuning updates."
+        )
+    if source_state_dict.get("reference_model_state_dict") is None:
+        raise ValueError("The source checkpoint has no frozen reference Actor.")
+
+    source_model = source_state_dict["model_state_dict"]
+    target_model = algo_state_dict["model_state_dict"]
+    if source_model.keys() != target_model.keys():
+        raise KeyError("v10 and v11 model parameter names do not match.")
+    for name, source_value in source_model.items():
+        if source_value.shape != target_model[name].shape:
+            raise ValueError(
+                f"Parameter {name!r} has incompatible shapes: "
+                f"{tuple(source_value.shape)} versus "
+                f"{tuple(target_model[name].shape)}."
+            )
+
+    target_algorithm = algo_state_dict["algorithm_state_dict"]
+    curriculum_keys = (
+        "curriculum_state_version",
+        "quality_phase",
+        "speed_penalty_level",
+        "motion_quality_level",
+        "curriculum_stable_windows",
+        "curriculum_regression_windows",
+        "speed_master_windows",
+        "motion_master_windows",
+        "reference_kl_stable_window_count",
+        "collapse_windows",
+        "collapse_warning",
+        "reward_order_warning",
+        "current_reference_kl_coef",
+    )
+    migrated = copy.deepcopy(source_state_dict)
+    migrated_algorithm = migrated.setdefault("algorithm_state_dict", {})
+    for key in curriculum_keys:
+        migrated_algorithm[key] = copy.deepcopy(target_algorithm[key])
+    migrated_algorithm["quality_stage_start_iteration"] = 11800
+    print(
+        "\033[1;36m Preserved the v10 warmup Actor, Critic, reference Actor, "
+        "and optimizer; initialized explicit v11 curriculum state. \033[0m"
+    )
+    return migrated
 
 
 def reinitialize_height_encoders(source_state_dict, algo_state_dict):
