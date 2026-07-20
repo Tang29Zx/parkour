@@ -859,12 +859,19 @@ class LeggedRobotBox(LeggedRobot):
         )
 
     def _reward_forward_speed_tracking(self):
-        """Zero-centered command tracking; exact tracking gives zero."""
+        """Reward forward motion near the command without rewarding waiting."""
         speed_error = self.base_lin_vel[:, 0] - self.commands[:, 0]
-        return torch.exp(
+        tracking = torch.exp(
             -torch.square(speed_error)
             / self.cfg.rewards.forward_speed_tracking_sigma
-        ) - 1.0
+        )
+        forward_fraction = torch.clamp(
+            self.base_lin_vel[:, 0]
+            / self.commands[:, 0].clamp_min(1e-6),
+            min=0.0,
+            max=1.0,
+        )
+        return tracking * forward_fraction
 
     def _reward_tracking_ang_vel(self):
         """Zero-centered yaw tracking; a zero yaw error gives zero."""

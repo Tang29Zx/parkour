@@ -141,6 +141,8 @@ def initialize_v11_from_v10_warmup(source_state_dict, algo_state_dict):
         "collapse_windows",
         "collapse_warning",
         "reward_order_warning",
+        "reference_kl_min_coef",
+        "reference_kl_max_coef",
         "current_reference_kl_coef",
     )
     migrated = copy.deepcopy(source_state_dict)
@@ -151,6 +153,53 @@ def initialize_v11_from_v10_warmup(source_state_dict, algo_state_dict):
     print(
         "\033[1;36m Preserved the v10 warmup Actor, Critic, reference Actor, "
         "and optimizer; initialized explicit v11 curriculum state. \033[0m"
+    )
+    return migrated
+
+
+def enable_v11_target_speed_finetune(source_state_dict, algo_state_dict):
+    """Preserve a healthy v11 checkpoint while relaxing its KL floor to 0.02."""
+    source_algorithm = source_state_dict.get("algorithm_state_dict", {})
+    if source_algorithm.get("curriculum_state_version") != 11:
+        raise ValueError("Target-speed fine-tuning requires a v11 checkpoint.")
+    if not source_algorithm.get("actor_finetune_active", False):
+        raise ValueError(
+            "Target-speed fine-tuning requires an active Actor checkpoint."
+        )
+    if source_state_dict.get("reference_model_state_dict") is None:
+        raise ValueError("The source checkpoint has no frozen reference Actor.")
+
+    source_model = source_state_dict["model_state_dict"]
+    target_model = algo_state_dict["model_state_dict"]
+    if source_model.keys() != target_model.keys():
+        raise KeyError("Source and target model parameter names do not match.")
+    for name, source_value in source_model.items():
+        if source_value.shape != target_model[name].shape:
+            raise ValueError(
+                f"Parameter {name!r} has incompatible shapes: "
+                f"{tuple(source_value.shape)} versus "
+                f"{tuple(target_model[name].shape)}."
+            )
+
+    target_algorithm = algo_state_dict["algorithm_state_dict"]
+    target_minimum = float(target_algorithm["reference_kl_min_coef"])
+    if abs(target_minimum - 0.02) > 1e-12:
+        raise ValueError(
+            "Target-speed fine-tuning requires reference_kl_min_coef=0.02."
+        )
+
+    migrated = copy.deepcopy(source_state_dict)
+    migrated_algorithm = migrated["algorithm_state_dict"]
+    migrated_algorithm["reference_kl_min_coef"] = target_minimum
+    migrated_algorithm["reference_kl_max_coef"] = float(
+        target_algorithm["reference_kl_max_coef"]
+    )
+    migrated_algorithm["current_reference_kl_coef"] = target_minimum
+    migrated_algorithm["reference_kl_stable_window_count"] = 0
+    print(
+        "\033[1;36m Preserved the complete v11 checkpoint and enabled "
+        "target-speed fine-tuning with KL minimum/current coefficient 0.02. "
+        "\033[0m"
     )
     return migrated
 

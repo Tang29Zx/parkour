@@ -260,6 +260,8 @@ class HeightEncoderMigrationTest(unittest.TestCase):
                 "collapse_windows": 0,
                 "collapse_warning": False,
                 "reward_order_warning": False,
+                "reference_kl_min_coef": 0.02,
+                "reference_kl_max_coef": 1.0,
                 "current_reference_kl_coef": 0.2,
             },
         }
@@ -276,6 +278,83 @@ class HeightEncoderMigrationTest(unittest.TestCase):
             migrated["algorithm_state_dict"]["quality_stage_start_iteration"],
             11800,
         )
+        self.assertEqual(
+            migrated["algorithm_state_dict"]["reference_kl_min_coef"], 0.02
+        )
+
+    def test_target_speed_finetune_preserves_checkpoint_and_lowers_kl(self):
+        model = OrderedDict(
+            [
+                ("actor.weight", torch.ones(2, 2)),
+                ("critic.weight", torch.full((1, 2), 2.0)),
+            ]
+        )
+        reference = {"actor.weight": torch.full((2, 2), 3.0)}
+        source = {
+            "model_state_dict": model,
+            "optimizer_state_dict": {"state": "trained"},
+            "reference_model_state_dict": reference,
+            "algorithm_state_dict": {
+                "curriculum_state_version": 11,
+                "actor_finetune_active": True,
+                "speed_penalty_level": 1.0,
+                "motion_quality_level": 0.0,
+                "reference_kl_min_coef": 0.05,
+                "reference_kl_max_coef": 1.0,
+                "current_reference_kl_coef": 0.05,
+                "reference_kl_stable_window_count": 1,
+            },
+            "iter": 14100,
+        }
+        target = {
+            "model_state_dict": OrderedDict(
+                (name, torch.zeros_like(value)) for name, value in model.items()
+            ),
+            "algorithm_state_dict": {
+                "reference_kl_min_coef": 0.02,
+                "reference_kl_max_coef": 1.0,
+            },
+        }
+
+        migrated = self.module.enable_v11_target_speed_finetune(source, target)
+
+        for name, value in model.items():
+            self.assertTrue(torch.equal(migrated["model_state_dict"][name], value))
+        self.assertTrue(
+            torch.equal(
+                migrated["reference_model_state_dict"]["actor.weight"],
+                reference["actor.weight"],
+            )
+        )
+        self.assertEqual(migrated["optimizer_state_dict"], {"state": "trained"})
+        state = migrated["algorithm_state_dict"]
+        self.assertEqual(state["speed_penalty_level"], 1.0)
+        self.assertEqual(state["motion_quality_level"], 0.0)
+        self.assertEqual(state["reference_kl_min_coef"], 0.02)
+        self.assertEqual(state["current_reference_kl_coef"], 0.02)
+        self.assertEqual(state["reference_kl_stable_window_count"], 0)
+        self.assertEqual(
+            source["algorithm_state_dict"]["reference_kl_min_coef"], 0.05
+        )
+
+    def test_target_speed_finetune_rejects_non_v11_checkpoint(self):
+        source = {
+            "model_state_dict": OrderedDict([("actor.weight", torch.ones(1))]),
+            "reference_model_state_dict": {"actor.weight": torch.ones(1)},
+            "algorithm_state_dict": {
+                "curriculum_state_version": 10,
+                "actor_finetune_active": True,
+            },
+        }
+        target = {
+            "model_state_dict": OrderedDict([("actor.weight", torch.ones(1))]),
+            "algorithm_state_dict": {
+                "reference_kl_min_coef": 0.02,
+                "reference_kl_max_coef": 1.0,
+            },
+        }
+        with self.assertRaises(ValueError):
+            self.module.enable_v11_target_speed_finetune(source, target)
 
     def test_v11_initializer_rejects_non_warmup_checkpoint(self):
         source = {
@@ -702,12 +781,12 @@ class BoxRewardTest(unittest.TestCase):
         )
         reward = self.LeggedRobotBox._reward_forward_speed_tracking(env)
 
-        self.assertAlmostEqual(reward[0].item(), 0.0)
-        self.assertGreater(reward[3].item(), -0.4)
-        self.assertGreater(reward[4].item(), -0.4)
-        self.assertLess(reward[1].item(), -0.99)
-        self.assertLess(reward[2].item(), -0.99)
-        self.assertLess(reward[5].item(), -0.99)
+        self.assertAlmostEqual(reward[0].item(), 1.0)
+        self.assertGreater(reward[3].item(), 0.4)
+        self.assertGreater(reward[4].item(), 0.6)
+        self.assertLess(reward[1].item(), 1e-5)
+        self.assertEqual(reward[2].item(), 0.0)
+        self.assertLess(reward[5].item(), 1e-5)
 
     def test_zero_yaw_error_has_zero_reward_and_deviation_is_negative(self):
         env = self.make_speed_reward_env()
@@ -756,7 +835,7 @@ class BoxRewardTest(unittest.TestCase):
         waiting_tracking = np.exp(
             -(0.0 - command) ** 2
             / self.env_cfg.rewards.forward_speed_tracking_sigma
-        ) - 1.0
+        ) * 0.0
         waiting_return = (
             waiting_steps
             * dt
@@ -769,7 +848,7 @@ class BoxRewardTest(unittest.TestCase):
         sprint_tracking = np.exp(
             -(sprint_speed - command) ** 2
             / self.env_cfg.rewards.forward_speed_tracking_sigma
-        ) - 1.0
+        )
         sprint_return = event_total + sprint_steps * dt * (
             scales.forward_speed_tracking * sprint_tracking
             + scales.speed_error_square * (sprint_speed - command) ** 2
@@ -781,10 +860,10 @@ class BoxRewardTest(unittest.TestCase):
         self.assertGreater(target_return, waiting_return)
         self.assertGreater(target_return, sprint_return)
         self.assertGreater(target_return, immediate_failure_return)
-        self.assertLess(waiting_return, immediate_failure_return)
+        self.assertLessEqual(waiting_return, immediate_failure_return)
 
         gamma = self.train_cfg.algorithm.gamma
-        target_tracking = 0.0
+        target_tracking = dt * scales.forward_speed_tracking
         target_discounted = sum(
             gamma ** step * target_tracking for step in range(target_steps)
         ) + gamma ** target_steps * event_total
