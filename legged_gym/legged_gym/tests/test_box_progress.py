@@ -1,4 +1,4 @@
-"""Unit tests for the tensor-only five-box progress state."""
+"""Unit tests for tensor-only sequential box-course progress."""
 
 import importlib.util
 from pathlib import Path
@@ -42,6 +42,7 @@ class BoxProgressTrackerTest(unittest.TestCase):
         self.env_origins = torch.zeros(2, 3)
         self.track_start_x = torch.full((2,), -0.6)
         self.track_end_x = torch.full((2,), 14.9)
+        self.landing_end_x = self.track_end_x.clone()
         self.feet_positions = torch.tensor(
             [
                 [[0.0, -0.2, 0.0], [0.0, 0.2, 0.0], [0.0, -0.2, 0.0], [0.0, 0.2, 0.0]],
@@ -73,6 +74,7 @@ class BoxProgressTrackerTest(unittest.TestCase):
             pitch=self.pitch,
             body_contact=self.body_contact,
             natural_timeout=self.natural_timeout,
+            landing_end_x=self.landing_end_x,
         )
 
     def put_foot_on_box(self, env_idx, foot_idx, box_idx):
@@ -164,7 +166,7 @@ class BoxProgressTrackerTest(unittest.TestCase):
         self.assertFalse(self.tracker.box_passed_buf[0])
         self.assertEqual(self.tracker.passed_box_count[0].item(), 1)
 
-    def test_landing_accumulates_distinct_feet_and_upright_steps(self):
+    def test_landing_requires_four_feet_for_ten_consecutive_steps(self):
         self.tracker.next_box_idx[0] = 5
         self.tracker.passed_box_count[0] = 5
         self.feet_positions[0, :, 0] = 10.5
@@ -173,20 +175,23 @@ class BoxProgressTrackerTest(unittest.TestCase):
         self.base_positions[0, 0] = 10.5
         self.terrain_heights[0] = 0.0
 
-        for foot_idx in range(4):
-            self.contact_forces[0].zero_()
-            self.contact_forces[0, foot_idx, 2] = 2.0
+        self.contact_forces[0, :, 2] = 2.0
+        for _ in range(9):
             self.update()
         self.assertTrue(self.tracker.landing_foot_contact_mask[0].all())
         self.assertFalse(self.tracker.success_buf[0])
+        self.assertEqual(self.tracker.landing_counter[0].item(), 9)
 
-        self.roll[0] = 1.5
+        self.contact_forces[0, 0] = 0.0
         self.update()
         self.assertEqual(self.tracker.landing_counter[0].item(), 0)
+        self.assertFalse(self.tracker.landing_foot_contact_mask[0, 0])
 
-        self.roll[0] = 0.0
-        self.contact_forces[0].zero_()
-        self.tracker.landing_counter[0] = 9
+        self.contact_forces[0, 0, 2] = 2.0
+        for _ in range(9):
+            self.update()
+        self.assertFalse(self.tracker.success_buf[0])
+
         self.natural_timeout[0] = True
         self.update()
         self.assertTrue(self.tracker.success_buf[0])
@@ -232,7 +237,6 @@ class BoxProgressTrackerTest(unittest.TestCase):
     def test_failure_takes_precedence_over_landing_success(self):
         self.tracker.next_box_idx[0] = 5
         self.tracker.passed_box_count[0] = 5
-        self.tracker.landing_foot_contact_mask[0] = True
         self.tracker.landing_counter[0] = 9
         self.tracker.body_contact_counter[0] = 14
         self.body_contact[0] = True
@@ -241,6 +245,7 @@ class BoxProgressTrackerTest(unittest.TestCase):
             [-0.3, 0.3, -0.3, 0.3]
         )
         self.feet_positions[0, :, 2] = 0.0
+        self.contact_forces[0, :, 2] = 2.0
         self.base_positions[0, 0] = 10.5
         self.update()
 
@@ -261,6 +266,7 @@ class BoxProgressTrackerTest(unittest.TestCase):
         self.tracker.success_buf[:] = True
         self.tracker.missed_box_buf[:] = True
         self.tracker.out_of_track_buf[:] = True
+        self.tracker.landing_overrun_buf[:] = True
         self.tracker.fall_buf[:] = True
         self.tracker.episode_timeout_buf[:] = True
         self.tracker.reset(self.torch.tensor([0, 1]))
@@ -278,21 +284,113 @@ class BoxProgressTrackerTest(unittest.TestCase):
             self.tracker.success_buf,
             self.tracker.missed_box_buf,
             self.tracker.out_of_track_buf,
+            self.tracker.landing_overrun_buf,
             self.tracker.fall_buf,
             self.tracker.episode_timeout_buf,
         ):
             self.assertFalse(value.any())
 
     def test_4096_environment_buffer_shapes(self):
-        tracker = self.BoxProgressTracker(4096, 4, 5, "cpu")
-        self.assertEqual(tuple(tracker.next_box_idx.shape), (4096,))
-        self.assertEqual(tuple(tracker.foot_contact_mask.shape), (4096, 4))
-        self.assertEqual(
-            tuple(tracker.landing_foot_contact_mask.shape), (4096, 4)
+        for required_boxes in (1, 3, 5):
+            tracker = self.BoxProgressTracker(
+                4096, 4, 5, "cpu", required_boxes=required_boxes
+            )
+            self.assertEqual(tuple(tracker.next_box_idx.shape), (4096,))
+            self.assertEqual(tuple(tracker.foot_contact_mask.shape), (4096, 4))
+            self.assertEqual(
+                tuple(tracker.landing_foot_contact_mask.shape), (4096, 4)
+            )
+            self.assertEqual(
+                tuple(tracker.first_foot_contact_buf.shape), (4096,)
+            )
+            self.assertEqual(
+                tuple(tracker.second_foot_contact_buf.shape), (4096,)
+            )
+            self.assertEqual(tuple(tracker.success_buf.shape), (4096,))
+            self.assertEqual(tuple(tracker.landing_overrun_buf.shape), (4096,))
+
+    def test_required_boxes_is_validated(self):
+        with self.assertRaises(TypeError):
+            self.BoxProgressTracker(1, 4, 5, "cpu", required_boxes=1.0)
+        with self.assertRaises(ValueError):
+            self.BoxProgressTracker(1, 4, 5, "cpu", required_boxes=0)
+        with self.assertRaises(ValueError):
+            self.BoxProgressTracker(1, 4, 5, "cpu", required_boxes=6)
+
+    def test_one_box_course_ignores_future_boxes_and_lands_before_box_two(self):
+        self.tracker = self.BoxProgressTracker(
+            2, 4, 5, "cpu", required_boxes=1
         )
-        self.assertEqual(tuple(tracker.first_foot_contact_buf.shape), (4096,))
-        self.assertEqual(tuple(tracker.second_foot_contact_buf.shape), (4096,))
-        self.assertEqual(tuple(tracker.success_buf.shape), (4096,))
+        self.landing_end_x = self.box_bounds[:, 1, 0].clone()
+
+        self.put_foot_on_box(0, 0, 0)
+        self.put_foot_on_box(0, 1, 0)
+        self.update()
+        self.base_positions[0, 0] = 2.16
+        self.update()
+        self.assertTrue(self.tracker.box_passed_buf[0])
+        self.assertEqual(self.tracker.next_box_idx[0].item(), 1)
+
+        self.contact_forces.zero_()
+        self.put_foot_on_box(0, 0, 1)
+        self.put_foot_on_box(0, 1, 1)
+        self.update()
+        self.assertFalse(self.tracker.first_foot_contact_buf[0])
+        self.assertFalse(self.tracker.second_foot_contact_buf[0])
+        self.assertEqual(self.tracker.passed_box_count[0].item(), 1)
+
+        self.feet_positions[0, :, 0] = 2.5
+        self.feet_positions[0, :, 1] = self.torch.tensor(
+            [-0.3, 0.3, -0.3, 0.3]
+        )
+        self.feet_positions[0, :, 2] = 0.0
+        self.terrain_heights[0] = 0.0
+        self.contact_forces[0].zero_()
+        self.contact_forces[0, :, 2] = 2.0
+        self.base_positions[0, 0] = 2.5
+        for _ in range(10):
+            self.update()
+        self.assertTrue(self.tracker.success_buf[0])
+
+    def test_intermediate_course_landing_overrun_is_a_failure(self):
+        self.tracker = self.BoxProgressTracker(
+            2, 4, 5, "cpu", required_boxes=1
+        )
+        self.landing_end_x = self.box_bounds[:, 1, 0].clone()
+        self.tracker.next_box_idx[0] = 1
+        self.tracker.passed_box_count[0] = 1
+        self.base_positions[0, 0] = self.landing_end_x[0]
+        self.update()
+
+        self.assertTrue(self.tracker.landing_overrun_buf[0])
+        self.assertTrue(self.tracker.failure_buf[0])
+        self.assertFalse(self.tracker.success_buf[0])
+        self.assertFalse(self.tracker.episode_timeout_buf[0])
+
+    def test_three_box_course_lands_between_boxes_three_and_four(self):
+        self.tracker = self.BoxProgressTracker(
+            2, 4, 5, "cpu", required_boxes=3
+        )
+        self.landing_end_x = self.box_bounds[:, 3, 0].clone()
+        self.tracker.next_box_idx[0] = 3
+        self.tracker.passed_box_count[0] = 3
+        landing_x = 0.5 * (
+            self.box_bounds[0, 2, 1] + self.landing_end_x[0]
+        )
+        self.feet_positions[0, :, 0] = landing_x
+        self.feet_positions[0, :, 1] = self.torch.tensor(
+            [-0.3, 0.3, -0.3, 0.3]
+        )
+        self.feet_positions[0, :, 2] = 0.0
+        self.terrain_heights[0] = 0.0
+        self.contact_forces[0, :, 2] = 2.0
+        self.base_positions[0, 0] = landing_x
+
+        for _ in range(10):
+            self.update()
+
+        self.assertTrue(self.tracker.success_buf[0])
+        self.assertFalse(self.tracker.landing_overrun_buf[0])
 
 
 if __name__ == "__main__":

@@ -88,6 +88,8 @@ class Go2BoxParkourCfg(DebugGo2BoxCfg):
         box_speed_limit = 1.2
 
     class box_progress:
+        required_boxes = 5
+        min_landing_zone_length = 0.85
         pass_margin = 0.15
         top_contact_tolerance = 0.06
         contact_force_threshold = 1.0
@@ -132,3 +134,45 @@ class Go2BoxParkourCfgPPO(Go2RoughCfgPPO):
         max_iterations = 2000
         save_interval = 250
         log_interval = 50
+
+
+class Go2BoxParkour1BoxCfg(Go2BoxParkourCfg):
+    """One-box curriculum stage on the unchanged five-box terrain."""
+
+    class env(Go2BoxParkourCfg.env):
+        episode_length_s = 15
+
+    class box_progress(Go2BoxParkourCfg.box_progress):
+        required_boxes = 1
+
+
+class Go2BoxParkour1BoxCfgPPO(Go2BoxParkourCfgPPO):
+    class runner(Go2BoxParkourCfgPPO.runner):
+        run_name = "one_box_v8_curriculum"
+        # The source checkpoint must be selected explicitly on the CLI.
+        resume = False
+        load_run = -1
+        checkpoint = -1
+        ckpt_manipulator = None
+        max_iterations = 1000
+
+
+class Go2BoxParkour3BoxCfg(Go2BoxParkourCfg):
+    """Three-box curriculum stage on the unchanged five-box terrain."""
+
+    class env(Go2BoxParkourCfg.env):
+        episode_length_s = 30
+
+    class box_progress(Go2BoxParkourCfg.box_progress):
+        required_boxes = 3
+
+
+class Go2BoxParkour3BoxCfgPPO(Go2BoxParkourCfgPPO):
+    class runner(Go2BoxParkourCfgPPO.runner):
+        run_name = "three_box_v8_curriculum"
+        # Continue from the accepted one-box checkpoint without migration.
+        resume = False
+        load_run = -1
+        checkpoint = -1
+        ckpt_manipulator = None
+        max_iterations = 1000

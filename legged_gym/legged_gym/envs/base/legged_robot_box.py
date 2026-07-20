@@ -9,7 +9,7 @@ from .legged_robot import LeggedRobot
 
 
 class LeggedRobotBox(LeggedRobot):
-    """Add five-box progress and course termination to ``LeggedRobot``."""
+    """Add ordered box-course progress and termination to ``LeggedRobot``."""
 
     def _init_buffers(self):
         super()._init_buffers()
@@ -24,6 +24,7 @@ class LeggedRobotBox(LeggedRobot):
             num_feet=len(self.feet_indices),
             num_boxes=self.terrain.num_boxes,
             device=self.device,
+            required_boxes=progress_cfg.required_boxes,
             pass_margin=progress_cfg.pass_margin,
             top_contact_tolerance=progress_cfg.top_contact_tolerance,
             contact_force_threshold=progress_cfg.contact_force_threshold,
@@ -92,6 +93,7 @@ class LeggedRobotBox(LeggedRobot):
         self.success_buf = tracker.success_buf
         self.missed_box_buf = tracker.missed_box_buf
         self.out_of_track_buf = tracker.out_of_track_buf
+        self.landing_overrun_buf = tracker.landing_overrun_buf
         self.fall_buf = tracker.fall_buf
         self.body_contact_counter = tracker.body_contact_counter
         self.landing_counter = tracker.landing_counter
@@ -102,9 +104,44 @@ class LeggedRobotBox(LeggedRobot):
             (self.terrain_levels, self.terrain_types), dim=1
         )
         self.env_box_bounds = self.terrain.get_box_bounds(track_indices)
+        physical_track_indices = (
+            self.terrain_levels * self.cfg.terrain.num_cols
+            + self.terrain_types
+        )
+        self.layout_indices = torch.remainder(
+            physical_track_indices, self.terrain.num_unique_layouts
+        )
         spawn_margin = float(self.terrain.track_kwargs["spawn_margin"])
         self.track_start_x = self.env_origins[:, 0] - spawn_margin
         self.track_end_x = self.track_start_x + float(self.terrain.env_length)
+
+        required_boxes = self.box_progress.required_boxes
+        if required_boxes < self.terrain.num_boxes:
+            self.course_landing_end_x = self.env_box_bounds[
+                :, required_boxes, 0
+            ]
+        else:
+            self.course_landing_end_x = self.track_end_x.clone()
+        minimum_length = float(self.cfg.box_progress.min_landing_zone_length)
+        all_box_bounds = self.terrain.box_bounds_pyt
+        all_course_rear = all_box_bounds[:, :, required_boxes - 1, 1]
+        if required_boxes < self.terrain.num_boxes:
+            all_landing_end_x = all_box_bounds[:, :, required_boxes, 0]
+        else:
+            all_landing_end_x = (
+                self.terrain.env_origins_pyt[:, :, 0]
+                - spawn_margin
+                + float(self.terrain.env_length)
+            )
+        actual_minimum = float(
+            torch.min(all_landing_end_x - all_course_rear).item()
+        )
+        if actual_minimum + 1e-6 < minimum_length:
+            raise ValueError(
+                "The shortest course landing zone is "
+                f"{actual_minimum:.3f} m, below the configured minimum "
+                f"of {minimum_length:.3f} m."
+            )
 
     def _post_physics_step_callback(self):
         super()._post_physics_step_callback()
@@ -240,6 +277,7 @@ class LeggedRobotBox(LeggedRobot):
             pitch=pitch,
             body_contact=body_contact,
             natural_timeout=natural_timeout,
+            landing_end_x=self.course_landing_end_x,
         )
         self.box_progress.apply_termination(
             self.reset_buf, self.time_out_buf
@@ -261,11 +299,33 @@ class LeggedRobotBox(LeggedRobot):
         episode["out_of_track_rate"] = (
             self.out_of_track_buf[env_ids].float().mean()
         )
+        episode["landing_overrun_rate"] = (
+            self.landing_overrun_buf[env_ids].float().mean()
+        )
         episode["fall_rate"] = self.fall_buf[env_ids].float().mean()
+        episode["required_boxes"] = torch.tensor(
+            float(self.box_progress.required_boxes), device=self.device
+        )
+        episode["mean_progress_ratio"] = (
+            self.passed_box_count[env_ids].float().mean()
+            / self.box_progress.required_boxes
+        )
         episode.update(self._get_speed_statistics(env_ids))
-        for box_idx in range(self.terrain.num_boxes):
+        for box_idx in range(self.box_progress.required_boxes):
             episode[f"box_{box_idx + 1}_pass_rate"] = (
                 (self.passed_box_count[env_ids] > box_idx).float().mean()
+            )
+        for layout_idx in range(self.terrain.num_unique_layouts):
+            layout_mask = self.layout_indices[env_ids] == layout_idx
+            layout_count = layout_mask.sum()
+            layout_successes = (
+                self.success_buf[env_ids] & layout_mask
+            ).float().sum()
+            episode[f"layout_{layout_idx + 1}_success_rate"] = (
+                layout_successes / layout_count.clamp_min(1)
+            )
+            episode[f"layout_{layout_idx + 1}_episode_count"] = (
+                layout_count.float()
             )
 
         self.extras["successes"] = self.success_buf.clone()
@@ -283,9 +343,9 @@ class LeggedRobotBox(LeggedRobot):
         cfg = self.cfg.rewards
         num_envs = self.root_states.shape[0]
         env_ids = torch.arange(num_envs, device=self.root_states.device)
-        active = self.next_box_idx < self.env_box_bounds.shape[1]
+        active = self.next_box_idx < self.box_progress.required_boxes
         target_indices = self.next_box_idx.clamp(
-            max=self.env_box_bounds.shape[1] - 1
+            max=self.box_progress.required_boxes - 1
         )
         target_bounds = self.env_box_bounds[env_ids, target_indices]
         base_x = self.root_states[:, 0]
@@ -362,7 +422,7 @@ class LeggedRobotBox(LeggedRobot):
         return self.second_foot_contact_buf.float()
 
     def _reward_success(self):
-        """Emit one event after all five boxes and a stable landing."""
+        """Emit one event after the required boxes and a stable landing."""
         return self.success_buf.float()
 
     def _reward_episode_timeout(self):

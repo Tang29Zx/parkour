@@ -48,7 +48,14 @@ from .go1.go1_field_distill_config import Go1FieldDistillCfg, Go1FieldDistillCfg
 from .go2.go2_config import Go2RoughCfg, Go2RoughCfgPPO
 from .go2.go2_field_config import Go2FieldCfg, Go2FieldCfgPPO
 from .go2.debug_go2_box_config import DebugGo2BoxCfg, DebugGo2BoxCfgPPO
-from .go2.go2_box_parkour_config import Go2BoxParkourCfg, Go2BoxParkourCfgPPO
+from .go2.go2_box_parkour_config import (
+    Go2BoxParkourCfg,
+    Go2BoxParkourCfgPPO,
+    Go2BoxParkour1BoxCfg,
+    Go2BoxParkour1BoxCfgPPO,
+    Go2BoxParkour3BoxCfg,
+    Go2BoxParkour3BoxCfgPPO,
+)
 from .go2.go2_distill_config import Go2DistillCfg, Go2DistillCfgPPO
 
 
@@ -66,6 +73,18 @@ task_registry.register( "go1_distill", LeggedRobot, Go1FieldDistillCfg(), Go1Fie
 task_registry.register( "go2", LeggedRobot, Go2RoughCfg(), Go2RoughCfgPPO() )
 task_registry.register( "go2_field", RobotFieldNoisy, Go2FieldCfg(), Go2FieldCfgPPO() )
 task_registry.register( "debug_go2_box", LeggedRobot, DebugGo2BoxCfg(), DebugGo2BoxCfgPPO() )
+task_registry.register(
+    "go2_box_parkour_1box",
+    LeggedRobotBox,
+    Go2BoxParkour1BoxCfg(),
+    Go2BoxParkour1BoxCfgPPO(),
+)
+task_registry.register(
+    "go2_box_parkour_3box",
+    LeggedRobotBox,
+    Go2BoxParkour3BoxCfg(),
+    Go2BoxParkour3BoxCfgPPO(),
+)
 task_registry.register( "go2_box_parkour", LeggedRobotBox, Go2BoxParkourCfg(), Go2BoxParkourCfgPPO() )
 task_registry.register( "go2_distill", RobotFieldNoisy, Go2DistillCfg(), Go2DistillCfgPPO() )
 

@@ -214,6 +214,12 @@ class RandomBoxTrackTest(unittest.TestCase):
             for layout in first.layout_metadata[0]
         ]
         self.np.testing.assert_allclose(actual_gaps, expected_gaps)
+        for required_boxes in (1, 3):
+            landing_lengths = [
+                layout["boxes"][required_boxes]["gap"]
+                for layout in first.layout_metadata[0]
+            ]
+            self.assertGreaterEqual(min(landing_lengths), 0.85 - 1e-8)
 
         spawn_margin = random_cfg.RandomBoxTrack_kwargs["spawn_margin"]
         for col_idx, layout in enumerate(first.layout_metadata[0]):

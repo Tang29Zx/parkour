@@ -366,18 +366,28 @@ class BoxRewardTest(unittest.TestCase):
         from legged_gym.envs.go2.go2_box_parkour_config import (
             Go2BoxParkourCfg,
             Go2BoxParkourCfgPPO,
+            Go2BoxParkour1BoxCfg,
+            Go2BoxParkour1BoxCfgPPO,
+            Go2BoxParkour3BoxCfg,
+            Go2BoxParkour3BoxCfgPPO,
         )
         from legged_gym.envs.go2.go2_config import Go2RoughCfg
         from legged_gym.envs.go2.debug_go2_box_config import DebugGo2BoxCfg
         from legged_gym.utils.helpers import update_cfg_from_args
+        from legged_gym.utils.task_registry import task_registry
 
         cls.LeggedRobot = LeggedRobot
         cls.LeggedRobotBox = LeggedRobotBox
         cls.env_cfg = Go2BoxParkourCfg
         cls.train_cfg = Go2BoxParkourCfgPPO
+        cls.one_box_cfg = Go2BoxParkour1BoxCfg
+        cls.one_box_train_cfg = Go2BoxParkour1BoxCfgPPO
+        cls.three_box_cfg = Go2BoxParkour3BoxCfg
+        cls.three_box_train_cfg = Go2BoxParkour3BoxCfgPPO
         cls.debug_cfg = DebugGo2BoxCfg
         cls.walk_cfg = Go2RoughCfg
         cls.update_cfg_from_args = staticmethod(update_cfg_from_args)
+        cls.task_registry = task_registry
 
     def test_event_scale_values_after_control_dt(self):
         scales = self.env_cfg.rewards.scales
@@ -460,6 +470,7 @@ class BoxRewardTest(unittest.TestCase):
         env.cfg = SimpleNamespace(rewards=rewards)
         env.root_states = root_states
         env.env_box_bounds = bounds
+        env.box_progress = SimpleNamespace(required_boxes=2)
         env.next_box_idx = torch.tensor([0, 0, 0, 0, 0, 2])
         env.base_lin_vel = torch.tensor(
             [[1.0, 0.0, 0.0]]
@@ -602,6 +613,56 @@ class BoxRewardTest(unittest.TestCase):
         self.assertEqual(commands.ranges.ang_vel_yaw, [0.0, 0.0])
         self.assertGreater(commands.resampling_time, self.env_cfg.env.episode_length_s)
         self.assertEqual(self.env_cfg.env.episode_length_s, 45)
+
+    def test_curriculum_stage_configs_keep_the_five_box_geometry(self):
+        stages = (
+            (self.one_box_cfg, self.one_box_train_cfg, 1, 15, "one_box"),
+            (
+                self.three_box_cfg,
+                self.three_box_train_cfg,
+                3,
+                30,
+                "three_box",
+            ),
+            (self.env_cfg, self.train_cfg, 5, 45, "five_box"),
+        )
+        reference_boxes = self.env_cfg.terrain.RandomBoxTrack_kwargs["boxes"]
+        for env_cfg, train_cfg, required_boxes, episode_length, run_prefix in stages:
+            self.assertEqual(env_cfg.box_progress.required_boxes, required_boxes)
+            self.assertEqual(env_cfg.env.episode_length_s, episode_length)
+            self.assertEqual(
+                env_cfg.box_progress.min_landing_zone_length, 0.85
+            )
+            self.assertEqual(
+                env_cfg.terrain.RandomBoxTrack_kwargs["boxes"], reference_boxes
+            )
+            self.assertEqual(len(reference_boxes), 5)
+            self.assertTrue(train_cfg.runner.run_name.startswith(run_prefix))
+
+        self.assertFalse(self.one_box_train_cfg.runner.resume)
+        self.assertFalse(self.three_box_train_cfg.runner.resume)
+        self.assertIsNone(self.one_box_train_cfg.runner.ckpt_manipulator)
+        self.assertIsNone(self.three_box_train_cfg.runner.ckpt_manipulator)
+        self.assertEqual(self.one_box_train_cfg.runner.max_iterations, 1000)
+        self.assertEqual(self.three_box_train_cfg.runner.max_iterations, 1000)
+
+    def test_curriculum_tasks_are_registered_with_the_box_environment(self):
+        expected = {
+            "go2_box_parkour_1box": 1,
+            "go2_box_parkour_3box": 3,
+            "go2_box_parkour": 5,
+        }
+        for task_name, required_boxes in expected.items():
+            self.assertIs(
+                self.task_registry.task_classes[task_name],
+                self.LeggedRobotBox,
+            )
+            self.assertEqual(
+                self.task_registry.env_cfgs[
+                    task_name
+                ].box_progress.required_boxes,
+                required_boxes,
+            )
 
     def test_expanded_height_grid_contains_the_original_grid_at_locked_indices(self):
         import numpy as np

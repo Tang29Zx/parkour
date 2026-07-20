@@ -1,5 +1,7 @@
 """Tensor-only progress state for sequential box parkour courses."""
 
+from numbers import Integral
+
 import torch
 
 
@@ -12,6 +14,7 @@ class BoxProgressTracker:
         num_feet,
         num_boxes,
         device,
+        required_boxes=None,
         pass_margin=0.15,
         top_contact_tolerance=0.06,
         contact_force_threshold=1.0,
@@ -31,6 +34,16 @@ class BoxProgressTracker:
         self.num_envs = int(num_envs)
         self.num_feet = int(num_feet)
         self.num_boxes = int(num_boxes)
+        if required_boxes is None:
+            required_boxes = self.num_boxes
+        if isinstance(required_boxes, bool) or not isinstance(
+            required_boxes, Integral
+        ):
+            raise TypeError("required_boxes must be an integer.")
+        required_boxes = int(required_boxes)
+        if not 1 <= required_boxes <= self.num_boxes:
+            raise ValueError("required_boxes must be between 1 and num_boxes.")
+        self.required_boxes = required_boxes
         self.device = device
         self.pass_margin = float(pass_margin)
         self.top_contact_tolerance = float(top_contact_tolerance)
@@ -64,6 +77,7 @@ class BoxProgressTracker:
         self.success_buf = torch.zeros_like(self.box_passed_buf)
         self.missed_box_buf = torch.zeros_like(self.box_passed_buf)
         self.out_of_track_buf = torch.zeros_like(self.box_passed_buf)
+        self.landing_overrun_buf = torch.zeros_like(self.box_passed_buf)
         self.fall_buf = torch.zeros_like(self.box_passed_buf)
         self.episode_timeout_buf = torch.zeros_like(self.box_passed_buf)
 
@@ -86,6 +100,7 @@ class BoxProgressTracker:
         self.success_buf[env_ids] = False
         self.missed_box_buf[env_ids] = False
         self.out_of_track_buf[env_ids] = False
+        self.landing_overrun_buf[env_ids] = False
         self.fall_buf[env_ids] = False
         self.episode_timeout_buf[env_ids] = False
 
@@ -103,12 +118,15 @@ class BoxProgressTracker:
         pitch,
         body_contact,
         natural_timeout,
+        landing_end_x=None,
     ):
         """Advance progress by one control step and update event buffers."""
         self._clear_events()
+        if landing_end_x is None:
+            landing_end_x = track_end_x
         env_ids = torch.arange(self.num_envs, device=self.device)
-        active = self.next_box_idx < self.num_boxes
-        target_indices = self.next_box_idx.clamp(max=self.num_boxes - 1)
+        active = self.next_box_idx < self.required_boxes
+        target_indices = self.next_box_idx.clamp(max=self.required_boxes - 1)
         target_bounds = box_bounds[env_ids, target_indices]
 
         previous_contact_count = self.foot_contact_mask.sum(dim=1)
@@ -140,10 +158,10 @@ class BoxProgressTracker:
         self.foot_contact_mask[passed_envs] = False
 
         force_contact = feet_contact_forces.norm(dim=-1) > self.contact_force_threshold
-        final_rear = box_bounds[:, -1, 1]
+        course_rear = box_bounds[:, self.required_boxes - 1, 1]
         post_box_ground = (
-            (feet_positions[:, :, 0] > final_rear.unsqueeze(1))
-            & (feet_positions[:, :, 0] < track_end_x.unsqueeze(1))
+            (feet_positions[:, :, 0] > course_rear.unsqueeze(1))
+            & (feet_positions[:, :, 0] < landing_end_x.unsqueeze(1))
             & (
                 torch.abs(feet_positions[:, :, 1] - env_origins[:, 1].unsqueeze(1))
                 <= self.lateral_limit
@@ -155,16 +173,17 @@ class BoxProgressTracker:
             )
             & force_contact
         )
-        course_complete = self.next_box_idx == self.num_boxes
-        self.landing_foot_contact_mask |= (
+        course_complete = self.next_box_idx == self.required_boxes
+        self.landing_foot_contact_mask[:] = (
             course_complete.unsqueeze(1) & post_box_ground
         )
         all_feet_landed = self.landing_foot_contact_mask.all(dim=1)
         base_height = base_positions[:, 2] - env_origins[:, 2]
         stable_landing = (
             course_complete
-            & (base_positions[:, 0] > final_rear)
-            & (base_positions[:, 0] < track_end_x)
+            & all_feet_landed
+            & (base_positions[:, 0] > course_rear)
+            & (base_positions[:, 0] < landing_end_x)
             & (
                 torch.abs(base_positions[:, 1] - env_origins[:, 1])
                 <= self.lateral_limit
@@ -178,9 +197,7 @@ class BoxProgressTracker:
             self.landing_counter + 1,
             torch.zeros_like(self.landing_counter),
         )
-        landing_success = all_feet_landed & (
-            self.landing_counter >= self.landing_steps
-        )
+        landing_success = self.landing_counter >= self.landing_steps
 
         self.body_contact_counter[:] = torch.where(
             body_contact,
@@ -200,13 +217,26 @@ class BoxProgressTracker:
             | (base_positions[:, 0] < track_start_x)
             | ((base_positions[:, 0] > track_end_x) & ~landing_success)
         )
+        raw_landing_overrun = torch.zeros_like(course_complete)
+        if self.required_boxes < self.num_boxes:
+            raw_landing_overrun = (
+                course_complete
+                & (base_positions[:, 0] >= landing_end_x)
+                & ~landing_success
+            )
 
         # Terminal causes are mutually exclusive. Unsafe task failures take
         # precedence over success, and natural timeout is considered only when
         # neither a failure nor success happened on the same control step.
         self.fall_buf[:] = raw_fall & ~self.missed_box_buf
+        self.landing_overrun_buf[:] = (
+            raw_landing_overrun & ~self.missed_box_buf & ~raw_fall
+        )
         self.out_of_track_buf[:] = (
-            raw_out_of_track & ~self.missed_box_buf & ~raw_fall
+            raw_out_of_track
+            & ~self.missed_box_buf
+            & ~raw_fall
+            & ~raw_landing_overrun
         )
         self.success_buf[:] = landing_success & ~self.failure_buf
         self.episode_timeout_buf[:] = (
@@ -241,7 +271,12 @@ class BoxProgressTracker:
 
     @property
     def failure_buf(self):
-        return self.missed_box_buf | self.out_of_track_buf | self.fall_buf
+        return (
+            self.missed_box_buf
+            | self.out_of_track_buf
+            | self.landing_overrun_buf
+            | self.fall_buf
+        )
 
     def apply_termination(self, reset_buf, time_out_buf):
         """Apply exclusive failure, success, and natural-timeout semantics."""
