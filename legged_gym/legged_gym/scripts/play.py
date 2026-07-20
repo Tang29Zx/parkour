@@ -129,7 +129,8 @@ def play(args):
     env_cfg.env.episode_length_s = 1000
     env_cfg.commands.resampling_time = int(1e16)
     if not debug_geometry:
-        env_cfg.commands.ranges.lin_vel_x = [1.2, 1.2]
+        command_x = 1.2 if args.command_x is None else args.command_x
+        env_cfg.commands.ranges.lin_vel_x = [command_x, command_x]
     env_cfg.domain_rand.push_robots = False
     if not debug_geometry:
         initial_x = 0.0 if env_cfg.terrain.selected == "RandomBoxTrack" else 0.6
@@ -518,6 +519,7 @@ if __name__ == '__main__':
         dict(name= "--plot_time", type= int, default= -1, help= "plot states after this time"),
         dict(name= "--no_throw", action= "store_true", default= False),
         dict(name= "--load_cfg", action= "store_true", default= False, help= "use the config from the logdir"),
+        dict(name= "--command_x", type= float, default= None, help= "fixed forward command for policy playback; defaults to 1.2 m/s"),
         dict(name= "--record", action= "store_true", default= False, help= "record frames"),
         dict(name= "--frames_dir", type= str, default= "images", help= "which folder to store intermediate recorded frames."),
     ])

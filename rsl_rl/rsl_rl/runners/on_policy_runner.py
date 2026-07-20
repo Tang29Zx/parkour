@@ -258,17 +258,20 @@ class OnPolicyRunner:
 
     def load(self, path, load_optimizer=True):
         loaded_dict = torch.load(path, map_location=self.device)
-        if self.cfg.get("ckpt_manipulator", False):
+        manipulator_name = self.cfg.get("ckpt_manipulator", False)
+        if manipulator_name:
             # suppose to be a string specifying which function to use
             print("\033[1;36m Warning: using a hacky way to load the model. \033[0m")
-            loaded_dict = getattr(ckpt_manipulator, self.cfg["ckpt_manipulator"])(
+            loaded_dict = getattr(ckpt_manipulator, manipulator_name)(
                 loaded_dict,
                 self.alg.state_dict(),
             )
             print("\033[1;36m Done: using a hacky way to load the model. \033[0m")
         self.alg.load_state_dict(loaded_dict)
         self.current_learning_iteration = loaded_dict['iter']
-        if self.cfg.get("ckpt_manipulator", False):
+        if manipulator_name == "reset_critic_and_optimizer":
+            self.alg.start_critic_warmup(self.current_learning_iteration)
+        if manipulator_name:
             try:
                 self.save(os.path.join(self.log_dir, 'model_{}.pt'.format(self.current_learning_iteration)))
             except:

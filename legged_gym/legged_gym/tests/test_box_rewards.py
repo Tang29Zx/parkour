@@ -7,6 +7,8 @@ import sys
 from types import ModuleType, SimpleNamespace
 import unittest
 
+import numpy as np
+
 
 ISAAC_GYM_AVAILABLE = importlib.util.find_spec("isaacgym") is not None
 TORCH_AVAILABLE = importlib.util.find_spec("torch") is not None
@@ -393,8 +395,11 @@ class BoxRewardTest(unittest.TestCase):
         scales = self.env_cfg.rewards.scales
         expected_scales = {
             "tracking_ang_vel": 0.2,
+            "forward_speed_tracking": 1.0,
             "speed_error_square": -1.0,
             "overspeed": -1.5,
+            "action_rate": -0.01,
+            "flat_orientation": -0.2,
             "lin_pos_y": -0.1,
             "yaw_abs": -0.1,
             "energy_substeps": -2e-7,
@@ -414,8 +419,11 @@ class BoxRewardTest(unittest.TestCase):
         self.assertAlmostEqual(scales.box_second_foot_contact * dt, 0.2)
         self.assertAlmostEqual(scales.box_passed * dt, 0.5)
         self.assertAlmostEqual(scales.success * dt, 2.0)
-        self.assertAlmostEqual(scales.termination * dt, -2.0)
+        self.assertAlmostEqual(scales.termination * dt, -4.0)
         self.assertAlmostEqual(scales.episode_timeout * dt, -3.0)
+        self.assertEqual(
+            self.env_cfg.rewards.forward_speed_tracking_sigma, 0.02
+        )
         self.assertFalse(self.env_cfg.rewards.only_positive_rewards)
         self.assertFalse(hasattr(scales, "lazy_stop"))
 
@@ -431,6 +439,8 @@ class BoxRewardTest(unittest.TestCase):
             box_progress=SimpleNamespace(
                 failure_buf=torch.tensor([False, False, True])
             ),
+            episode_length_buf=torch.tensor([1, 750, 750]),
+            max_episode_length=750,
         )
         first_foot = self.LeggedRobotBox._reward_box_first_foot_contact(env)
         second_foot = self.LeggedRobotBox._reward_box_second_foot_contact(env)
@@ -446,6 +456,26 @@ class BoxRewardTest(unittest.TestCase):
         self.assertEqual(timeout.tolist(), [0.0, 1.0, 0.0])
         self.assertEqual(termination.tolist(), [0, 0, 1])
 
+    def test_early_failure_costs_more_than_late_failure_and_timeout(self):
+        env = SimpleNamespace(
+            box_progress=SimpleNamespace(
+                failure_buf=torch.tensor([True, True, False])
+            ),
+            episode_length_buf=torch.tensor([0, 750, 750]),
+            max_episode_length=750,
+        )
+        multiplier = self.LeggedRobotBox._reward_termination(env)
+        actual = multiplier * self.env_cfg.rewards.scales.termination * 0.02
+
+        torch.testing.assert_close(
+            actual, torch.tensor([-8.0, -4.0, 0.0])
+        )
+        self.assertLess(actual[0].item(), actual[1].item())
+        self.assertLess(
+            actual[1].item(),
+            self.env_cfg.rewards.scales.episode_timeout * 0.02,
+        )
+
     def make_speed_reward_env(self):
         rewards = SimpleNamespace(
             box_approach_distance=0.5,
@@ -455,6 +485,7 @@ class BoxRewardTest(unittest.TestCase):
             flat_speed_limit=0.7,
             flat_severe_speed_limit=0.8,
             box_speed_limit=1.2,
+            forward_speed_tracking_sigma=0.02,
         )
         single_bounds = torch.tensor(
             [
@@ -511,31 +542,86 @@ class BoxRewardTest(unittest.TestCase):
             torch.tensor([0.0, 0.0, 0.09, 0.09, 0.09, 0.09]),
         )
 
+    def test_forward_speed_tracking_peaks_only_at_the_command(self):
+        env = self.make_speed_reward_env()
+        env.base_lin_vel[:, 0] = torch.tensor(
+            [0.5, 1.0, 0.0, 0.4, 0.6, 2.0]
+        )
+        reward = self.LeggedRobotBox._reward_forward_speed_tracking(env)
+
+        self.assertAlmostEqual(reward[0].item(), 1.0)
+        self.assertGreater(reward[3].item(), 0.6)
+        self.assertGreater(reward[4].item(), 0.6)
+        self.assertLess(reward[1].item(), 1e-5)
+        self.assertLess(reward[2].item(), 1e-5)
+        self.assertLess(reward[5].item(), 1e-5)
+
+    def test_flat_orientation_is_disabled_only_in_current_box_window(self):
+        env = self.make_speed_reward_env()
+        env.projected_gravity = torch.tensor(
+            [[0.3, 0.4, -0.866]]
+        ).repeat(6, 1)
+        reward = self.LeggedRobotBox._reward_flat_orientation(env)
+
+        torch.testing.assert_close(
+            reward,
+            torch.tensor([0.0, 0.0, 0.25, 0.25, 0.25, 0.25]),
+        )
+
+    def test_action_rate_is_zero_for_unchanged_actions(self):
+        env = SimpleNamespace(
+            actions=torch.tensor([[1.0, -1.0], [0.5, 0.5]]),
+            last_actions=torch.tensor([[1.0, -1.0], [0.0, 0.0]]),
+            episode_length_buf=torch.tensor([2, 2]),
+        )
+        reward = self.LeggedRobotBox._reward_action_rate(env)
+
+        torch.testing.assert_close(reward, torch.tensor([0.0, 0.5]))
+
+        env.episode_length_buf[:] = 1
+        reward = self.LeggedRobotBox._reward_action_rate(env)
+        torch.testing.assert_close(reward, torch.zeros(2))
+
     def test_target_speed_trajectory_beats_waiting_and_flat_sprint(self):
         scales = self.env_cfg.rewards.scales
         dt = 0.02
         command = 0.5
-        event_total = 5 * (0.1 + 0.2 + 0.5) + 2.0
-
-        target_return = event_total
-        waiting_steps = int(self.env_cfg.env.episode_length_s / dt)
+        course_distance = 3.0
+        event_total = 0.1 + 0.2 + 0.5 + 2.0
+        target_steps = int(course_distance / command / dt)
+        target_return = event_total + target_steps * dt * (
+            scales.forward_speed_tracking
+        )
+        waiting_steps = int(self.one_box_cfg.env.episode_length_s / dt)
+        waiting_tracking = np.exp(
+            -(0.0 - command) ** 2
+            / self.env_cfg.rewards.forward_speed_tracking_sigma
+        )
         waiting_return = (
-            waiting_steps
-            * scales.speed_error_square
-            * dt
-            * (0.0 - command) ** 2
+            waiting_steps * dt * (
+                scales.forward_speed_tracking * waiting_tracking
+                + scales.speed_error_square * (0.0 - command) ** 2
+            )
             + scales.episode_timeout * dt
         )
         sprint_speed = 2.0
-        sprint_steps = int(14.0 / sprint_speed / dt)
+        sprint_steps = int(course_distance / sprint_speed / dt)
+        sprint_tracking = np.exp(
+            -(sprint_speed - command) ** 2
+            / self.env_cfg.rewards.forward_speed_tracking_sigma
+        )
         sprint_return = event_total + sprint_steps * dt * (
-            scales.speed_error_square * (sprint_speed - command) ** 2
+            scales.forward_speed_tracking * sprint_tracking
+            + scales.speed_error_square * (sprint_speed - command) ** 2
             + scales.overspeed
             * (sprint_speed - self.env_cfg.rewards.flat_speed_limit) ** 2
         )
+        immediate_failure_return = scales.termination * dt * 2.0
 
         self.assertGreater(target_return, waiting_return)
         self.assertGreater(target_return, sprint_return)
+        self.assertGreater(target_return, immediate_failure_return)
+        self.assertGreater(waiting_return, immediate_failure_return)
 
     def test_speed_statistics_are_finite_and_reset_to_zero(self):
         env = self.make_speed_reward_env()
@@ -576,6 +662,52 @@ class BoxRewardTest(unittest.TestCase):
         zero_stats = self.LeggedRobotBox._get_speed_statistics(env, env_ids)
         self.assertTrue(all(torch.isfinite(value) for value in zero_stats.values()))
         self.assertTrue(all(value.item() == 0.0 for value in zero_stats.values()))
+
+    def test_motion_quality_statistics_are_finite_and_reset_to_zero(self):
+        env = object.__new__(self.LeggedRobotBox)
+        num_envs = 3
+        env.dt = 0.02
+        env.episode_length_buf = torch.tensor([1, 50, 100])
+        env.box_progress = SimpleNamespace(
+            failure_buf=torch.tensor([False, True, True])
+        )
+        for name in (
+            "abs_roll_sum",
+            "max_abs_roll",
+            "abs_pitch_sum",
+            "max_abs_pitch",
+            "action_rate_l2_sum",
+            "max_action_rate_l2",
+        ):
+            setattr(env, name, torch.zeros(num_envs))
+        env.abs_roll_sum[:] = torch.tensor([0.1, 1.0, 2.0])
+        env.max_abs_roll[:] = torch.tensor([0.1, 0.2, 0.3])
+        env.abs_pitch_sum[:] = torch.tensor([0.2, 2.0, 3.0])
+        env.max_abs_pitch[:] = torch.tensor([0.2, 0.3, 0.4])
+        env.action_rate_l2_sum[:] = torch.tensor([0.3, 3.0, 4.0])
+        env.max_action_rate_l2[:] = torch.tensor([0.3, 0.4, 0.5])
+        env_ids = torch.arange(num_envs)
+
+        stats = self.LeggedRobotBox._get_motion_quality_statistics(
+            env, env_ids
+        )
+        self.assertTrue(all(torch.isfinite(value) for value in stats.values()))
+        self.assertAlmostEqual(stats["early_failure_rate"].item(), 1.0 / 3.0)
+        self.assertAlmostEqual(stats["mean_failure_time_s"].item(), 1.5)
+
+        self.LeggedRobotBox._reset_motion_quality_statistics(env, env_ids)
+        reset_stats = self.LeggedRobotBox._get_motion_quality_statistics(
+            env, env_ids
+        )
+        for name in (
+            "mean_abs_roll_rad",
+            "max_abs_roll_rad",
+            "mean_abs_pitch_rad",
+            "max_abs_pitch_rad",
+            "mean_action_rate_l2",
+            "max_action_rate_l2",
+        ):
+            self.assertEqual(reset_stats[name].item(), 0.0)
 
     def test_4096_event_reward_shapes(self):
         env = SimpleNamespace(
@@ -710,7 +842,7 @@ class BoxRewardTest(unittest.TestCase):
         self.assertEqual(runner.checkpoint, 11700)
         self.assertEqual(
             runner.run_name,
-            "five_box_v8_pre_curriculum_from11700",
+            "five_box_v9_pre_curriculum_from11700",
         )
         self.assertIsNone(runner.ckpt_manipulator)
         self.assertTrue(
@@ -723,8 +855,9 @@ class BoxRewardTest(unittest.TestCase):
         self.assertEqual(algorithm.entropy_coef, 0.003)
         self.assertEqual(algorithm.gamma, 0.999)
         self.assertEqual(algorithm.lam, 0.95)
-        self.assertEqual(runner.save_interval, 250)
-        self.assertEqual(runner.log_interval, 50)
+        self.assertEqual(algorithm.critic_warmup_iterations, 100)
+        self.assertEqual(runner.save_interval, 100)
+        self.assertEqual(runner.log_interval, 10)
 
     def test_cli_checkpoint_manipulator_override_is_explicit(self):
         args = SimpleNamespace(

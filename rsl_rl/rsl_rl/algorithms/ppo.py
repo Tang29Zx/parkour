@@ -54,6 +54,7 @@ class PPO:
                  optimizer_class_name= "Adam",
                  schedule="fixed",
                  desired_kl=0.01,
+                 critic_warmup_iterations=0,
                  device='cpu',
                  ):
 
@@ -80,9 +81,30 @@ class PPO:
         self.max_grad_norm = max_grad_norm
         self.use_clipped_value_loss = use_clipped_value_loss
         self.clip_min_std = torch.tensor(clip_min_std, device= self.device) if isinstance(clip_min_std, (tuple, list)) else clip_min_std
+        self.critic_warmup_iterations = int(critic_warmup_iterations)
+        if self.critic_warmup_iterations < 0:
+            raise ValueError("critic_warmup_iterations must be non-negative.")
+        self.critic_warmup_until_iteration = None
         
         # algorithm status
         self.current_learning_iteration = 0
+
+    def start_critic_warmup(self, start_iteration):
+        """Train only the Critic for a fixed number of loaded iterations."""
+        if self.critic_warmup_iterations == 0:
+            self.critic_warmup_until_iteration = None
+            return
+        self.critic_warmup_until_iteration = (
+            int(start_iteration) + self.critic_warmup_iterations
+        )
+
+    def is_critic_warmup_active(self, iteration=None):
+        """Return whether Actor-side losses must remain frozen."""
+        if self.critic_warmup_until_iteration is None:
+            return False
+        if iteration is None:
+            iteration = self.current_learning_iteration
+        return int(iteration) < self.critic_warmup_until_iteration
 
     def init_storage(self, num_envs, num_transitions_per_env, actor_obs_shape, critic_obs_shape, action_shape):
         self.transition = RolloutStorage.Transition()
@@ -126,6 +148,9 @@ class PPO:
 
     def update(self, current_learning_iteration):
         self.current_learning_iteration = current_learning_iteration
+        critic_warmup_active = self.is_critic_warmup_active(
+            current_learning_iteration
+        )
         mean_losses = defaultdict(lambda :0.)
         average_stats = defaultdict(lambda :0.)
         if self.actor_critic.is_recurrent:
@@ -138,7 +163,8 @@ class PPO:
 
                 loss = 0.
                 for k, v in losses.items():
-                    loss += getattr(self, k + "_coef", 1.) * v
+                    if not critic_warmup_active or k == "value_loss":
+                        loss += getattr(self, k + "_coef", 1.) * v
                     mean_losses[k] = mean_losses[k] + v.detach()
                 mean_losses["total_loss"] = mean_losses["total_loss"] + loss.detach()
                 for k, v in stats.items():
@@ -155,6 +181,19 @@ class PPO:
             mean_losses[k] = mean_losses[k] / num_updates
         for k in average_stats.keys():
             average_stats[k] = average_stats[k] / num_updates
+        warmup_remaining = 0
+        if self.critic_warmup_until_iteration is not None:
+            warmup_remaining = max(
+                self.critic_warmup_until_iteration
+                - int(current_learning_iteration),
+                0,
+            )
+        average_stats["actor_update_enabled"] = torch.tensor(
+            0.0 if critic_warmup_active else 1.0, device=self.device
+        )
+        average_stats["critic_warmup_remaining"] = torch.tensor(
+            float(warmup_remaining), device=self.device
+        )
         self.storage.clear()
         if hasattr(self.actor_critic, "clip_std"):
             self.actor_critic.clip_std(min= self.clip_min_std)
@@ -227,6 +266,11 @@ class PPO:
         state_dict = {
             "model_state_dict": self.actor_critic.state_dict(),
             "optimizer_state_dict": self.optimizer.state_dict(),
+            "algorithm_state_dict": {
+                "critic_warmup_until_iteration": (
+                    self.critic_warmup_until_iteration
+                ),
+            },
         }
         if hasattr(self, "lr_scheduler"):
             state_dict["lr_scheduler_state_dict"] = self.lr_scheduler.state_dict()
@@ -241,3 +285,7 @@ class PPO:
             self.lr_scheduler.load_state_dict(state_dict["lr_scheduler_state_dict"])
         elif "lr_scheduler_state_dict" in state_dict:
             print("Warning: lr scheduler state dict loaded but no lr scheduler is initialized. Ignored.")
+        algorithm_state = state_dict.get("algorithm_state_dict", {})
+        self.critic_warmup_until_iteration = algorithm_state.get(
+            "critic_warmup_until_iteration"
+        )

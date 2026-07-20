@@ -58,8 +58,11 @@ class Go2BoxParkourCfg(DebugGo2BoxCfg):
     class rewards(DebugGo2BoxCfg.rewards):
         class scales:
             tracking_ang_vel = 0.2
+            forward_speed_tracking = 1.0
             speed_error_square = -1.0
             overspeed = -1.5
+            action_rate = -0.01
+            flat_orientation = -0.2
             lin_pos_y = -0.1
             yaw_abs = -0.1
             energy_substeps = -2e-7
@@ -73,10 +76,11 @@ class Go2BoxParkourCfg(DebugGo2BoxCfg):
             box_second_foot_contact = 10.0
             box_passed = 25.0
             success = 100.0
-            termination = -100.0
+            termination = -200.0
             episode_timeout = -150.0
 
         only_positive_rewards = False
+        forward_speed_tracking_sigma = 0.02
         # Track the command closely on flat ground. Near a box, allow a brief
         # positive speed error for jumping or climbing without rewarding it.
         box_approach_distance = 0.5
@@ -116,10 +120,11 @@ class Go2BoxParkourCfgPPO(Go2RoughCfgPPO):
         entropy_coef = 0.003
         gamma = 0.999
         lam = 0.95
+        critic_warmup_iterations = 100
 
     class runner(Go2RoughCfgPPO.runner):
         experiment_name = "go2_box_parkour"
-        run_name = "five_box_v8_pre_curriculum_from11700"
+        run_name = "five_box_v9_pre_curriculum_from11700"
         resume = True
         load_run = osp.join(
             osp.dirname(osp.dirname(osp.dirname(osp.dirname(__file__)))),
@@ -129,11 +134,11 @@ class Go2BoxParkourCfgPPO(Go2RoughCfgPPO):
         )
         checkpoint = 11700
         # Initial Critic migration is selected explicitly from the CLI. Keeping
-        # this disabled prevents later v8 resumes from resetting Critic again.
+        # this disabled prevents later v9 resumes from resetting Critic again.
         ckpt_manipulator = None
         max_iterations = 2000
-        save_interval = 250
-        log_interval = 50
+        save_interval = 100
+        log_interval = 10
 
 
 class Go2BoxParkour1BoxCfg(Go2BoxParkourCfg):
@@ -148,7 +153,7 @@ class Go2BoxParkour1BoxCfg(Go2BoxParkourCfg):
 
 class Go2BoxParkour1BoxCfgPPO(Go2BoxParkourCfgPPO):
     class runner(Go2BoxParkourCfgPPO.runner):
-        run_name = "one_box_v8_curriculum"
+        run_name = "one_box_v9_critic_warmup_from11700"
         # The source checkpoint must be selected explicitly on the CLI.
         resume = False
         load_run = -1
@@ -169,7 +174,7 @@ class Go2BoxParkour3BoxCfg(Go2BoxParkourCfg):
 
 class Go2BoxParkour3BoxCfgPPO(Go2BoxParkourCfgPPO):
     class runner(Go2BoxParkourCfgPPO.runner):
-        run_name = "three_box_v8_curriculum"
+        run_name = "three_box_v9_curriculum"
         # Continue from the accepted one-box checkpoint without migration.
         resume = False
         load_run = -1

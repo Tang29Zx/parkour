@@ -63,6 +63,12 @@ class LeggedRobotBox(LeggedRobot):
         self.box_overspeed_count = torch.zeros_like(
             self.flat_forward_speed_count
         )
+        self.abs_roll_sum = torch.zeros_like(self.forward_speed_sum)
+        self.max_abs_roll = torch.zeros_like(self.forward_speed_sum)
+        self.abs_pitch_sum = torch.zeros_like(self.forward_speed_sum)
+        self.max_abs_pitch = torch.zeros_like(self.forward_speed_sum)
+        self.action_rate_l2_sum = torch.zeros_like(self.forward_speed_sum)
+        self.max_action_rate_l2 = torch.zeros_like(self.forward_speed_sum)
 
         rigid_body_names = self.gym.get_actor_rigid_body_names(
             self.envs[0], self.actor_handles[0]
@@ -148,6 +154,26 @@ class LeggedRobotBox(LeggedRobot):
         forward_speed = self.base_lin_vel[:, 0]
         box_mask = self._near_box_for_speed_control()
         self._update_speed_statistics(forward_speed, box_mask)
+        self._update_motion_quality_statistics()
+
+    def _update_motion_quality_statistics(self):
+        """Accumulate posture and action-change metrics for each episode."""
+        roll, pitch, _ = get_euler_xyz(self.base_quat)
+        roll = torch.where(roll > np.pi, roll - 2.0 * np.pi, roll).abs()
+        pitch = torch.where(pitch > np.pi, pitch - 2.0 * np.pi, pitch).abs()
+        action_rate_l2 = torch.norm(
+            self.actions - self.last_actions, dim=1
+        )
+        action_rate_l2 *= (self.episode_length_buf > 1).float()
+
+        self.abs_roll_sum += roll
+        self.max_abs_roll = torch.maximum(self.max_abs_roll, roll)
+        self.abs_pitch_sum += pitch
+        self.max_abs_pitch = torch.maximum(self.max_abs_pitch, pitch)
+        self.action_rate_l2_sum += action_rate_l2
+        self.max_action_rate_l2 = torch.maximum(
+            self.max_action_rate_l2, action_rate_l2
+        )
 
     def _update_speed_statistics(self, forward_speed, box_mask):
         """Accumulate finite whole-course and mutually exclusive region stats."""
@@ -245,6 +271,52 @@ class LeggedRobotBox(LeggedRobot):
         self.flat_severe_overspeed_count[env_ids] = 0
         self.box_overspeed_count[env_ids] = 0
 
+    def _get_motion_quality_statistics(self, env_ids):
+        """Summarize posture, action changes, and early task failures."""
+        episode_lengths = self.episode_length_buf[env_ids].clamp_min(1)
+        failure_mask = self.box_progress.failure_buf[env_ids]
+        failure_count = failure_mask.sum()
+        early_failure_steps = int(np.ceil(1.0 / self.dt))
+        early_failure = failure_mask & (
+            self.episode_length_buf[env_ids] <= early_failure_steps
+        )
+        failure_steps = torch.where(
+            failure_mask,
+            self.episode_length_buf[env_ids],
+            torch.zeros_like(self.episode_length_buf[env_ids]),
+        )
+        return {
+            "mean_abs_roll_rad": torch.mean(
+                self.abs_roll_sum[env_ids] / episode_lengths
+            ),
+            "max_abs_roll_rad": torch.max(self.max_abs_roll[env_ids]),
+            "mean_abs_pitch_rad": torch.mean(
+                self.abs_pitch_sum[env_ids] / episode_lengths
+            ),
+            "max_abs_pitch_rad": torch.max(self.max_abs_pitch[env_ids]),
+            "mean_action_rate_l2": torch.mean(
+                self.action_rate_l2_sum[env_ids] / episode_lengths
+            ),
+            "max_action_rate_l2": torch.max(
+                self.max_action_rate_l2[env_ids]
+            ),
+            "early_failure_rate": early_failure.float().mean(),
+            "mean_failure_time_s": (
+                failure_steps.float().sum()
+                * self.dt
+                / failure_count.clamp_min(1)
+            ),
+        }
+
+    def _reset_motion_quality_statistics(self, env_ids):
+        """Clear posture and action-change accumulators."""
+        self.abs_roll_sum[env_ids] = 0.0
+        self.max_abs_roll[env_ids] = 0.0
+        self.abs_pitch_sum[env_ids] = 0.0
+        self.max_abs_pitch[env_ids] = 0.0
+        self.action_rate_l2_sum[env_ids] = 0.0
+        self.max_action_rate_l2[env_ids] = 0.0
+
     def check_termination(self):
         super().check_termination()
         natural_timeout = self.time_out_buf.clone()
@@ -311,6 +383,7 @@ class LeggedRobotBox(LeggedRobot):
             / self.box_progress.required_boxes
         )
         episode.update(self._get_speed_statistics(env_ids))
+        episode.update(self._get_motion_quality_statistics(env_ids))
         for box_idx in range(self.box_progress.required_boxes):
             episode[f"box_{box_idx + 1}_pass_rate"] = (
                 (self.passed_box_count[env_ids] > box_idx).float().mean()
@@ -337,6 +410,8 @@ class LeggedRobotBox(LeggedRobot):
             self.box_progress.reset(env_ids)
         if hasattr(self, "forward_speed_sum"):
             self._reset_speed_statistics(env_ids)
+        if hasattr(self, "abs_roll_sum"):
+            self._reset_motion_quality_statistics(env_ids)
 
     def _near_box_for_speed_control(self):
         """Return environments inside the current target box speed window."""
@@ -377,6 +452,21 @@ class LeggedRobotBox(LeggedRobot):
         )
         return torch.square(adjusted_error)
 
+    def _reward_forward_speed_tracking(self):
+        """Reward the commanded speed without rewarding faster motion."""
+        speed_error = self.base_lin_vel[:, 0] - self.commands[:, 0]
+        return torch.exp(
+            -torch.square(speed_error)
+            / self.cfg.rewards.forward_speed_tracking_sigma
+        )
+
+    def _reward_action_rate(self):
+        """Penalize action changes except across an episode reset boundary."""
+        action_rate = torch.sum(
+            torch.square(self.last_actions - self.actions), dim=1
+        )
+        return action_rate * (self.episode_length_buf > 1).float()
+
     def _reward_overspeed(self):
         """Quadratically penalize speed above the local absolute limit."""
         near_box = self._near_box_for_speed_control()
@@ -395,8 +485,21 @@ class LeggedRobotBox(LeggedRobot):
         return torch.square(excess_speed)
 
     def _reward_termination(self):
-        """Penalize only task failures, never success or natural timeout."""
-        return self.box_progress.failure_buf.float()
+        """Make an early task failure costlier than a late failed attempt."""
+        remaining_fraction = 1.0 - (
+            self.episode_length_buf.float() / float(self.max_episode_length)
+        )
+        remaining_fraction = remaining_fraction.clamp(0.0, 1.0)
+        return self.box_progress.failure_buf.float() * (
+            1.0 + remaining_fraction
+        )
+
+    def _reward_flat_orientation(self):
+        """Penalize base tilt only outside the active box maneuver window."""
+        tilt_square = torch.sum(
+            torch.square(self.projected_gravity[:, :2]), dim=1
+        )
+        return tilt_square * (~self._near_box_for_speed_control()).float()
 
     def _reward_lin_pos_y(self):
         """Penalize lateral displacement from the course centerline."""
