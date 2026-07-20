@@ -166,7 +166,7 @@ class BoxProgressTrackerTest(unittest.TestCase):
         self.assertFalse(self.tracker.box_passed_buf[0])
         self.assertEqual(self.tracker.passed_box_count[0].item(), 1)
 
-    def test_landing_requires_four_feet_for_ten_consecutive_steps(self):
+    def test_landing_accumulates_sequential_feet_and_safe_steps(self):
         self.tracker.next_box_idx[0] = 5
         self.tracker.passed_box_count[0] = 5
         self.feet_positions[0, :, 0] = 10.5
@@ -175,22 +175,20 @@ class BoxProgressTrackerTest(unittest.TestCase):
         self.base_positions[0, 0] = 10.5
         self.terrain_heights[0] = 0.0
 
-        self.contact_forces[0, :, 2] = 2.0
-        for _ in range(9):
+        for foot_idx in range(4):
+            self.contact_forces[0].zero_()
+            self.contact_forces[0, foot_idx, 2] = 2.0
             self.update()
         self.assertTrue(self.tracker.landing_foot_contact_mask[0].all())
         self.assertFalse(self.tracker.success_buf[0])
-        self.assertEqual(self.tracker.landing_counter[0].item(), 9)
+        self.assertEqual(self.tracker.landing_counter[0].item(), 4)
 
-        self.contact_forces[0, 0] = 0.0
-        self.update()
-        self.assertEqual(self.tracker.landing_counter[0].item(), 0)
-        self.assertFalse(self.tracker.landing_foot_contact_mask[0, 0])
-
-        self.contact_forces[0, 0, 2] = 2.0
-        for _ in range(9):
+        self.contact_forces[0].zero_()
+        for _ in range(5):
             self.update()
         self.assertFalse(self.tracker.success_buf[0])
+        self.assertEqual(self.tracker.landing_counter[0].item(), 9)
+        self.assertTrue(self.tracker.landing_foot_contact_mask[0].all())
 
         self.natural_timeout[0] = True
         self.update()

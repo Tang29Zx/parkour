@@ -69,6 +69,9 @@ class LeggedRobotBox(LeggedRobot):
         self.max_abs_pitch = torch.zeros_like(self.forward_speed_sum)
         self.action_rate_l2_sum = torch.zeros_like(self.forward_speed_sum)
         self.max_action_rate_l2 = torch.zeros_like(self.forward_speed_sum)
+        self.quality_level = float(
+            getattr(self.cfg.rewards, "quality_initial_level", 0.0)
+        )
 
         rigid_body_names = self.gym.get_actor_rigid_body_names(
             self.envs[0], self.actor_handles[0]
@@ -441,6 +444,13 @@ class LeggedRobotBox(LeggedRobot):
             self.base_lin_vel.dtype
         ) * self.cfg.rewards.box_speed_allowance
 
+    def set_quality_level(self, level):
+        """Set the global action-quality curriculum level."""
+        level = float(level)
+        if not np.isfinite(level):
+            raise ValueError("quality_level must be finite.")
+        self.quality_level = min(max(level, 0.0), 1.0)
+
     def _reward_speed_error_square(self):
         """Penalize command error while preserving a short box-speed allowance."""
         speed_error = self.base_lin_vel[:, 0] - self.commands[:, 0]
@@ -450,7 +460,9 @@ class LeggedRobotBox(LeggedRobot):
             torch.relu(speed_error - allowance),
             speed_error,
         )
-        return torch.square(adjusted_error)
+        return torch.square(adjusted_error) * float(
+            getattr(self, "quality_level", 1.0)
+        )
 
     def _reward_forward_speed_tracking(self):
         """Reward the commanded speed without rewarding faster motion."""
@@ -465,7 +477,11 @@ class LeggedRobotBox(LeggedRobot):
         action_rate = torch.sum(
             torch.square(self.last_actions - self.actions), dim=1
         )
-        return action_rate * (self.episode_length_buf > 1).float()
+        return (
+            action_rate
+            * (self.episode_length_buf > 1).float()
+            * float(getattr(self, "quality_level", 1.0))
+        )
 
     def _reward_overspeed(self):
         """Quadratically penalize speed above the local absolute limit."""
@@ -482,7 +498,9 @@ class LeggedRobotBox(LeggedRobot):
             ),
         )
         excess_speed = torch.relu(self.base_lin_vel[:, 0] - speed_limit)
-        return torch.square(excess_speed)
+        return torch.square(excess_speed) * float(
+            getattr(self, "quality_level", 1.0)
+        )
 
     def _reward_termination(self):
         """Make an early task failure costlier than a late failed attempt."""
@@ -499,7 +517,11 @@ class LeggedRobotBox(LeggedRobot):
         tilt_square = torch.sum(
             torch.square(self.projected_gravity[:, :2]), dim=1
         )
-        return tilt_square * (~self._near_box_for_speed_control()).float()
+        return (
+            tilt_square
+            * (~self._near_box_for_speed_control()).float()
+            * float(getattr(self, "quality_level", 1.0))
+        )
 
     def _reward_lin_pos_y(self):
         """Penalize lateral displacement from the course centerline."""

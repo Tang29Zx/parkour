@@ -174,14 +174,13 @@ class BoxProgressTracker:
             & force_contact
         )
         course_complete = self.next_box_idx == self.required_boxes
-        self.landing_foot_contact_mask[:] = (
+        self.landing_foot_contact_mask |= (
             course_complete.unsqueeze(1) & post_box_ground
         )
         all_feet_landed = self.landing_foot_contact_mask.all(dim=1)
         base_height = base_positions[:, 2] - env_origins[:, 2]
         stable_landing = (
             course_complete
-            & all_feet_landed
             & (base_positions[:, 0] > course_rear)
             & (base_positions[:, 0] < landing_end_x)
             & (
@@ -197,7 +196,9 @@ class BoxProgressTracker:
             self.landing_counter + 1,
             torch.zeros_like(self.landing_counter),
         )
-        landing_success = self.landing_counter >= self.landing_steps
+        landing_success = all_feet_landed & (
+            self.landing_counter >= self.landing_steps
+        )
 
         self.body_contact_counter[:] = torch.where(
             body_contact,

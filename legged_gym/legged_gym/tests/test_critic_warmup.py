@@ -5,6 +5,7 @@ from pathlib import Path
 import sys
 import tempfile
 from types import ModuleType
+from types import SimpleNamespace
 import unittest
 
 import torch
@@ -19,6 +20,7 @@ if (
     sys.modules["tensorboardX"] = tensorboard_module
 
 from rsl_rl.algorithms.ppo import PPO
+from rsl_rl.modules.actor_critic import ActorCritic
 from rsl_rl.runners.on_policy_runner import OnPolicyRunner
 
 
@@ -157,6 +159,108 @@ class CriticWarmupTest(unittest.TestCase):
         self.assertEqual(restored.critic_warmup_until_iteration, 11800)
         self.assertTrue(restored.is_critic_warmup_active(11799))
         self.assertFalse(restored.is_critic_warmup_active(11800))
+
+    def test_quality_curriculum_promotes_regresses_and_warns(self):
+        ppo = self.make_ppo()
+        ppo.update_quality_curriculum(0.9, 0.95, 0.1, 256)
+        self.assertEqual(ppo.quality_level, 0.0)
+        ppo.update_quality_curriculum(0.9, 0.95, 0.1, 256)
+        self.assertAlmostEqual(ppo.quality_level, 0.05)
+
+        ppo.update_quality_curriculum(0.5, 0.6, 0.6, 255)
+        self.assertAlmostEqual(ppo.quality_level, 0.05)
+        self.assertFalse(ppo.collapse_warning)
+        ppo.update_quality_curriculum(0.5, 0.6, 0.6, 256)
+        ppo.update_quality_curriculum(0.5, 0.6, 0.6, 256)
+        self.assertEqual(ppo.quality_level, 0.0)
+        self.assertTrue(ppo.collapse_warning)
+
+    def test_reference_kl_has_actor_gradients_and_reference_is_frozen(self):
+        actor_critic = ActorCritic(
+            num_actor_obs=2,
+            num_critic_obs=2,
+            num_actions=1,
+            actor_hidden_dims=[4],
+            critic_hidden_dims=[4],
+            init_noise_std=0.5,
+        )
+        ppo = PPO(actor_critic, reference_kl_initial_coef=1.0)
+        ppo.snapshot_reference_policy()
+        with torch.no_grad():
+            ppo.actor_critic.actor[0].weight.add_(0.1)
+
+        obs = torch.tensor([[0.2, -0.1], [0.4, 0.3]])
+        ppo.actor_critic.act(obs)
+        actions = ppo.actor_critic.action_mean.detach().clone()
+        old_log_prob = ppo.actor_critic.get_actions_log_prob(actions).detach()
+        minibatch = SimpleNamespace(
+            obs=obs,
+            critic_obs=obs,
+            actions=actions,
+            values=torch.zeros(2, 1),
+            advantages=torch.ones(2, 1),
+            returns=torch.zeros(2, 1),
+            old_actions_log_prob=old_log_prob,
+            old_mu=actions,
+            old_sigma=torch.full_like(actions, 0.5),
+            hidden_states=SimpleNamespace(actor=None, critic=None),
+            masks=None,
+        )
+        ppo._critic_warmup_active = False
+        losses, _, _ = ppo.compute_losses(minibatch)
+        self.assertGreater(losses["reference_kl"].item(), 0.0)
+        losses["reference_kl"].backward()
+        actor_gradients = [
+            parameter.grad
+            for name, parameter in ppo.actor_critic.named_parameters()
+            if name.startswith("actor.")
+        ]
+        self.assertTrue(any(gradient is not None for gradient in actor_gradients))
+        self.assertTrue(
+            all(
+                parameter.grad is None
+                for parameter in ppo.reference_actor_critic.parameters()
+            )
+        )
+
+    def test_reference_and_quality_state_survive_checkpoint_restore(self):
+        source = self.make_ppo()
+        source.snapshot_reference_policy()
+        source.set_quality_level(0.35)
+        source.quality_up_windows = 1
+        source.collapse_windows = 1
+        checkpoint = source.state_dict()
+
+        restored = self.make_ppo()
+        restored.load_state_dict(checkpoint)
+        self.assertAlmostEqual(restored.quality_level, 0.35)
+        self.assertEqual(restored.quality_up_windows, 1)
+        self.assertEqual(restored.collapse_windows, 1)
+        for name, value in source._reference_actor_state_dict().items():
+            self.assertTrue(
+                torch.equal(
+                    value,
+                    restored._reference_actor_state_dict()[name],
+                ),
+                name,
+            )
+
+    def test_runner_saves_unique_warmup_boundary_checkpoint(self):
+        runner = OnPolicyRunner.__new__(OnPolicyRunner)
+        runner.alg = self.make_ppo()
+        runner.alg.start_critic_warmup(11700)
+        runner.alg.snapshot_reference_policy()
+        runner.current_learning_iteration = 11800
+        with tempfile.TemporaryDirectory() as temp_dir:
+            runner.log_dir = temp_dir
+            runner._save_warmup_boundary_checkpoint()
+            checkpoint_path = (
+                Path(temp_dir) / "model_11800_warmup.pt"
+            )
+            self.assertTrue(checkpoint_path.is_file())
+            self.assertTrue((Path(temp_dir) / "model_11800.pt").is_file())
+            checkpoint = torch.load(checkpoint_path, map_location="cpu")
+            self.assertEqual(checkpoint["iter"], 11800)
 
     def test_runner_starts_warmup_only_for_explicit_critic_reset(self):
         source = self.make_ppo().state_dict()

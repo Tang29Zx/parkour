@@ -80,6 +80,94 @@ class OnPolicyRunner:
         self.log_interval = self.cfg.get("log_interval", 1)
 
         _, _ = self.env.reset()
+        self._apply_quality_level_to_env()
+
+    def _apply_quality_level_to_env(self):
+        if hasattr(self, "env") and hasattr(self.env, "set_quality_level"):
+            self.env.set_quality_level(self.alg.quality_level)
+
+    @staticmethod
+    def _scalar(value):
+        if isinstance(value, torch.Tensor):
+            return float(value.detach().float().mean().item())
+        return float(value)
+
+    def _get_quality_window(self, ep_infos):
+        total_episodes = 0.0
+        weighted_success = 0.0
+        weighted_box_pass = 0.0
+        weighted_fall = 0.0
+        for info in ep_infos:
+            required = (
+                "num_terminated",
+                "success_rate",
+                "box_5_pass_rate",
+                "fall_rate",
+            )
+            if not all(key in info for key in required):
+                continue
+            episode_count = self._scalar(info["num_terminated"])
+            if episode_count <= 0.0:
+                continue
+            total_episodes += episode_count
+            weighted_success += (
+                self._scalar(info["success_rate"]) * episode_count
+            )
+            weighted_box_pass += (
+                self._scalar(info["box_5_pass_rate"]) * episode_count
+            )
+            weighted_fall += self._scalar(info["fall_rate"]) * episode_count
+        if total_episodes <= 0.0:
+            return None
+        return dict(
+            episode_count=total_episodes,
+            success_rate=weighted_success / total_episodes,
+            box_pass_rate=weighted_box_pass / total_episodes,
+            fall_rate=weighted_fall / total_episodes,
+        )
+
+    def _update_quality_curriculum(self, ep_infos, stats):
+        window = self._get_quality_window(ep_infos)
+        if window is not None:
+            self.alg.update_quality_curriculum(**window)
+            self._apply_quality_level_to_env()
+        stats["quality_level"] = torch.tensor(
+            self.alg.quality_level, device=self.device
+        )
+        stats["reference_kl_coef"] = torch.tensor(
+            self.alg.reference_kl_coef, device=self.device
+        )
+        stats["collapse_warning"] = torch.tensor(
+            float(self.alg.collapse_warning), device=self.device
+        )
+        if self.alg.collapse_warning:
+            print(
+                "\033[1;31m"
+                "WARNING: protected Actor metrics indicate policy collapse. "
+                "Training continues with reduced quality difficulty and a "
+                "stronger reference-policy constraint."
+                "\033[0m"
+            )
+
+    def _save_warmup_boundary_checkpoint(self):
+        warmup_until = self.alg.critic_warmup_until_iteration
+        if (
+            self.log_dir is None
+            or warmup_until is None
+            or self.current_learning_iteration != warmup_until
+            or self.alg.actor_finetune_active
+        ):
+            return
+        paths = (
+            os.path.join(self.log_dir, f"model_{warmup_until}.pt"),
+            os.path.join(
+                self.log_dir,
+                f"model_{warmup_until}_warmup.pt",
+            ),
+        )
+        for path in paths:
+            if not os.path.exists(path):
+                self.save(path)
     
     def learn(self, num_learning_iterations, init_at_random_ep_len=False):
         # initialize writer
@@ -136,11 +224,22 @@ class OnPolicyRunner:
             stop = time.time()
             learn_time = stop - start
             if self.log_dir is not None and self.current_learning_iteration % self.log_interval == 0:
+                self._update_quality_curriculum(ep_infos, stats)
                 self.log(locals())
-            if self.current_learning_iteration % self.save_interval == 0 and self.current_learning_iteration > start_iter:
+            is_warmup_boundary = (
+                self.alg.critic_warmup_until_iteration is not None
+                and self.current_learning_iteration
+                == self.alg.critic_warmup_until_iteration
+            )
+            if (
+                self.current_learning_iteration % self.save_interval == 0
+                and self.current_learning_iteration > start_iter
+                and not is_warmup_boundary
+            ):
                 self.save(os.path.join(self.log_dir, 'model_{}.pt'.format(self.current_learning_iteration)))
             ep_infos.clear()
             self.current_learning_iteration = self.current_learning_iteration + 1
+            self._save_warmup_boundary_checkpoint()
             start = time.time()
         
         self.save(os.path.join(self.log_dir, 'model_{}.pt'.format(self.current_learning_iteration)))
@@ -271,6 +370,9 @@ class OnPolicyRunner:
         self.current_learning_iteration = loaded_dict['iter']
         if manipulator_name == "reset_critic_and_optimizer":
             self.alg.start_critic_warmup(self.current_learning_iteration)
+            self.alg.set_quality_level(0.0)
+            self.alg.snapshot_reference_policy()
+        self._apply_quality_level_to_env()
         if manipulator_name:
             try:
                 self.save(os.path.join(self.log_dir, 'model_{}.pt'.format(self.current_learning_iteration)))

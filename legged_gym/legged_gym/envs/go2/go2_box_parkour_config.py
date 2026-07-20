@@ -75,12 +75,13 @@ class Go2BoxParkourCfg(DebugGo2BoxCfg):
             box_first_foot_contact = 5.0
             box_second_foot_contact = 10.0
             box_passed = 25.0
-            success = 100.0
-            termination = -200.0
+            success = 500.0
+            termination = -1000.0
             episode_timeout = -150.0
 
         only_positive_rewards = False
         forward_speed_tracking_sigma = 0.02
+        quality_initial_level = 0.0
         # Track the command closely on flat ground. Near a box, allow a brief
         # positive speed error for jumping or climbing without rewarding it.
         box_approach_distance = 0.5
@@ -121,10 +122,26 @@ class Go2BoxParkourCfgPPO(Go2RoughCfgPPO):
         gamma = 0.999
         lam = 0.95
         critic_warmup_iterations = 100
+        actor_finetune_learning_rate = 1e-5
+        actor_finetune_clip_param = 0.1
+        actor_finetune_entropy_coef = 0.001
+        reference_kl_initial_coef = 1.0
+        quality_min_episodes = 256
+        quality_required_windows = 2
+        quality_increase = 0.05
+        quality_decrease = 0.10
+        quality_success_up = 0.80
+        quality_box_pass_up = 0.90
+        quality_fall_up = 0.20
+        quality_success_down = 0.60
+        quality_box_pass_down = 0.70
+        quality_fall_down = 0.35
+        collapse_success_threshold = 0.60
+        collapse_fall_threshold = 0.50
 
     class runner(Go2RoughCfgPPO.runner):
         experiment_name = "go2_box_parkour"
-        run_name = "five_box_v9_pre_curriculum_from11700"
+        run_name = "five_box_v10_critic_warmup_from11700"
         resume = True
         load_run = osp.join(
             osp.dirname(osp.dirname(osp.dirname(osp.dirname(__file__)))),
@@ -136,7 +153,7 @@ class Go2BoxParkourCfgPPO(Go2RoughCfgPPO):
         # Initial Critic migration is selected explicitly from the CLI. Keeping
         # this disabled prevents later v9 resumes from resetting Critic again.
         ckpt_manipulator = None
-        max_iterations = 2000
+        max_iterations = 100
         save_interval = 100
         log_interval = 10
 

@@ -418,8 +418,8 @@ class BoxRewardTest(unittest.TestCase):
         self.assertAlmostEqual(scales.box_first_foot_contact * dt, 0.1)
         self.assertAlmostEqual(scales.box_second_foot_contact * dt, 0.2)
         self.assertAlmostEqual(scales.box_passed * dt, 0.5)
-        self.assertAlmostEqual(scales.success * dt, 2.0)
-        self.assertAlmostEqual(scales.termination * dt, -4.0)
+        self.assertAlmostEqual(scales.success * dt, 10.0)
+        self.assertAlmostEqual(scales.termination * dt, -20.0)
         self.assertAlmostEqual(scales.episode_timeout * dt, -3.0)
         self.assertEqual(
             self.env_cfg.rewards.forward_speed_tracking_sigma, 0.02
@@ -468,7 +468,7 @@ class BoxRewardTest(unittest.TestCase):
         actual = multiplier * self.env_cfg.rewards.scales.termination * 0.02
 
         torch.testing.assert_close(
-            actual, torch.tensor([-8.0, -4.0, 0.0])
+            actual, torch.tensor([-40.0, -20.0, 0.0])
         )
         self.assertLess(actual[0].item(), actual[1].item())
         self.assertLess(
@@ -542,6 +542,29 @@ class BoxRewardTest(unittest.TestCase):
             torch.tensor([0.0, 0.0, 0.09, 0.09, 0.09, 0.09]),
         )
 
+    def test_quality_level_scales_only_staged_penalties(self):
+        env = self.make_speed_reward_env()
+        env.quality_level = 0.0
+        torch.testing.assert_close(
+            self.LeggedRobotBox._reward_speed_error_square(env),
+            torch.zeros(6),
+        )
+        torch.testing.assert_close(
+            self.LeggedRobotBox._reward_overspeed(env),
+            torch.zeros(6),
+        )
+
+        env.quality_level = 0.5
+        torch.testing.assert_close(
+            self.LeggedRobotBox._reward_speed_error_square(env),
+            torch.tensor([0.0, 0.0, 0.125, 0.125, 0.125, 0.125]),
+        )
+        tracking = self.LeggedRobotBox._reward_forward_speed_tracking(env)
+        env.quality_level = 1.0
+        torch.testing.assert_close(
+            self.LeggedRobotBox._reward_forward_speed_tracking(env), tracking
+        )
+
     def test_forward_speed_tracking_peaks_only_at_the_command(self):
         env = self.make_speed_reward_env()
         env.base_lin_vel[:, 0] = torch.tensor(
@@ -587,7 +610,7 @@ class BoxRewardTest(unittest.TestCase):
         dt = 0.02
         command = 0.5
         course_distance = 3.0
-        event_total = 0.1 + 0.2 + 0.5 + 2.0
+        event_total = 0.1 + 0.2 + 0.5 + 10.0
         target_steps = int(course_distance / command / dt)
         target_return = event_total + target_steps * dt * (
             scales.forward_speed_tracking
@@ -842,7 +865,7 @@ class BoxRewardTest(unittest.TestCase):
         self.assertEqual(runner.checkpoint, 11700)
         self.assertEqual(
             runner.run_name,
-            "five_box_v9_pre_curriculum_from11700",
+            "five_box_v10_critic_warmup_from11700",
         )
         self.assertIsNone(runner.ckpt_manipulator)
         self.assertTrue(
@@ -856,6 +879,11 @@ class BoxRewardTest(unittest.TestCase):
         self.assertEqual(algorithm.gamma, 0.999)
         self.assertEqual(algorithm.lam, 0.95)
         self.assertEqual(algorithm.critic_warmup_iterations, 100)
+        self.assertEqual(algorithm.actor_finetune_learning_rate, 1e-5)
+        self.assertEqual(algorithm.actor_finetune_clip_param, 0.1)
+        self.assertEqual(algorithm.actor_finetune_entropy_coef, 0.001)
+        self.assertEqual(algorithm.reference_kl_initial_coef, 1.0)
+        self.assertEqual(runner.max_iterations, 100)
         self.assertEqual(runner.save_interval, 100)
         self.assertEqual(runner.log_interval, 10)
 
