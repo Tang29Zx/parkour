@@ -48,6 +48,8 @@ class RolloutStorage:
             self.actions_log_prob = None
             self.action_mean = None
             self.action_sigma = None
+            self.reference_action_mean = None
+            self.reference_action_sigma = None
             self.hidden_states = None
         
         def clear(self):
@@ -63,6 +65,8 @@ class RolloutStorage:
         "old_actions_log_prob",
         "old_mu",
         "old_sigma",
+        "reference_mu",
+        "reference_sigma",
         "hidden_states",
         "masks",
     ])
@@ -92,6 +96,8 @@ class RolloutStorage:
         self.advantages = torch.zeros(num_transitions_per_env, num_envs, 1, device=self.device)
         self.mu = torch.zeros(num_transitions_per_env, num_envs, *actions_shape, device=self.device)
         self.sigma = torch.zeros(num_transitions_per_env, num_envs, *actions_shape, device=self.device)
+        self.reference_mu = torch.zeros_like(self.mu)
+        self.reference_sigma = torch.zeros_like(self.sigma)
 
         self.num_transitions_per_env = num_transitions_per_env
         self.num_envs = num_envs
@@ -113,6 +119,14 @@ class RolloutStorage:
         self.actions_log_prob[self.step].copy_(transition.actions_log_prob.view(-1, 1))
         self.mu[self.step].copy_(transition.action_mean)
         self.sigma[self.step].copy_(transition.action_sigma)
+        reference_mean = transition.reference_action_mean
+        reference_sigma = transition.reference_action_sigma
+        if reference_mean is None:
+            reference_mean = transition.action_mean
+        if reference_sigma is None:
+            reference_sigma = transition.action_sigma
+        self.reference_mu[self.step].copy_(reference_mean)
+        self.reference_sigma[self.step].copy_(reference_sigma)
         self._save_hidden_states(transition.hidden_states)
         self.step += 1
 
@@ -248,6 +262,8 @@ class RolloutStorage:
         advantage_batch = self.advantages[T_slice, B_slice]
         old_mu_batch = self.mu[T_slice, B_slice]
         old_sigma_batch = self.sigma[T_slice, B_slice]
+        reference_mu_batch = self.reference_mu[T_slice, B_slice]
+        reference_sigma_batch = self.reference_sigma[T_slice, B_slice]
 
         if padded_B_slice is None:
             # flatten the trajectory sample if not recurrent
@@ -261,12 +277,15 @@ class RolloutStorage:
             advantage_batch = advantage_batch.flatten(0, 1)
             old_mu_batch = old_mu_batch.flatten(0, 1)
             old_sigma_batch = old_sigma_batch.flatten(0, 1)
+            reference_mu_batch = reference_mu_batch.flatten(0, 1)
+            reference_sigma_batch = reference_sigma_batch.flatten(0, 1)
 
         return RolloutStorage.MiniBatch(
             obs_batch, critic_obs_batch,
             action_batch,
             target_value_batch, advantage_batch, return_batch,
             old_action_log_prob_batch, old_mu_batch, old_sigma_batch,
+            reference_mu_batch, reference_sigma_batch,
             hid_batch, obs_mask_batch,
         )
 
@@ -352,6 +371,14 @@ class QueueRolloutStorage(RolloutStorage):
             self.sigma,
             torch.zeros(expand_size, self.num_envs, *self.actions_shape, device=self.device),
         ], dim= 0).contiguous()
+        self.reference_mu = torch.cat([
+            self.reference_mu,
+            torch.zeros(expand_size, self.num_envs, *self.actions_shape, device=self.device),
+        ], dim= 0).contiguous()
+        self.reference_sigma = torch.cat([
+            self.reference_sigma,
+            torch.zeros(expand_size, self.num_envs, *self.actions_shape, device=self.device),
+        ], dim= 0).contiguous()
 
         # For hidden_states
         if not self.saved_hidden_states is None:
@@ -399,6 +426,8 @@ class QueueRolloutStorage(RolloutStorage):
         self.actions_log_prob = self.swap_from_cursor(self.actions_log_prob)
         self.mu = self.swap_from_cursor(self.mu)
         self.sigma = self.swap_from_cursor(self.sigma)
+        self.reference_mu = self.swap_from_cursor(self.reference_mu)
+        self.reference_sigma = self.swap_from_cursor(self.reference_sigma)
         if not self.saved_hidden_states is None:
             with torch.no_grad():
                 self.saved_hidden_states = buffer_swap(self.saved_hidden_states, self.step, contiguous= True)

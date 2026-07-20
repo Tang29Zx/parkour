@@ -219,7 +219,7 @@ class BoxProgressTrackerTest(unittest.TestCase):
             self.update()
         self.assertTrue(self.tracker.fall_buf.all())
 
-    def test_pure_natural_timeout_is_the_only_timeout_termination(self):
+    def test_task_deadline_is_incomplete_without_timeout_bootstrap(self):
         self.natural_timeout[0] = True
         self.update()
 
@@ -227,10 +227,36 @@ class BoxProgressTrackerTest(unittest.TestCase):
         time_out_buf = self.natural_timeout.clone()
         self.tracker.apply_termination(reset_buf, time_out_buf)
 
-        self.assertTrue(self.tracker.episode_timeout_buf[0])
-        self.assertTrue(time_out_buf[0])
+        self.assertTrue(self.tracker.incomplete_buf[0])
+        self.assertFalse(self.tracker.episode_timeout_buf[0])
+        self.assertFalse(time_out_buf[0])
         self.assertTrue(reset_buf[0])
         self.assertFalse(reset_buf[1])
+
+    def test_external_timeout_is_the_only_bootstrap_timeout(self):
+        external_timeout = self.torch.tensor([True, False])
+        self.tracker.update(
+            box_bounds=self.box_bounds,
+            env_origins=self.env_origins,
+            track_start_x=self.track_start_x,
+            track_end_x=self.track_end_x,
+            feet_positions=self.feet_positions,
+            feet_terrain_heights=self.terrain_heights,
+            feet_contact_forces=self.contact_forces,
+            base_positions=self.base_positions,
+            roll=self.roll,
+            pitch=self.pitch,
+            body_contact=self.body_contact,
+            natural_timeout=self.natural_timeout,
+            landing_end_x=self.landing_end_x,
+            external_timeout=external_timeout,
+        )
+        reset_buf = self.torch.zeros(2, dtype=self.torch.bool)
+        time_out_buf = self.torch.zeros(2, dtype=self.torch.bool)
+        self.tracker.apply_termination(reset_buf, time_out_buf)
+        self.assertTrue(time_out_buf[0])
+        self.assertTrue(reset_buf[0])
+        self.assertFalse(self.tracker.incomplete_buf[0])
 
     def test_failure_takes_precedence_over_landing_success(self):
         self.tracker.next_box_idx[0] = 5
@@ -266,7 +292,9 @@ class BoxProgressTrackerTest(unittest.TestCase):
         self.tracker.out_of_track_buf[:] = True
         self.tracker.landing_overrun_buf[:] = True
         self.tracker.fall_buf[:] = True
+        self.tracker.incomplete_buf[:] = True
         self.tracker.episode_timeout_buf[:] = True
+        self.tracker.task_progress_buf[:] = 1.0
         self.tracker.reset(self.torch.tensor([0, 1]))
 
         for value in (
@@ -284,7 +312,9 @@ class BoxProgressTrackerTest(unittest.TestCase):
             self.tracker.out_of_track_buf,
             self.tracker.landing_overrun_buf,
             self.tracker.fall_buf,
+            self.tracker.incomplete_buf,
             self.tracker.episode_timeout_buf,
+            self.tracker.task_progress_buf,
         ):
             self.assertFalse(value.any())
 
@@ -305,7 +335,17 @@ class BoxProgressTrackerTest(unittest.TestCase):
                 tuple(tracker.second_foot_contact_buf.shape), (4096,)
             )
             self.assertEqual(tuple(tracker.success_buf.shape), (4096,))
+            self.assertEqual(tuple(tracker.incomplete_buf.shape), (4096,))
             self.assertEqual(tuple(tracker.landing_overrun_buf.shape), (4096,))
+
+    def test_task_progress_depends_on_space_not_elapsed_time(self):
+        self.base_positions[:, 0] = self.torch.tensor([0.0, 1.0])
+        self.update()
+        first = self.tracker.task_progress_buf.clone()
+        for _ in range(20):
+            self.update()
+        self.assertTrue(self.torch.equal(first, self.tracker.task_progress_buf))
+        self.assertGreater(first[1].item(), first[0].item())
 
     def test_required_boxes_is_validated(self):
         with self.assertRaises(TypeError):

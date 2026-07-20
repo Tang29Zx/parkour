@@ -121,8 +121,28 @@ class Memory(torch.nn.Module):
         return out
 
     def reset(self, dones=None):
-        # When the RNN is an LSTM, self.hidden_states_a is a list with hidden_state and cell_state
         if self.hidden_states is None:
             return
-        for hidden_state in self.hidden_states:
-            hidden_state[..., dones, :] = 0.0
+        if dones is None:
+            self.hidden_states = None
+            return
+        # Use out-of-place masked tensors. Besides avoiding autograd view errors,
+        # this guarantees current and frozen-reference memories never alias.
+        keep = (~dones).to(dtype=torch.float).view(1, -1, 1)
+        if is_namedarraytuple(self.hidden_states):
+            self.hidden_states = type(self.hidden_states)(
+                *(
+                    state * keep.to(device=state.device, dtype=state.dtype)
+                    for state in self.hidden_states
+                )
+            )
+        elif isinstance(self.hidden_states, tuple):
+            self.hidden_states = tuple(
+                state * keep.to(device=state.device, dtype=state.dtype)
+                for state in self.hidden_states
+            )
+        else:
+            self.hidden_states = self.hidden_states * keep.to(
+                device=self.hidden_states.device,
+                dtype=self.hidden_states.dtype,
+            )

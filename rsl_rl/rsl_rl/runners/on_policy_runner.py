@@ -30,6 +30,7 @@
 
 import time
 import os
+import json
 from collections import deque
 import statistics
 
@@ -87,6 +88,115 @@ class OnPolicyRunner:
             self.env.set_quality_level(self.alg.quality_level)
 
     @staticmethod
+    def _config_child(value, key):
+        if isinstance(value, dict):
+            return value[key]
+        return getattr(value, key)
+
+    @classmethod
+    def _config_subset(cls, value, template):
+        if isinstance(template, dict):
+            return {
+                key: cls._config_subset(cls._config_child(value, key), child)
+                for key, child in template.items()
+            }
+        if isinstance(template, list):
+            return list(value)
+        return value
+
+    @classmethod
+    def _config_values_equal(cls, left, right):
+        if isinstance(left, dict) and isinstance(right, dict):
+            return left.keys() == right.keys() and all(
+                cls._config_values_equal(left[key], right[key])
+                for key in left
+            )
+        if isinstance(left, (list, tuple)) and isinstance(right, (list, tuple)):
+            return len(left) == len(right) and all(
+                cls._config_values_equal(a, b) for a, b in zip(left, right)
+            )
+        if isinstance(left, (int, float)) and isinstance(right, (int, float)):
+            return abs(float(left) - float(right)) <= 1e-8
+        return left == right
+
+    def _verify_actor_runtime_config(self, checkpoint_path):
+        """Reject runtime transforms that would change an identical Actor."""
+        config_path = os.path.join(
+            os.path.dirname(os.path.abspath(checkpoint_path)), "config.json"
+        )
+        if not os.path.isfile(config_path):
+            print(
+                "Warning: source config.json is missing; Actor runtime "
+                "compatibility could not be checked."
+            )
+            return False
+        with open(config_path, "r") as config_file:
+            source = json.load(config_file)
+        paths = (
+            ("env", "obs_components"),
+            ("terrain", "measured_points_x"),
+            ("terrain", "measured_points_y"),
+            ("normalization", "obs_scales"),
+            ("normalization", "height_measurements_offset"),
+            ("normalization", "clip_observations"),
+            ("normalization", "clip_actions"),
+            ("normalization", "clip_actions_method"),
+            ("control", "action_scale"),
+            ("control", "stiffness"),
+            ("control", "damping"),
+            ("init_state", "default_joint_angles"),
+        )
+        mismatches = []
+        for path in paths:
+            source_value = source
+            current_value = self.env.cfg
+            try:
+                for key in path:
+                    source_value = self._config_child(source_value, key)
+                    current_value = self._config_child(current_value, key)
+                current_value = self._config_subset(
+                    current_value, source_value
+                )
+            except (AttributeError, KeyError, TypeError) as error:
+                mismatches.append((".".join(path), f"missing: {error}"))
+                continue
+            if not self._config_values_equal(source_value, current_value):
+                mismatches.append(
+                    (".".join(path), "source and current values differ")
+                )
+        for key in (
+            "estimator_obs_components",
+            "estimator_target_components",
+            "replace_state_prob",
+            "use_actor_rnn",
+            "encoder_component_names",
+            "encoder_output_size",
+            "rnn_type",
+        ):
+            if key not in source.get("policy", {}):
+                continue
+            current_value = self.policy_cfg.get(key)
+            if not self._config_values_equal(
+                source["policy"][key], current_value
+            ):
+                mismatches.append(
+                    (f"policy.{key}", "source and current values differ")
+                )
+        if mismatches:
+            detail = "; ".join(
+                f"{name} ({reason})" for name, reason in mismatches
+            )
+            raise ValueError(
+                "Actor runtime configuration is incompatible with the "
+                f"checkpoint: {detail}."
+            )
+        print(
+            "Verified Actor runtime compatibility: observations, scaling, "
+            "history inputs, action scale, default pose, and PD gains match."
+        )
+        return True
+
+    @staticmethod
     def _scalar(value):
         if isinstance(value, torch.Tensor):
             return float(value.detach().float().mean().item())
@@ -139,6 +249,24 @@ class OnPolicyRunner:
         )
         stats["collapse_warning"] = torch.tensor(
             float(self.alg.collapse_warning), device=self.device
+        )
+        stats["actor_runtime_config_compatible"] = torch.tensor(
+            float(getattr(self, "actor_runtime_config_compatible", False)),
+            device=self.device,
+        )
+        action_scale = self.env.cfg.control.action_scale
+        if isinstance(action_scale, torch.Tensor):
+            max_action_scale = float(action_scale.abs().max().item())
+        elif isinstance(action_scale, (list, tuple)):
+            max_action_scale = max(abs(float(value)) for value in action_scale)
+        else:
+            max_action_scale = abs(float(action_scale))
+        stats["actor_scaled_output_max_diff"] = (
+            stats.get(
+                "actor_output_max_diff",
+                torch.zeros((), device=self.device),
+            )
+            * max_action_scale
         )
         if self.alg.collapse_warning:
             print(
@@ -202,11 +330,14 @@ class OnPolicyRunner:
                     
                     if self.log_dir is not None:
                         # Book keeping
-                        if 'episode' in infos:
+                        new_ids = (dones > 0).nonzero(as_tuple=False)
+                        # ``env.extras`` persists between resets in this
+                        # codebase. Only consume episode summaries on a step
+                        # that actually terminated at least one environment.
+                        if 'episode' in infos and new_ids.numel() > 0:
                             ep_infos.append(infos['episode'])
                         cur_reward_sum += rewards
                         cur_episode_length += 1
-                        new_ids = (dones > 0).nonzero(as_tuple=False)
                         rframebuffer.extend(rewards[dones < 1].cpu().numpy().tolist())
                         rewbuffer.extend(cur_reward_sum[new_ids][:, 0].cpu().numpy().tolist())
                         lenbuffer.extend(cur_episode_length[new_ids][:, 0].cpu().numpy().tolist())
@@ -226,6 +357,7 @@ class OnPolicyRunner:
             if self.log_dir is not None and self.current_learning_iteration % self.log_interval == 0:
                 self._update_quality_curriculum(ep_infos, stats)
                 self.log(locals())
+                ep_infos.clear()
             is_warmup_boundary = (
                 self.alg.critic_warmup_until_iteration is not None
                 and self.current_learning_iteration
@@ -237,7 +369,6 @@ class OnPolicyRunner:
                 and not is_warmup_boundary
             ):
                 self.save(os.path.join(self.log_dir, 'model_{}.pt'.format(self.current_learning_iteration)))
-            ep_infos.clear()
             self.current_learning_iteration = self.current_learning_iteration + 1
             self._save_warmup_boundary_checkpoint()
             start = time.time()
@@ -276,15 +407,29 @@ class OnPolicyRunner:
                     value = torch.min(infotensor) if len(infotensor) > 0 else torch.tensor(float("nan"))
                 else:
                     value = torch.nanmean(infotensor)
-                self.writer.add_scalar('Episode/' + key, value, self.current_learning_iteration)
+                if key.startswith("raw/"):
+                    tensorboard_key = "EpisodeRaw/" + key[len("raw/"):]
+                else:
+                    tensorboard_key = "Episode/" + key
+                self.writer.add_scalar(tensorboard_key, value, self.current_learning_iteration)
                 ep_string += f"""{f'Mean episode {key}:':>{pad}} {value:.4f}\n"""
         mean_std = self.alg.actor_critic.action_std.mean()
         fps = int(self.num_steps_per_env * self.env.num_envs / (locs['collection_time'] + locs['learn_time']))
 
         for k, v in locs["losses"].items():
             self.writer.add_scalar("Loss/" + k, v.item(), self.current_learning_iteration)
+        loss_stat_names = {
+            "reference_kl",
+            "reference_kl_max",
+            "reference_kl_p95",
+            "reference_to_surrogate_ratio",
+            "explained_variance",
+        }
         for k, v in locs["stats"].items():
-            self.writer.add_scalar("Train/" + k, v.item(), self.current_learning_iteration)
+            namespace = "Loss/" if k in loss_stat_names else "Train/"
+            self.writer.add_scalar(
+                namespace + k, v.item(), self.current_learning_iteration
+            )
         
         self.writer.add_scalar('Loss/learning_rate', self.alg.learning_rate, self.current_learning_iteration)
         self.writer.add_scalar('Policy/mean_noise_std', mean_std.item(), self.current_learning_iteration)
@@ -356,6 +501,9 @@ class OnPolicyRunner:
         torch.save(run_state_dict, path)
 
     def load(self, path, load_optimizer=True):
+        self.actor_runtime_config_compatible = (
+            self._verify_actor_runtime_config(path)
+        )
         loaded_dict = torch.load(path, map_location=self.device)
         manipulator_name = self.cfg.get("ckpt_manipulator", False)
         if manipulator_name:

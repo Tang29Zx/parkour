@@ -21,6 +21,7 @@ if (
 
 from rsl_rl.algorithms.ppo import PPO
 from rsl_rl.modules.actor_critic import ActorCritic
+from rsl_rl.modules.actor_critic_recurrent import ActorCriticRecurrent
 from rsl_rl.runners.on_policy_runner import OnPolicyRunner
 
 
@@ -203,13 +204,16 @@ class CriticWarmupTest(unittest.TestCase):
             old_actions_log_prob=old_log_prob,
             old_mu=actions,
             old_sigma=torch.full_like(actions, 0.5),
+            reference_mu=ppo.reference_actor_critic.act_inference(obs).detach(),
+            reference_sigma=torch.full_like(actions, 0.5),
             hidden_states=SimpleNamespace(actor=None, critic=None),
             masks=None,
         )
         ppo._critic_warmup_active = False
-        losses, _, _ = ppo.compute_losses(minibatch)
-        self.assertGreater(losses["reference_kl"].item(), 0.0)
-        losses["reference_kl"].backward()
+        losses, _, stats = ppo.compute_losses(minibatch)
+        self.assertGreater(stats["reference_kl"].item(), 0.0)
+        self.assertGreater(losses["reference_kl_loss"].item(), 0.0)
+        losses["reference_kl_loss"].backward()
         actor_gradients = [
             parameter.grad
             for name, parameter in ppo.actor_critic.named_parameters()
@@ -221,6 +225,95 @@ class CriticWarmupTest(unittest.TestCase):
                 parameter.grad is None
                 for parameter in ppo.reference_actor_critic.parameters()
             )
+        )
+
+    def test_reference_kl_retains_a_nonzero_minimum(self):
+        ppo = PPO(
+            ActorCritic(2, 2, 1, actor_hidden_dims=[4], critic_hidden_dims=[4]),
+            reference_kl_min_coef=0.05,
+            reference_kl_max_coef=1.0,
+        )
+        ppo.set_quality_level(0.0)
+        self.assertAlmostEqual(ppo.reference_kl_coef, 1.0)
+        ppo.set_quality_level(1.0)
+        self.assertAlmostEqual(ppo.reference_kl_coef, 0.05)
+
+    def test_reference_recurrent_state_is_independent_and_resets_with_done(self):
+        actor_critic = ActorCriticRecurrent(
+            num_actor_obs=2,
+            num_critic_obs=2,
+            num_actions=1,
+            actor_hidden_dims=[4],
+            critic_hidden_dims=[4],
+            rnn_type="gru",
+            rnn_hidden_size=4,
+        )
+        ppo = PPO(actor_critic, reference_kl_max_coef=1.0)
+        ppo.snapshot_reference_policy()
+        ppo.init_storage(2, 1, [2], [2], [1])
+        obs = torch.tensor([[0.2, -0.1], [0.4, 0.3]])
+        ppo.act(obs, obs)
+
+        current_hidden = ppo.actor_critic.memory_a.hidden_states
+        reference_hidden = ppo.reference_actor_critic.memory_a.hidden_states
+        self.assertIsNot(current_hidden, reference_hidden)
+        self.assertNotEqual(
+            current_hidden.data_ptr(), reference_hidden.data_ptr()
+        )
+        torch.testing.assert_close(current_hidden, reference_hidden)
+
+        dones = torch.tensor([True, False])
+        ppo.process_env_step(
+            torch.zeros(2), dones, {}, obs, obs
+        )
+        self.assertTrue(
+            (ppo.actor_critic.memory_a.hidden_states[:, 0] == 0.0).all()
+        )
+        self.assertTrue(
+            (
+                ppo.reference_actor_critic.memory_a.hidden_states[:, 0]
+                == 0.0
+            ).all()
+        )
+        ppo.actor_critic.reset()
+        ppo.reference_actor_critic.reset()
+        self.assertIsNone(ppo.actor_critic.memory_a.hidden_states)
+        self.assertIsNone(
+            ppo.reference_actor_critic.memory_a.hidden_states
+        )
+
+    def test_incomplete_does_not_bootstrap_but_external_timeout_does(self):
+        actor_critic = ActorCritic(
+            num_actor_obs=2,
+            num_critic_obs=2,
+            num_actions=1,
+            actor_hidden_dims=[4],
+            critic_hidden_dims=[4],
+        )
+        ppo = PPO(actor_critic, gamma=0.9)
+        ppo.init_storage(2, 1, [2], [2], [1])
+        observations = torch.zeros(2, 2)
+        ppo.act(observations, observations)
+        predicted_values = ppo.transition.values.squeeze(1).clone()
+        rewards = torch.tensor([1.0, 1.0])
+        dones = torch.tensor([True, True])
+
+        ppo.process_env_step(
+            rewards,
+            dones,
+            {
+                "episode_incompletes": torch.tensor([True, False]),
+                "time_outs": torch.tensor([False, True]),
+            },
+            observations,
+            observations,
+        )
+
+        self.assertEqual(ppo.storage.rewards[0, 0].item(), 1.0)
+        self.assertAlmostEqual(
+            ppo.storage.rewards[0, 1].item(),
+            (1.0 + 0.9 * predicted_values[1]).item(),
+            places=6,
         )
 
     def test_reference_and_quality_state_survive_checkpoint_restore(self):

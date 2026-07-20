@@ -59,7 +59,9 @@ class PPO:
                  actor_finetune_learning_rate=None,
                  actor_finetune_clip_param=None,
                  actor_finetune_entropy_coef=None,
-                 reference_kl_initial_coef=0.0,
+                 reference_kl_initial_coef=None,
+                 reference_kl_min_coef=0.0,
+                 reference_kl_max_coef=0.0,
                  quality_min_episodes=256,
                  quality_required_windows=2,
                  quality_increase=0.05,
@@ -86,7 +88,10 @@ class PPO:
         self.actor_critic = actor_critic
         self.actor_critic.to(self.device)
         self.storage = None # initialized later
-        self.optimizer = getattr(optim, optimizer_class_name)(self.actor_critic.parameters(), lr=learning_rate)
+        self.optimizer_class = getattr(optim, optimizer_class_name)
+        self.optimizer = self.optimizer_class(
+            self.actor_critic.parameters(), lr=learning_rate
+        )
 
         # PPO parameters
         self.clip_param = clip_param
@@ -119,9 +124,18 @@ class PPO:
             else actor_finetune_entropy_coef
         )
         self.actor_finetune_active = False
-        self.reference_kl_initial_coef = float(reference_kl_initial_coef)
-        if self.reference_kl_initial_coef < 0.0:
-            raise ValueError("reference_kl_initial_coef must be non-negative.")
+        if reference_kl_initial_coef is not None:
+            # Backward-compatible interpretation for older task configs.
+            reference_kl_max_coef = float(reference_kl_initial_coef)
+        self.reference_kl_min_coef = float(reference_kl_min_coef)
+        self.reference_kl_max_coef = float(reference_kl_max_coef)
+        if (
+            self.reference_kl_min_coef < 0.0
+            or self.reference_kl_max_coef < self.reference_kl_min_coef
+        ):
+            raise ValueError(
+                "Reference KL coefficients must satisfy 0 <= min <= max."
+            )
         self.reference_actor_critic = None
         self.quality_level = 0.0
         self.quality_up_windows = 0
@@ -148,6 +162,22 @@ class PPO:
         # algorithm status
         self.current_learning_iteration = 0
 
+    def _rebuild_optimizer(self, actor_enabled, learning_rate):
+        """Build an optimizer containing exactly the parameters for this phase."""
+        if actor_enabled:
+            parameters = list(self.actor_critic.parameters())
+        else:
+            parameters = [
+                parameter
+                for name, parameter in self.actor_critic.named_parameters()
+                if not self._is_actor_side_parameter(name)
+            ]
+        if not parameters:
+            raise RuntimeError("No trainable parameters selected for PPO phase.")
+        self.optimizer = self.optimizer_class(
+            parameters, lr=float(learning_rate)
+        )
+
     def start_critic_warmup(self, start_iteration):
         """Train only the Critic for a fixed number of loaded iterations."""
         if self.critic_warmup_iterations == 0:
@@ -155,6 +185,12 @@ class PPO:
             return
         self.critic_warmup_until_iteration = (
             int(start_iteration) + self.critic_warmup_iterations
+        )
+        self.actor_finetune_active = False
+        self.learning_rate = self.warmup_learning_rate
+        self._rebuild_optimizer(
+            actor_enabled=False,
+            learning_rate=self.learning_rate,
         )
 
     @staticmethod
@@ -167,6 +203,10 @@ class PPO:
         self.reference_actor_critic = copy.deepcopy(self.actor_critic).to(
             self.device
         )
+        for memory_name in ("memory_a", "memory_s", "memory_c"):
+            memory = getattr(self.reference_actor_critic, memory_name, None)
+            if memory is not None and hasattr(memory, "hidden_states"):
+                memory.hidden_states = None
         self.reference_actor_critic.eval()
         for parameter in self.reference_actor_critic.parameters():
             parameter.requires_grad_(False)
@@ -211,13 +251,19 @@ class PPO:
                 dtype=target_state[name].dtype,
             )
         self.reference_actor_critic.load_state_dict(target_state)
+        for memory_name in ("memory_a", "memory_s", "memory_c"):
+            memory = getattr(self.reference_actor_critic, memory_name, None)
+            if memory is not None and hasattr(memory, "hidden_states"):
+                memory.hidden_states = None
         self.reference_actor_critic.eval()
         for parameter in self.reference_actor_critic.parameters():
             parameter.requires_grad_(False)
 
     @property
     def reference_kl_coef(self):
-        return self.reference_kl_initial_coef * (1.0 - self.quality_level)
+        return self.reference_kl_min_coef + (1.0 - self.quality_level) * (
+            self.reference_kl_max_coef - self.reference_kl_min_coef
+        )
 
     def set_quality_level(self, level):
         """Clamp and store the global action-quality curriculum level."""
@@ -231,8 +277,10 @@ class PPO:
         self.learning_rate = self.actor_finetune_learning_rate
         self.clip_param = self.actor_finetune_clip_param
         self.entropy_coef = self.actor_finetune_entropy_coef
-        for param_group in self.optimizer.param_groups:
-            param_group["lr"] = self.learning_rate
+        self._rebuild_optimizer(
+            actor_enabled=True,
+            learning_rate=self.learning_rate,
+        )
 
     def update_quality_curriculum(
         self, success_rate, box_pass_rate, fall_rate, episode_count
@@ -301,6 +349,22 @@ class PPO:
         self.transition.actions_log_prob = self.actor_critic.get_actions_log_prob(self.transition.actions).detach()
         self.transition.action_mean = self.actor_critic.action_mean.detach()
         self.transition.action_sigma = self.actor_critic.action_std.detach()
+        if self.reference_actor_critic is not None:
+            with torch.no_grad():
+                self.reference_actor_critic.act(obs)
+                self.transition.reference_action_mean = (
+                    self.reference_actor_critic.action_mean.detach()
+                )
+                self.transition.reference_action_sigma = (
+                    self.reference_actor_critic.action_std.detach()
+                )
+        else:
+            self.transition.reference_action_mean = (
+                self.transition.action_mean
+            )
+            self.transition.reference_action_sigma = (
+                self.transition.action_sigma
+            )
         # need to record obs and critic_obs before env.step()
         self.transition.observations = obs
         self.transition.critic_observations = critic_obs
@@ -317,6 +381,8 @@ class PPO:
         self.storage.add_transitions(self.transition)
         self.transition.clear()
         self.actor_critic.reset(dones)
+        if self.reference_actor_critic is not None:
+            self.reference_actor_critic.reset(dones)
     
     def compute_returns(self, last_critic_obs):
         last_values= self.actor_critic.evaluate(last_critic_obs).detach()
@@ -341,6 +407,11 @@ class PPO:
         self._critic_warmup_active = critic_warmup_active
         mean_losses = defaultdict(lambda :0.)
         average_stats = defaultdict(lambda :0.)
+        maximum_stat_names = {
+            "reference_kl_max",
+            "actor_output_max_diff",
+            "actor_std_max_diff",
+        }
         if self.actor_critic.is_recurrent:
             generator = self.storage.reccurent_mini_batch_generator(self.num_mini_batches, self.num_learning_epochs)
         else:
@@ -356,19 +427,35 @@ class PPO:
                     mean_losses[k] = mean_losses[k] + v.detach()
                 mean_losses["total_loss"] = mean_losses["total_loss"] + loss.detach()
                 for k, v in stats.items():
-                    average_stats[k] = average_stats[k] + v.detach()
+                    if k in maximum_stat_names:
+                        average_stats[k] = torch.maximum(
+                            torch.as_tensor(
+                                average_stats[k], device=v.device
+                            ),
+                            v.detach(),
+                        )
+                    else:
+                        average_stats[k] = average_stats[k] + v.detach()
 
                 # Gradient step
                 self.optimizer.zero_grad()
                 loss.backward()
-                nn.utils.clip_grad_norm_(self.actor_critic.parameters(), self.max_grad_norm)
+                optimized_parameters = [
+                    parameter
+                    for group in self.optimizer.param_groups
+                    for parameter in group["params"]
+                ]
+                nn.utils.clip_grad_norm_(
+                    optimized_parameters, self.max_grad_norm
+                )
                 self.optimizer.step()
 
         num_updates = self.num_learning_epochs * self.num_mini_batches
         for k in mean_losses.keys():
             mean_losses[k] = mean_losses[k] / num_updates
         for k in average_stats.keys():
-            average_stats[k] = average_stats[k] / num_updates
+            if k not in maximum_stat_names:
+                average_stats[k] = average_stats[k] / num_updates
         warmup_remaining = 0
         if self.critic_warmup_until_iteration is not None:
             warmup_remaining = max(
@@ -391,8 +478,32 @@ class PPO:
         average_stats["collapse_warning"] = torch.tensor(
             float(self.collapse_warning), device=self.device
         )
+        average_stats["actor_parameter_max_diff"] = torch.tensor(
+            self.actor_parameter_max_diff(), device=self.device
+        )
+        if critic_warmup_active:
+            if (
+                average_stats["actor_parameter_max_diff"].item() > 0.0
+                or average_stats.get(
+                    "actor_output_max_diff",
+                    torch.zeros((), device=self.device),
+                ).item()
+                > 1e-5
+                or average_stats.get(
+                    "actor_std_max_diff",
+                    torch.zeros((), device=self.device),
+                ).item()
+                > 1e-7
+            ):
+                raise RuntimeError(
+                    "Actor changed during Critic-only warmup. Refusing to "
+                    "continue from a non-equivalent warmup checkpoint."
+                )
         self.storage.clear()
-        if hasattr(self.actor_critic, "clip_std"):
+        if (
+            not critic_warmup_active
+            and hasattr(self.actor_critic, "clip_std")
+        ):
             self.actor_critic.clip_std(min= self.clip_min_std)
 
         return mean_losses, average_stats
@@ -444,27 +555,35 @@ class PPO:
         return_ = dict(
             surrogate_loss= surrogate_loss,
             value_loss= value_loss,
+            reference_kl_loss=value_batch.sum() * 0.0,
         )
         if entropy_batch is not None:
             return_["entropy"] = - entropy_batch.mean()
+
+        return_variance = torch.var(minibatch.returns, unbiased=False)
+        explained_variance = torch.where(
+            return_variance > 1e-8,
+            1.0
+            - torch.var(
+                minibatch.returns - value_batch,
+                unbiased=False,
+            )
+            / return_variance,
+            torch.zeros_like(return_variance),
+        )
+        stats = {"explained_variance": explained_variance}
 
         if (
             not getattr(self, "_critic_warmup_active", False)
             and self.reference_kl_coef > 0.0
         ):
-            with torch.no_grad():
-                self.reference_actor_critic.act(
-                    minibatch.obs,
-                    masks=minibatch.masks,
-                    hidden_states=minibatch.hidden_states.actor,
-                )
-                reference_mu = self.reference_actor_critic.action_mean.detach()
-                reference_sigma = (
-                    self.reference_actor_critic.action_std.detach()
-                )
+            reference_mu = minibatch.reference_mu.detach()
+            reference_sigma = minibatch.reference_sigma.detach()
             current_sigma = sigma_batch.clamp_min(1e-6)
             reference_sigma = reference_sigma.clamp_min(1e-6)
-            reference_kl = torch.sum(
+            # KL(current || frozen reference): sum over action dimensions,
+            # then average over all valid rollout samples below.
+            reference_kl_per_sample = torch.sum(
                 torch.log(reference_sigma / current_sigma)
                 + (
                     torch.square(current_sigma)
@@ -473,8 +592,49 @@ class PPO:
                 / (2.0 * torch.square(reference_sigma))
                 - 0.5,
                 dim=-1,
-            ).mean()
-            return_["reference_kl"] = reference_kl
+            )
+            reference_kl = reference_kl_per_sample.mean()
+            reference_kl_loss = self.reference_kl_coef * reference_kl
+            return_["reference_kl_loss"] = reference_kl_loss
+            stats["reference_kl"] = reference_kl.detach()
+            stats["reference_kl_max"] = (
+                reference_kl_per_sample.detach().max()
+            )
+            stats["reference_kl_p95"] = torch.quantile(
+                reference_kl_per_sample.detach().float(), 0.95
+            )
+            stats["reference_to_surrogate_ratio"] = (
+                reference_kl_loss.detach().abs()
+                / surrogate_loss.detach().abs().clamp_min(1e-8)
+            )
+            stats["actor_output_max_diff"] = torch.max(
+                torch.abs(mu_batch.detach() - reference_mu)
+            )
+            stats["actor_std_max_diff"] = torch.max(
+                torch.abs(sigma_batch.detach() - reference_sigma)
+            )
+        else:
+            zero = torch.zeros((), device=value_batch.device)
+            stats["reference_kl"] = zero
+            stats["reference_kl_max"] = zero
+            stats["reference_kl_p95"] = zero
+            stats["reference_to_surrogate_ratio"] = zero
+            if self.reference_actor_critic is not None:
+                stats["actor_output_max_diff"] = torch.max(
+                    torch.abs(
+                        mu_batch.detach()
+                        - minibatch.reference_mu.detach()
+                    )
+                )
+                stats["actor_std_max_diff"] = torch.max(
+                    torch.abs(
+                        sigma_batch.detach()
+                        - minibatch.reference_sigma.detach()
+                    )
+                )
+            else:
+                stats["actor_output_max_diff"] = zero
+                stats["actor_std_max_diff"] = zero
         
         inter_vars = dict(
             ratio= ratio,
@@ -485,7 +645,22 @@ class PPO:
             inter_vars["kl"] = kl
         if self.use_clipped_value_loss:
             inter_vars["value_clipped"] = value_clipped
-        return return_, inter_vars, dict()
+        return return_, inter_vars, stats
+
+    def actor_parameter_max_diff(self):
+        """Return the maximum Actor-side difference from the frozen source."""
+        if self.reference_actor_critic is None:
+            return 0.0
+        reference_state = self.reference_actor_critic.state_dict()
+        maximum = 0.0
+        for name, value in self.actor_critic.state_dict().items():
+            if not self._is_actor_side_parameter(name):
+                continue
+            difference = torch.max(
+                torch.abs(value.detach() - reference_state[name].detach())
+            ).item()
+            maximum = max(maximum, difference)
+        return maximum
 
     def state_dict(self):
         state_dict = {
@@ -505,6 +680,8 @@ class PPO:
                 "learning_rate": self.learning_rate,
                 "clip_param": self.clip_param,
                 "entropy_coef": self.entropy_coef,
+                "reference_kl_min_coef": self.reference_kl_min_coef,
+                "reference_kl_max_coef": self.reference_kl_max_coef,
             },
         }
         if hasattr(self, "lr_scheduler"):
@@ -514,12 +691,6 @@ class PPO:
     
     def load_state_dict(self, state_dict):
         self.actor_critic.load_state_dict(state_dict["model_state_dict"])
-        if "optimizer_state_dict" in state_dict:
-            self.optimizer.load_state_dict(state_dict["optimizer_state_dict"])
-        if hasattr(self, "lr_scheduler"):
-            self.lr_scheduler.load_state_dict(state_dict["lr_scheduler_state_dict"])
-        elif "lr_scheduler_state_dict" in state_dict:
-            print("Warning: lr scheduler state dict loaded but no lr scheduler is initialized. Ignored.")
         algorithm_state = state_dict.get("algorithm_state_dict", {})
         self.critic_warmup_until_iteration = algorithm_state.get(
             "critic_warmup_until_iteration"
@@ -549,8 +720,32 @@ class PPO:
         self.entropy_coef = float(
             algorithm_state.get("entropy_coef", self.entropy_coef)
         )
-        for param_group in self.optimizer.param_groups:
-            param_group["lr"] = self.learning_rate
+        self.reference_kl_min_coef = float(
+            algorithm_state.get(
+                "reference_kl_min_coef", self.reference_kl_min_coef
+            )
+        )
+        self.reference_kl_max_coef = float(
+            algorithm_state.get(
+                "reference_kl_max_coef", self.reference_kl_max_coef
+            )
+        )
+        checkpoint_iteration = int(state_dict.get("iter", 0))
+        optimizer_is_critic_only = (
+            not self.actor_finetune_active
+            and self.critic_warmup_until_iteration is not None
+            and checkpoint_iteration <= self.critic_warmup_until_iteration
+        )
+        self._rebuild_optimizer(
+            actor_enabled=not optimizer_is_critic_only,
+            learning_rate=self.learning_rate,
+        )
+        if "optimizer_state_dict" in state_dict:
+            self.optimizer.load_state_dict(state_dict["optimizer_state_dict"])
+        if hasattr(self, "lr_scheduler"):
+            self.lr_scheduler.load_state_dict(state_dict["lr_scheduler_state_dict"])
+        elif "lr_scheduler_state_dict" in state_dict:
+            print("Warning: lr scheduler state dict loaded but no lr scheduler is initialized. Ignored.")
         self._restore_reference_policy(
             state_dict.get("reference_model_state_dict")
         )

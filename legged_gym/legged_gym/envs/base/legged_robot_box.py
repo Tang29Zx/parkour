@@ -2,7 +2,7 @@
 
 import numpy as np
 import torch
-from isaacgym.torch_utils import get_euler_xyz
+from isaacgym.torch_utils import get_euler_xyz, quat_rotate_inverse
 
 from .box_progress import BoxProgressTracker
 from .legged_robot import LeggedRobot
@@ -69,6 +69,42 @@ class LeggedRobotBox(LeggedRobot):
         self.max_abs_pitch = torch.zeros_like(self.forward_speed_sum)
         self.action_rate_l2_sum = torch.zeros_like(self.forward_speed_sum)
         self.max_action_rate_l2 = torch.zeros_like(self.forward_speed_sum)
+        self.named_dof_error_sum = torch.zeros_like(self.forward_speed_sum)
+        self.max_named_dof_error = torch.zeros_like(self.forward_speed_sum)
+        self.named_joint_error_sum = torch.zeros(
+            self.num_envs,
+            len(self.dof_error_named_indices),
+            dtype=torch.float,
+            device=self.device,
+        )
+        self.named_joint_error_max = torch.zeros_like(
+            self.named_joint_error_sum
+        )
+        self.dof_near_limit_count = torch.zeros(
+            self.num_envs, dtype=torch.long, device=self.device
+        )
+        self.action_saturation_count = torch.zeros_like(
+            self.dof_near_limit_count
+        )
+        self.action_abs_sum = torch.zeros_like(self.forward_speed_sum)
+        self.left_foot_crossing_count = torch.zeros_like(
+            self.dof_near_limit_count
+        )
+        self.right_foot_crossing_count = torch.zeros_like(
+            self.dof_near_limit_count
+        )
+        self.min_lr_foot_lateral_distance = torch.full_like(
+            self.forward_speed_sum, 10.0
+        )
+        self.thigh_collision_count = torch.zeros_like(
+            self.dof_near_limit_count
+        )
+        self.calf_collision_count = torch.zeros_like(
+            self.dof_near_limit_count
+        )
+        self.body_collision_count = torch.zeros_like(
+            self.dof_near_limit_count
+        )
         self.quality_level = float(
             getattr(self.cfg.rewards, "quality_initial_level", 0.0)
         )
@@ -89,6 +125,52 @@ class LeggedRobotBox(LeggedRobot):
             dtype=torch.long,
             device=self.device,
         )
+        self.thigh_contact_indices = self._body_indices_with_token(
+            rigid_body_names, "thigh"
+        )
+        self.calf_contact_indices = self._body_indices_with_token(
+            rigid_body_names, "calf"
+        )
+        self.left_foot_local_indices = torch.tensor(
+            [
+                idx
+                for idx, name in enumerate(self.feet_names)
+                if name.startswith(("FL", "RL"))
+            ],
+            dtype=torch.long,
+            device=self.device,
+        )
+        self.right_foot_local_indices = torch.tensor(
+            [
+                idx
+                for idx, name in enumerate(self.feet_names)
+                if name.startswith(("FR", "RR"))
+            ],
+            dtype=torch.long,
+            device=self.device,
+        )
+        if (
+            len(self.left_foot_local_indices) != 2
+            or len(self.right_foot_local_indices) != 2
+        ):
+            raise ValueError(
+                "Go2 leg-crossing metrics require FL/RL and FR/RR foot names."
+            )
+
+    def _body_indices_with_token(self, body_names, token):
+        names = [name for name in body_names if token in name]
+        if not names:
+            raise ValueError(f"The robot asset has no {token!r} rigid bodies.")
+        return torch.tensor(
+            [
+                self.gym.find_actor_rigid_body_handle(
+                    self.envs[0], self.actor_handles[0], name
+                )
+                for name in names
+            ],
+            dtype=torch.long,
+            device=self.device,
+        )
 
     def _bind_progress_buffers(self):
         tracker = self.box_progress
@@ -104,6 +186,8 @@ class LeggedRobotBox(LeggedRobot):
         self.out_of_track_buf = tracker.out_of_track_buf
         self.landing_overrun_buf = tracker.landing_overrun_buf
         self.fall_buf = tracker.fall_buf
+        self.incomplete_buf = tracker.incomplete_buf
+        self.task_progress_buf = tracker.task_progress_buf
         self.body_contact_counter = tracker.body_contact_counter
         self.landing_counter = tracker.landing_counter
         self.episode_timeout_buf = tracker.episode_timeout_buf
@@ -176,6 +260,73 @@ class LeggedRobotBox(LeggedRobot):
         self.action_rate_l2_sum += action_rate_l2
         self.max_action_rate_l2 = torch.maximum(
             self.max_action_rate_l2, action_rate_l2
+        )
+
+        named_error = torch.abs(
+            self.dof_pos[:, self.dof_error_named_indices]
+            - self.default_dof_pos[:, self.dof_error_named_indices]
+        )
+        named_error_mean = named_error.mean(dim=1)
+        self.named_dof_error_sum += named_error_mean
+        self.max_named_dof_error = torch.maximum(
+            self.max_named_dof_error, named_error.max(dim=1).values
+        )
+        self.named_joint_error_sum += named_error
+        self.named_joint_error_max = torch.maximum(
+            self.named_joint_error_max, named_error
+        )
+
+        dof_range = (self.dof_pos_limits[:, 1] - self.dof_pos_limits[:, 0])
+        near_margin = (
+            dof_range * self.cfg.rewards.dof_near_limit_fraction
+        )
+        near_limit = (
+            (self.dof_pos <= self.dof_pos_limits[:, 0] + near_margin)
+            | (self.dof_pos >= self.dof_pos_limits[:, 1] - near_margin)
+        )
+        self.dof_near_limit_count += near_limit.sum(dim=1)
+        self.action_saturation_count += (
+            torch.abs(self.actions)
+            > self.cfg.rewards.action_saturation_threshold
+        ).sum(dim=1)
+        self.action_abs_sum += torch.abs(self.actions).sum(dim=1)
+
+        body_states = self.all_rigid_body_states.view(self.num_envs, -1, 13)
+        feet_world_offset = (
+            body_states[:, self.feet_indices, :3]
+            - self.root_states[:, None, :3]
+        )
+        feet_local = quat_rotate_inverse(
+            self.base_quat[:, None, :].expand(-1, len(self.feet_indices), -1)
+            .reshape(-1, 4),
+            feet_world_offset.reshape(-1, 3),
+        ).reshape(self.num_envs, len(self.feet_indices), 3)
+        left_y = feet_local[:, self.left_foot_local_indices, 1]
+        right_y = feet_local[:, self.right_foot_local_indices, 1]
+        self.left_foot_crossing_count += (left_y < 0.0).sum(dim=1)
+        self.right_foot_crossing_count += (right_y > 0.0).sum(dim=1)
+        pairwise_lateral_distance = torch.abs(
+            left_y.unsqueeze(2) - right_y.unsqueeze(1)
+        )
+        self.min_lr_foot_lateral_distance = torch.minimum(
+            self.min_lr_foot_lateral_distance,
+            pairwise_lateral_distance.flatten(1).min(dim=1).values,
+        )
+
+        contact_norm = torch.norm(self.contact_forces, dim=-1)
+        leg_threshold = self.cfg.rewards.leg_contact_force_threshold
+        body_threshold = self.cfg.rewards.body_collision_force_threshold
+        self.thigh_collision_count += torch.any(
+            contact_norm[:, self.thigh_contact_indices] > leg_threshold,
+            dim=1,
+        )
+        self.calf_collision_count += torch.any(
+            contact_norm[:, self.calf_contact_indices] > leg_threshold,
+            dim=1,
+        )
+        self.body_collision_count += torch.any(
+            contact_norm[:, self.base_contact_indices] > body_threshold,
+            dim=1,
         )
 
     def _update_speed_statistics(self, forward_speed, box_mask):
@@ -288,7 +439,26 @@ class LeggedRobotBox(LeggedRobot):
             self.episode_length_buf[env_ids],
             torch.zeros_like(self.episode_length_buf[env_ids]),
         )
-        return {
+        named_episode_mean = (
+            self.named_dof_error_sum[env_ids] / episode_lengths
+        )
+        action_rate_episode_mean = (
+            self.action_rate_l2_sum[env_ids] / episode_lengths
+        )
+        named_joint_episode_mean = (
+            self.named_joint_error_sum[env_ids]
+            / episode_lengths.unsqueeze(1)
+        )
+        step_count = episode_lengths.sum().clamp_min(1)
+        dof_sample_count = (step_count * self.num_dof).clamp_min(1)
+        action_sample_count = (step_count * self.num_actions).clamp_min(1)
+        left_sample_count = (
+            step_count * len(self.left_foot_local_indices)
+        ).clamp_min(1)
+        right_sample_count = (
+            step_count * len(self.right_foot_local_indices)
+        ).clamp_min(1)
+        stats = {
             "mean_abs_roll_rad": torch.mean(
                 self.abs_roll_sum[env_ids] / episode_lengths
             ),
@@ -303,6 +473,55 @@ class LeggedRobotBox(LeggedRobot):
             "max_action_rate_l2": torch.max(
                 self.max_action_rate_l2[env_ids]
             ),
+            # P95 values are taken across completed episodes after each
+            # episode's time average is computed. This avoids retaining every
+            # control-step sample for all 4096 environments.
+            "p95_action_rate_l2": torch.quantile(
+                action_rate_episode_mean.float(), 0.95
+            ),
+            "mean_named_dof_error": named_episode_mean.mean(),
+            "p95_named_dof_error": torch.quantile(
+                named_episode_mean.float(), 0.95
+            ),
+            "max_named_dof_error": torch.max(
+                self.max_named_dof_error[env_ids]
+            ),
+            "dof_near_limit_ratio": (
+                self.dof_near_limit_count[env_ids].sum()
+                / dof_sample_count
+            ),
+            "action_saturation_ratio": (
+                self.action_saturation_count[env_ids].sum()
+                / action_sample_count
+            ),
+            "mean_action_abs": (
+                self.action_abs_sum[env_ids].sum()
+                / action_sample_count
+            ),
+            "left_foot_crossing_ratio": (
+                self.left_foot_crossing_count[env_ids].sum()
+                / left_sample_count
+            ),
+            "right_foot_crossing_ratio": (
+                self.right_foot_crossing_count[env_ids].sum()
+                / right_sample_count
+            ),
+            "leg_crossing_ratio": (
+                self.left_foot_crossing_count[env_ids].sum()
+                + self.right_foot_crossing_count[env_ids].sum()
+            ) / (left_sample_count + right_sample_count),
+            "min_left_right_foot_lateral_distance_m": torch.min(
+                self.min_lr_foot_lateral_distance[env_ids]
+            ),
+            "thigh_collision_rate": (
+                self.thigh_collision_count[env_ids].sum() / step_count
+            ),
+            "calf_collision_rate": (
+                self.calf_collision_count[env_ids].sum() / step_count
+            ),
+            "body_collision_rate": (
+                self.body_collision_count[env_ids].sum() / step_count
+            ),
             "early_failure_rate": early_failure.float().mean(),
             "mean_failure_time_s": (
                 failure_steps.float().sum()
@@ -310,6 +529,21 @@ class LeggedRobotBox(LeggedRobot):
                 / failure_count.clamp_min(1)
             ),
         }
+        for joint_idx, dof_idx in enumerate(
+            self.dof_error_named_indices.tolist()
+        ):
+            joint_name = self.dof_names[dof_idx]
+            joint_prefix = f"{joint_name}_abs_error_rad"
+            stats[f"mean_{joint_prefix}"] = named_joint_episode_mean[
+                :, joint_idx
+            ].mean()
+            stats[f"p95_{joint_prefix}"] = torch.quantile(
+                named_joint_episode_mean[:, joint_idx].float(), 0.95
+            )
+            stats[f"max_{joint_prefix}"] = torch.max(
+                self.named_joint_error_max[env_ids, joint_idx]
+            )
+        return stats
 
     def _reset_motion_quality_statistics(self, env_ids):
         """Clear posture and action-change accumulators."""
@@ -319,10 +553,29 @@ class LeggedRobotBox(LeggedRobot):
         self.max_abs_pitch[env_ids] = 0.0
         self.action_rate_l2_sum[env_ids] = 0.0
         self.max_action_rate_l2[env_ids] = 0.0
+        self.named_dof_error_sum[env_ids] = 0.0
+        self.max_named_dof_error[env_ids] = 0.0
+        self.named_joint_error_sum[env_ids] = 0.0
+        self.named_joint_error_max[env_ids] = 0.0
+        self.dof_near_limit_count[env_ids] = 0
+        self.action_saturation_count[env_ids] = 0
+        self.action_abs_sum[env_ids] = 0.0
+        self.left_foot_crossing_count[env_ids] = 0
+        self.right_foot_crossing_count[env_ids] = 0
+        self.min_lr_foot_lateral_distance[env_ids] = 10.0
+        self.thigh_collision_count[env_ids] = 0
+        self.calf_collision_count[env_ids] = 0
+        self.body_collision_count[env_ids] = 0
 
     def check_termination(self):
         super().check_termination()
-        natural_timeout = self.time_out_buf.clone()
+        # The base class uses ``>`` for historical truncation semantics. This
+        # task has a real 45 s completion deadline, so terminate at the exact
+        # configured control step and classify it as incomplete below.
+        natural_timeout = (
+            self.time_out_buf
+            | (self.episode_length_buf >= self.max_episode_length)
+        )
 
         roll, pitch, _ = get_euler_xyz(self.base_quat)
         roll = torch.where(roll > np.pi, roll - 2.0 * np.pi, roll)
@@ -359,9 +612,21 @@ class LeggedRobotBox(LeggedRobot):
         )
 
     def _fill_extras(self, env_ids):
+        raw_reward_sums = {
+            name: values[env_ids].clone()
+            for name, values in self.episode_sums.items()
+        }
+        raw_total_return = torch.zeros(
+            len(env_ids), dtype=torch.float, device=self.device
+        )
+        for values in raw_reward_sums.values():
+            raw_total_return += values
         super()._fill_extras(env_ids)
         episode = self.extras["episode"]
         episode["success_rate"] = self.success_buf[env_ids].float().mean()
+        episode["episode_incomplete_rate"] = (
+            self.incomplete_buf[env_ids].float().mean()
+        )
         episode["episode_timeout_rate"] = (
             self.episode_timeout_buf[env_ids].float().mean()
         )
@@ -387,6 +652,47 @@ class LeggedRobotBox(LeggedRobot):
         )
         episode.update(self._get_speed_statistics(env_ids))
         episode.update(self._get_motion_quality_statistics(env_ids))
+        for name, values in raw_reward_sums.items():
+            episode[f"raw/rew_{name}"] = values.mean()
+        collision_parts = (
+            "body_collision",
+            "thigh_collision",
+            "calf_collision",
+        )
+        if all(name in raw_reward_sums for name in collision_parts):
+            episode["raw/rew_collision"] = sum(
+                raw_reward_sums[name] for name in collision_parts
+            ).mean()
+        episode["raw/total_return"] = raw_total_return.mean()
+
+        result_masks = {
+            "success": self.success_buf[env_ids],
+            "fall_failure": self.fall_buf[env_ids],
+            "missed_box_failure": self.missed_box_buf[env_ids],
+            "out_of_track_failure": (
+                self.out_of_track_buf[env_ids]
+                | self.landing_overrun_buf[env_ids]
+            ),
+            "incomplete": self.incomplete_buf[env_ids],
+            "early_failure": self.box_progress.failure_buf[env_ids]
+            & (
+                self.episode_length_buf[env_ids]
+                <= int(np.ceil(1.0 / self.dt))
+            ),
+        }
+        for result_name, result_mask in result_masks.items():
+            result_count = result_mask.sum()
+            result_total = torch.where(
+                result_mask,
+                raw_total_return,
+                torch.zeros_like(raw_total_return),
+            ).sum()
+            episode[f"raw/{result_name}_mean_return"] = (
+                result_total / result_count.clamp_min(1)
+            )
+            episode[f"raw/{result_name}_episode_count"] = (
+                result_count.float()
+            )
         for box_idx in range(self.box_progress.required_boxes):
             episode[f"box_{box_idx + 1}_pass_rate"] = (
                 (self.passed_box_count[env_ids] > box_idx).float().mean()
@@ -405,6 +711,7 @@ class LeggedRobotBox(LeggedRobot):
             )
 
         self.extras["successes"] = self.success_buf.clone()
+        self.extras["episode_incompletes"] = self.incomplete_buf.clone()
         self.extras["episode_timeouts"] = self.episode_timeout_buf.clone()
 
     def _reset_buffers(self, env_ids):
@@ -417,30 +724,55 @@ class LeggedRobotBox(LeggedRobot):
             self._reset_motion_quality_statistics(env_ids)
 
     def _near_box_for_speed_control(self):
-        """Return environments inside the current target box speed window."""
+        """Return environments with a non-zero current-box speed blend."""
+        return self._box_speed_blend() > 0.0
+
+    @staticmethod
+    def _smoothstep(value):
+        value = value.clamp(0.0, 1.0)
+        return value * value * (3.0 - 2.0 * value)
+
+    def _box_speed_blend(self):
+        """Smoothly blend flat and obstacle limits for the current box only."""
         cfg = self.cfg.rewards
         num_envs = self.root_states.shape[0]
         env_ids = torch.arange(num_envs, device=self.root_states.device)
-        active = self.next_box_idx < self.box_progress.required_boxes
+        # Keep only the last target's exit ramp after course completion so the
+        # fifth-box landing does not see an instantaneous 1.2 -> 0.7 m/s jump.
+        active = self.next_box_idx <= self.box_progress.required_boxes
         target_indices = self.next_box_idx.clamp(
             max=self.box_progress.required_boxes - 1
         )
         target_bounds = self.env_box_bounds[env_ids, target_indices]
         base_x = self.root_states[:, 0]
         base_y = self.root_states[:, 1]
-        near_x = (
-            (base_x >= target_bounds[:, 0] - cfg.box_approach_distance)
-            & (base_x <= target_bounds[:, 1] + cfg.box_exit_distance)
+        ramp_up_distance = max(float(cfg.box_speed_ramp_up_distance), 1e-6)
+        ramp_down_distance = max(
+            float(cfg.box_speed_ramp_down_distance), 1e-6
+        )
+        ramp_up = self._smoothstep(
+            (
+                base_x
+                - (target_bounds[:, 0] - ramp_up_distance)
+            ) / ramp_up_distance
+        )
+        ramp_down = 1.0 - self._smoothstep(
+            (base_x - target_bounds[:, 1]) / ramp_down_distance
         )
         near_y = (
             (base_y >= target_bounds[:, 2] - cfg.box_lateral_margin)
             & (base_y <= target_bounds[:, 3] + cfg.box_lateral_margin)
         )
-        return active & near_x & near_y
+        return (
+            ramp_up
+            * ramp_down
+            * active.to(ramp_up.dtype)
+            * near_y.to(ramp_up.dtype)
+        ).clamp(0.0, 1.0)
 
     def _positive_speed_allowance(self):
         """Allow a small positive speed error only near a box."""
-        return self._near_box_for_speed_control().to(
+        return self._box_speed_blend().to(
             self.base_lin_vel.dtype
         ) * self.cfg.rewards.box_speed_allowance
 
@@ -465,11 +797,21 @@ class LeggedRobotBox(LeggedRobot):
         )
 
     def _reward_forward_speed_tracking(self):
-        """Reward the commanded speed without rewarding faster motion."""
+        """Zero-centered command tracking; exact tracking gives zero."""
         speed_error = self.base_lin_vel[:, 0] - self.commands[:, 0]
         return torch.exp(
             -torch.square(speed_error)
             / self.cfg.rewards.forward_speed_tracking_sigma
+        ) - 1.0
+
+    def _reward_tracking_ang_vel(self):
+        """Zero-centered yaw tracking; a zero yaw error gives zero."""
+        ang_vel_error = torch.square(
+            self.commands[:, 2] - self.base_ang_vel[:, 2]
+        )
+        return (
+            torch.exp(-ang_vel_error / self.cfg.rewards.tracking_sigma)
+            - 1.0
         )
 
     def _reward_action_rate(self):
@@ -485,17 +827,14 @@ class LeggedRobotBox(LeggedRobot):
 
     def _reward_overspeed(self):
         """Quadratically penalize speed above the local absolute limit."""
-        near_box = self._near_box_for_speed_control()
-        speed_limit = torch.where(
-            near_box,
-            torch.full_like(
-                self.base_lin_vel[:, 0],
-                self.cfg.rewards.box_speed_limit,
-            ),
-            torch.full_like(
-                self.base_lin_vel[:, 0],
-                self.cfg.rewards.flat_speed_limit,
-            ),
+        blend = self._box_speed_blend()
+        speed_limit = (
+            self.cfg.rewards.flat_speed_limit
+            + blend
+            * (
+                self.cfg.rewards.box_speed_limit
+                - self.cfg.rewards.flat_speed_limit
+            )
         )
         excess_speed = torch.relu(self.base_lin_vel[:, 0] - speed_limit)
         return torch.square(excess_speed) * float(
@@ -503,14 +842,20 @@ class LeggedRobotBox(LeggedRobot):
         )
 
     def _reward_termination(self):
-        """Make an early task failure costlier than a late failed attempt."""
-        remaining_fraction = 1.0 - (
-            self.episode_length_buf.float() / float(self.max_episode_length)
+        """Penalize failure by spatial task progress, never by elapsed time."""
+        floor = float(self.cfg.rewards.failure_progress_floor)
+        progress_multiplier = (
+            floor + (1.0 - floor) * (1.0 - self.task_progress_buf)
         )
-        remaining_fraction = remaining_fraction.clamp(0.0, 1.0)
-        return self.box_progress.failure_buf.float() * (
-            1.0 + remaining_fraction
+        return self.box_progress.failure_buf.float() * progress_multiplier
+
+    def _reward_incomplete(self):
+        """Penalize reaching the task deadline without PPO bootstrapping."""
+        floor = float(self.cfg.rewards.failure_progress_floor)
+        progress_multiplier = (
+            floor + (1.0 - floor) * (1.0 - self.task_progress_buf)
         )
+        return self.incomplete_buf.float() * progress_multiplier
 
     def _reward_flat_orientation(self):
         """Penalize base tilt only outside the active box maneuver window."""
@@ -519,9 +864,49 @@ class LeggedRobotBox(LeggedRobot):
         )
         return (
             tilt_square
-            * (~self._near_box_for_speed_control()).float()
+            * (1.0 - self._box_speed_blend())
             * float(getattr(self, "quality_level", 1.0))
         )
+
+    def _reward_dof_error_named(self):
+        return super()._reward_dof_error_named() * float(
+            getattr(self, "quality_level", 1.0)
+        )
+
+    def _reward_dof_error(self):
+        return super()._reward_dof_error() * float(
+            getattr(self, "quality_level", 1.0)
+        )
+
+    def _contact_count(self, indices, threshold):
+        return torch.sum(
+            (
+                torch.norm(self.contact_forces[:, indices, :], dim=-1)
+                > threshold
+            ).float(),
+            dim=1,
+        )
+
+    def _reward_body_collision(self):
+        """Keep base impacts as an always-on safety penalty."""
+        return self._contact_count(
+            self.base_contact_indices,
+            self.cfg.rewards.body_collision_force_threshold,
+        )
+
+    def _reward_thigh_collision(self):
+        """Gradually discourage light thigh contacts."""
+        return self._contact_count(
+            self.thigh_contact_indices,
+            self.cfg.rewards.leg_contact_force_threshold,
+        ) * float(getattr(self, "quality_level", 1.0))
+
+    def _reward_calf_collision(self):
+        """Gradually discourage light calf contacts."""
+        return self._contact_count(
+            self.calf_contact_indices,
+            self.cfg.rewards.leg_contact_force_threshold,
+        ) * float(getattr(self, "quality_level", 1.0))
 
     def _reward_lin_pos_y(self):
         """Penalize lateral displacement from the course centerline."""
@@ -549,7 +934,3 @@ class LeggedRobotBox(LeggedRobot):
     def _reward_success(self):
         """Emit one event after the required boxes and a stable landing."""
         return self.success_buf.float()
-
-    def _reward_episode_timeout(self):
-        """Emit one event only for the true episode time limit."""
-        return self.episode_timeout_buf.float()

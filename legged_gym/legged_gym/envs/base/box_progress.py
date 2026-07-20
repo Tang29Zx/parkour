@@ -79,7 +79,11 @@ class BoxProgressTracker:
         self.out_of_track_buf = torch.zeros_like(self.box_passed_buf)
         self.landing_overrun_buf = torch.zeros_like(self.box_passed_buf)
         self.fall_buf = torch.zeros_like(self.box_passed_buf)
+        self.incomplete_buf = torch.zeros_like(self.box_passed_buf)
         self.episode_timeout_buf = torch.zeros_like(self.box_passed_buf)
+        self.task_progress_buf = torch.zeros(
+            self.num_envs, dtype=torch.float, device=device
+        )
 
     def reset(self, env_ids):
         """Clear all episode state for selected environments."""
@@ -102,7 +106,9 @@ class BoxProgressTracker:
         self.out_of_track_buf[env_ids] = False
         self.landing_overrun_buf[env_ids] = False
         self.fall_buf[env_ids] = False
+        self.incomplete_buf[env_ids] = False
         self.episode_timeout_buf[env_ids] = False
+        self.task_progress_buf[env_ids] = 0.0
 
     def update(
         self,
@@ -119,6 +125,7 @@ class BoxProgressTracker:
         body_contact,
         natural_timeout,
         landing_end_x=None,
+        external_timeout=None,
     ):
         """Advance progress by one control step and update event buffers."""
         self._clear_events()
@@ -240,8 +247,49 @@ class BoxProgressTracker:
             & ~raw_landing_overrun
         )
         self.success_buf[:] = landing_success & ~self.failure_buf
-        self.episode_timeout_buf[:] = (
+        self.incomplete_buf[:] = (
             natural_timeout & ~self.failure_buf & ~self.success_buf
+        )
+        if external_timeout is None:
+            external_timeout = torch.zeros_like(natural_timeout)
+        self.episode_timeout_buf[:] = (
+            external_timeout
+            & ~self.failure_buf
+            & ~self.success_buf
+            & ~self.incomplete_buf
+        )
+        self.task_progress_buf[:] = self.compute_task_progress(
+            box_bounds=box_bounds,
+            track_start_x=track_start_x,
+            base_x=base_positions[:, 0],
+        )
+
+    def compute_task_progress(self, box_bounds, track_start_x, base_x):
+        """Return ordered course progress in ``[0, 1]`` without using time."""
+        env_ids = torch.arange(self.num_envs, device=self.device)
+        completed = self.passed_box_count.clamp(max=self.required_boxes)
+        course_complete = completed >= self.required_boxes
+        target_indices = completed.clamp(max=self.required_boxes - 1)
+        target_rear = box_bounds[env_ids, target_indices, 1] + self.pass_margin
+
+        previous_indices = (target_indices - 1).clamp_min(0)
+        previous_rear = box_bounds[env_ids, previous_indices, 1] + self.pass_margin
+        segment_start = torch.where(
+            target_indices > 0,
+            previous_rear,
+            track_start_x,
+        )
+        local_progress = (
+            (base_x - segment_start)
+            / (target_rear - segment_start).clamp_min(1e-6)
+        ).clamp(0.0, 1.0)
+        progress = (
+            completed.float() + local_progress
+        ) / float(self.required_boxes)
+        return torch.where(
+            course_complete,
+            torch.ones_like(progress),
+            progress.clamp(0.0, 1.0),
         )
 
     def _get_top_contacts(
@@ -280,6 +328,11 @@ class BoxProgressTracker:
         )
 
     def apply_termination(self, reset_buf, time_out_buf):
-        """Apply exclusive failure, success, and natural-timeout semantics."""
+        """Apply exclusive failure, success, incomplete, and timeout semantics."""
         time_out_buf.copy_(self.episode_timeout_buf)
-        reset_buf |= self.failure_buf | self.success_buf | time_out_buf
+        reset_buf |= (
+            self.failure_buf
+            | self.success_buf
+            | self.incomplete_buf
+            | time_out_buf
+        )

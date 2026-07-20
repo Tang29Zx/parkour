@@ -69,7 +69,11 @@ class Go2BoxParkourCfg(DebugGo2BoxCfg):
             torques = -1e-7
             dof_error_named = -1.0
             dof_error = -0.005
-            collision = -0.05
+            # Base contact is a hard safety cost. Leg rubbing is introduced by
+            # the action-quality curriculum to preserve the source behavior.
+            body_collision = -0.05
+            thigh_collision = -0.05
+            calf_collision = -0.05
             exceed_dof_pos_limits = -0.1
             exceed_torque_limits_l1norm = -0.1
             box_first_foot_contact = 5.0
@@ -77,20 +81,29 @@ class Go2BoxParkourCfg(DebugGo2BoxCfg):
             box_passed = 25.0
             success = 500.0
             termination = -1000.0
-            episode_timeout = -150.0
+            incomplete = -1000.0
 
         only_positive_rewards = False
         forward_speed_tracking_sigma = 0.02
         quality_initial_level = 0.0
         # Track the command closely on flat ground. Near a box, allow a brief
         # positive speed error for jumping or climbing without rewarding it.
-        box_approach_distance = 0.5
-        box_exit_distance = 0.2
+        # Smoothly blend the local speed limit over these distances. Only the
+        # current target box can activate this window.
+        box_speed_ramp_up_distance = 0.5
+        box_speed_ramp_down_distance = 0.5
         box_lateral_margin = 0.2
         box_speed_allowance = 0.5
         flat_speed_limit = 0.7
         flat_severe_speed_limit = 0.8
         box_speed_limit = 1.2
+        # Task failure remains costly even after all boxes are passed but the
+        # landing has not been completed.
+        failure_progress_floor = 0.25
+        leg_contact_force_threshold = 0.1
+        body_collision_force_threshold = 1.0
+        dof_near_limit_fraction = 0.15
+        action_saturation_threshold = 0.95
 
     class box_progress:
         required_boxes = 5
@@ -125,7 +138,9 @@ class Go2BoxParkourCfgPPO(Go2RoughCfgPPO):
         actor_finetune_learning_rate = 1e-5
         actor_finetune_clip_param = 0.1
         actor_finetune_entropy_coef = 0.001
-        reference_kl_initial_coef = 1.0
+        # Keep a non-zero behavior anchor even at maximum quality difficulty.
+        reference_kl_min_coef = 0.05
+        reference_kl_max_coef = 1.0
         quality_min_episodes = 256
         quality_required_windows = 2
         quality_increase = 0.05
@@ -151,7 +166,7 @@ class Go2BoxParkourCfgPPO(Go2RoughCfgPPO):
         )
         checkpoint = 11700
         # Initial Critic migration is selected explicitly from the CLI. Keeping
-        # this disabled prevents later v9 resumes from resetting Critic again.
+        # this disabled prevents later v10 resumes from resetting Critic again.
         ckpt_manipulator = None
         max_iterations = 100
         save_interval = 100
