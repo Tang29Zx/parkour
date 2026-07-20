@@ -284,6 +284,28 @@ class CriticWarmupTest(unittest.TestCase):
             ppo.reference_actor_critic.memory_a.hidden_states
         )
 
+    def test_inference_rollout_statistics_are_reset_out_of_place(self):
+        actor_critic = ActorCriticRecurrent(
+            num_actor_obs=2,
+            num_critic_obs=2,
+            num_actions=1,
+            actor_hidden_dims=[4],
+            critic_hidden_dims=[4],
+            rnn_type="gru",
+            rnn_hidden_size=4,
+        )
+        ppo = PPO(actor_critic, reference_kl_max_coef=1.0)
+        ppo.snapshot_reference_policy()
+        ppo.init_storage(2, 1, [2], [2], [1])
+        observations = torch.tensor([[0.2, -0.1], [0.4, 0.3]])
+        with torch.inference_mode():
+            ppo.act(observations, observations)
+
+        ppo._reset_rollout_actor_equivalence_statistics()
+
+        self.assertEqual(ppo.rollout_actor_output_max_diff.item(), 0.0)
+        self.assertEqual(ppo.rollout_actor_std_max_diff.item(), 0.0)
+
     def test_incomplete_does_not_bootstrap_but_external_timeout_does(self):
         actor_critic = ActorCritic(
             num_actor_obs=2,

@@ -155,12 +155,7 @@ class PPO:
         ) < 0.0:
             raise ValueError("Actor equivalence tolerances must be non-negative.")
         self.reference_actor_critic = None
-        self.rollout_actor_output_max_diff = torch.zeros(
-            (), device=self.device
-        )
-        self.rollout_actor_std_max_diff = torch.zeros(
-            (), device=self.device
-        )
+        self._reset_rollout_actor_equivalence_statistics()
         self.quality_level = 0.0
         self.quality_up_windows = 0
         self.quality_down_windows = 0
@@ -200,6 +195,15 @@ class PPO:
             raise RuntimeError("No trainable parameters selected for PPO phase.")
         self.optimizer = self.optimizer_class(
             parameters, lr=float(learning_rate)
+        )
+
+    def _reset_rollout_actor_equivalence_statistics(self):
+        """Replace inference tensors instead of mutating them out of mode."""
+        self.rollout_actor_output_max_diff = torch.zeros(
+            (), device=self.device
+        )
+        self.rollout_actor_std_max_diff = torch.zeros(
+            (), device=self.device
         )
 
     def start_critic_warmup(self, start_iteration):
@@ -561,8 +565,7 @@ class PPO:
                     f"std_max_diff={std_diff:.3e} (limit "
                     f"{self.actor_std_equivalence_tolerance:.3e})."
                 )
-        self.rollout_actor_output_max_diff.zero_()
-        self.rollout_actor_std_max_diff.zero_()
+        self._reset_rollout_actor_equivalence_statistics()
         self.storage.clear()
         if (
             not critic_warmup_active
