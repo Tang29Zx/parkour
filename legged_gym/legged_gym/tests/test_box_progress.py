@@ -186,16 +186,16 @@ class BoxProgressTrackerTest(unittest.TestCase):
 
         self.roll[0] = 0.0
         self.contact_forces[0].zero_()
+        self.tracker.landing_counter[0] = 9
         self.natural_timeout[0] = True
-        for _ in range(10):
-            self.update()
+        self.update()
         self.assertTrue(self.tracker.success_buf[0])
         self.assertFalse(self.tracker.episode_timeout_buf[0])
 
         reset_buf = self.torch.zeros(2, dtype=self.torch.bool)
         time_out_buf = self.torch.zeros(2, dtype=self.torch.bool)
         self.tracker.apply_termination(reset_buf, time_out_buf)
-        self.assertTrue(time_out_buf[0])
+        self.assertFalse(time_out_buf[0])
         self.assertTrue(reset_buf[0])
 
     def test_failure_causes_and_true_timeout_are_separate(self):
@@ -206,7 +206,7 @@ class BoxProgressTrackerTest(unittest.TestCase):
 
         self.assertTrue(self.tracker.out_of_track_buf[0])
         self.assertTrue(self.tracker.fall_buf[1])
-        self.assertEqual(self.tracker.episode_timeout_buf.tolist(), [True, True])
+        self.assertEqual(self.tracker.episode_timeout_buf.tolist(), [False, False])
 
         self.roll.zero_()
         self.base_positions[:] = self.torch.tensor([0.0, 0.0, 0.5])
@@ -215,6 +215,38 @@ class BoxProgressTrackerTest(unittest.TestCase):
         for _ in range(15):
             self.update()
         self.assertTrue(self.tracker.fall_buf.all())
+
+    def test_pure_natural_timeout_is_the_only_timeout_termination(self):
+        self.natural_timeout[0] = True
+        self.update()
+
+        reset_buf = self.torch.zeros(2, dtype=self.torch.bool)
+        time_out_buf = self.natural_timeout.clone()
+        self.tracker.apply_termination(reset_buf, time_out_buf)
+
+        self.assertTrue(self.tracker.episode_timeout_buf[0])
+        self.assertTrue(time_out_buf[0])
+        self.assertTrue(reset_buf[0])
+        self.assertFalse(reset_buf[1])
+
+    def test_failure_takes_precedence_over_landing_success(self):
+        self.tracker.next_box_idx[0] = 5
+        self.tracker.passed_box_count[0] = 5
+        self.tracker.landing_foot_contact_mask[0] = True
+        self.tracker.landing_counter[0] = 9
+        self.tracker.body_contact_counter[0] = 14
+        self.body_contact[0] = True
+        self.feet_positions[0, :, 0] = 10.5
+        self.feet_positions[0, :, 1] = self.torch.tensor(
+            [-0.3, 0.3, -0.3, 0.3]
+        )
+        self.feet_positions[0, :, 2] = 0.0
+        self.base_positions[0, 0] = 10.5
+        self.update()
+
+        self.assertTrue(self.tracker.fall_buf[0])
+        self.assertFalse(self.tracker.success_buf[0])
+        self.assertFalse(self.tracker.episode_timeout_buf[0])
 
     def test_reset_clears_all_progress_and_events(self):
         self.tracker.next_box_idx[:] = 3

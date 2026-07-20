@@ -160,6 +160,11 @@ def update_cfg_from_args(env_cfg, cfg_train, args):
             cfg_train.runner.load_run = args.load_run
         if args.checkpoint is not None:
             cfg_train.runner.checkpoint = args.checkpoint
+        ckpt_manipulator = getattr(args, "ckpt_manipulator", None)
+        if ckpt_manipulator is not None:
+            cfg_train.runner.ckpt_manipulator = (
+                None if ckpt_manipulator.lower() == "none" else ckpt_manipulator
+            )
 
     return env_cfg, cfg_train
 
@@ -171,6 +176,7 @@ def get_args(custom_args=[]):
         {"name": "--run_name", "type": str,  "help": "Name of the run. Overrides config file if provided."},
         {"name": "--load_run", "type": str,  "help": "Name of the run to load when resume=True. If -1: will load the last run. Overrides config file if provided."},
         {"name": "--checkpoint", "type": int,  "help": "Saved model checkpoint number. If -1: will load the last checkpoint. Overrides config file if provided."},
+        {"name": "--ckpt_manipulator", "type": str, "help": "Optional checkpoint migration function. Use 'none' to disable the configured migration."},
         
         {"name": "--headless", "action": "store_true", "default": False, "help": "Force display off at all times"},
         {"name": "--horovod", "action": "store_true", "default": False, "help": "Use horovod for multi-gpu training"},

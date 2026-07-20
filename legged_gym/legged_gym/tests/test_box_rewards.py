@@ -149,6 +149,84 @@ class HeightEncoderMigrationTest(unittest.TestCase):
                 dict(model_state_dict=target_model),
             )
 
+    def test_reset_critic_keeps_actor_side_and_discards_training_state(self):
+        names = (
+            "std",
+            "actor.0.weight",
+            "memory_a.rnn.weight",
+            "encoders.0.weight",
+            "memory_s.rnn.weight",
+            "state_estimator.model.0.weight",
+            "critic.0.weight",
+            "memory_c.rnn.weight",
+            "critic_encoders.0.weight",
+        )
+        source_model = OrderedDict(
+            (name, torch.full((2, 2), float(index + 1)))
+            for index, name in enumerate(names)
+        )
+        target_model = OrderedDict(
+            (name, torch.full((2, 2), float(index + 101)))
+            for index, name in enumerate(names)
+        )
+        source = dict(
+            model_state_dict=source_model,
+            optimizer_state_dict={"old": True},
+            lr_scheduler_state_dict={"old": True},
+            iter=11700,
+            infos={"source": "v5"},
+        )
+
+        migrated = self.module.reset_critic_and_optimizer(
+            source,
+            dict(model_state_dict=target_model),
+        )
+
+        critic_prefixes = ("critic.", "memory_c.", "critic_encoders.")
+        for key in names:
+            expected = (
+                target_model[key]
+                if key.startswith(critic_prefixes)
+                else source_model[key]
+            )
+            self.assertTrue(
+                torch.equal(migrated["model_state_dict"][key], expected)
+            )
+        self.assertNotIn("optimizer_state_dict", migrated)
+        self.assertNotIn("lr_scheduler_state_dict", migrated)
+        self.assertEqual(migrated["iter"], 11700)
+        self.assertEqual(migrated["infos"], {"source": "v5"})
+
+    def test_reset_critic_rejects_key_and_preserved_shape_mismatches(self):
+        names = (
+            "actor.0.weight",
+            "critic.0.weight",
+            "memory_c.rnn.weight",
+            "critic_encoders.0.weight",
+        )
+        source_model = OrderedDict(
+            (name, torch.zeros(2, 2)) for name in names
+        )
+        target_model = OrderedDict(
+            (name, torch.ones(2, 2)) for name in names
+        )
+        source = dict(model_state_dict=source_model, iter=11700)
+
+        target_model["actor.0.weight"] = torch.ones(3, 2)
+        with self.assertRaises(ValueError):
+            self.module.reset_critic_and_optimizer(
+                source,
+                dict(model_state_dict=target_model),
+            )
+
+        target_model["actor.0.weight"] = torch.ones(2, 2)
+        del target_model["memory_c.rnn.weight"]
+        with self.assertRaises(KeyError):
+            self.module.reset_critic_and_optimizer(
+                source,
+                dict(model_state_dict=target_model),
+            )
+
     def test_reinitializes_both_encoders_and_keeps_other_model_weights(self):
         source, target = self.make_states()
         migrated = self.module.reinitialize_height_encoders(source, target)
@@ -291,6 +369,7 @@ class BoxRewardTest(unittest.TestCase):
         )
         from legged_gym.envs.go2.go2_config import Go2RoughCfg
         from legged_gym.envs.go2.debug_go2_box_config import DebugGo2BoxCfg
+        from legged_gym.utils.helpers import update_cfg_from_args
 
         cls.LeggedRobot = LeggedRobot
         cls.LeggedRobotBox = LeggedRobotBox
@@ -298,11 +377,11 @@ class BoxRewardTest(unittest.TestCase):
         cls.train_cfg = Go2BoxParkourCfgPPO
         cls.debug_cfg = DebugGo2BoxCfg
         cls.walk_cfg = Go2RoughCfg
+        cls.update_cfg_from_args = staticmethod(update_cfg_from_args)
 
     def test_event_scale_values_after_control_dt(self):
         scales = self.env_cfg.rewards.scales
         expected_scales = {
-            "tracking_lin_vel": 1.0,
             "tracking_ang_vel": 0.2,
             "speed_error_square": -1.0,
             "overspeed": -1.5,
@@ -318,13 +397,15 @@ class BoxRewardTest(unittest.TestCase):
         }
         for name, expected in expected_scales.items():
             self.assertEqual(getattr(scales, name), expected)
+        self.assertFalse(hasattr(scales, "tracking_lin_vel"))
+        self.assertFalse(hasattr(scales, "lin_vel_x"))
         dt = 0.02
-        self.assertAlmostEqual(scales.box_first_foot_contact * dt, 0.5)
-        self.assertAlmostEqual(scales.box_second_foot_contact * dt, 2.0)
-        self.assertAlmostEqual(scales.box_passed * dt, 5.0)
-        self.assertAlmostEqual(scales.success * dt, 10.0)
+        self.assertAlmostEqual(scales.box_first_foot_contact * dt, 0.1)
+        self.assertAlmostEqual(scales.box_second_foot_contact * dt, 0.2)
+        self.assertAlmostEqual(scales.box_passed * dt, 0.5)
+        self.assertAlmostEqual(scales.success * dt, 2.0)
         self.assertAlmostEqual(scales.termination * dt, -2.0)
-        self.assertAlmostEqual(scales.episode_timeout * dt, -5.0)
+        self.assertAlmostEqual(scales.episode_timeout * dt, -3.0)
         self.assertFalse(self.env_cfg.rewards.only_positive_rewards)
         self.assertFalse(hasattr(scales, "lazy_stop"))
 
@@ -336,14 +417,17 @@ class BoxRewardTest(unittest.TestCase):
             success_buf=torch.tensor([True, False, False]),
             episode_timeout_buf=torch.tensor([False, True, False]),
             reset_buf=torch.tensor([True, True, True]),
-            time_out_buf=torch.tensor([True, True, False]),
+            time_out_buf=torch.tensor([False, True, False]),
+            box_progress=SimpleNamespace(
+                failure_buf=torch.tensor([False, False, True])
+            ),
         )
         first_foot = self.LeggedRobotBox._reward_box_first_foot_contact(env)
         second_foot = self.LeggedRobotBox._reward_box_second_foot_contact(env)
         passed = self.LeggedRobotBox._reward_box_passed(env)
         success = self.LeggedRobotBox._reward_success(env)
         timeout = self.LeggedRobotBox._reward_episode_timeout(env)
-        termination = self.LeggedRobot._reward_termination(env)
+        termination = self.LeggedRobotBox._reward_termination(env)
 
         self.assertEqual(first_foot.tolist(), [1.0, 0.0, 0.0])
         self.assertEqual(second_foot.tolist(), [0.0, 1.0, 0.0])
@@ -354,31 +438,45 @@ class BoxRewardTest(unittest.TestCase):
 
     def make_speed_reward_env(self):
         rewards = SimpleNamespace(
-            box_approach_distance=0.8,
-            box_exit_distance=0.35,
+            box_approach_distance=0.5,
+            box_exit_distance=0.2,
             box_lateral_margin=0.2,
-            box_speed_allowance=0.4,
-            flat_overspeed_margin=0.2,
-            box_overspeed_margin=0.4,
+            box_speed_allowance=0.5,
+            flat_speed_limit=0.7,
+            flat_severe_speed_limit=0.8,
+            box_speed_limit=1.2,
         )
-        bounds = torch.tensor(
+        single_bounds = torch.tensor(
             [
-                [[2.0, 3.0, -0.5, 0.5, 0.4]],
-                [[0.5, 1.5, -0.5, 0.5, 0.4]],
-                [[0.5, 1.5, -0.5, 0.5, 0.4]],
+                [2.0, 3.0, -0.5, 0.5, 0.4],
+                [4.0, 5.0, -0.5, 0.5, 0.4],
             ]
         )
-        root_states = torch.zeros(3, 13)
-        root_states[2, 1] = 1.0
+        bounds = single_bounds.unsqueeze(0).repeat(6, 1, 1)
+        root_states = torch.zeros(6, 13)
+        root_states[:, 0] = torch.tensor([1.5, 3.2, 3.21, 3.8, 2.5, 2.5])
+        root_states[4, 1] = 1.0
         env = object.__new__(self.LeggedRobotBox)
         env.cfg = SimpleNamespace(rewards=rewards)
         env.root_states = root_states
         env.env_box_bounds = bounds
+        env.next_box_idx = torch.tensor([0, 0, 0, 0, 0, 2])
         env.base_lin_vel = torch.tensor(
-            [[1.0, 0.0, 0.0], [1.0, 0.0, 0.0], [1.0, 0.0, 0.0]]
-        )
-        env.commands = torch.tensor([[0.5, 0.0, 0.0]]).repeat(3, 1)
+            [[1.0, 0.0, 0.0]]
+        ).repeat(6, 1)
+        env.commands = torch.tensor(
+            [[0.5, 0.0, 0.0]]
+        ).repeat(6, 1)
         return env
+
+    def test_only_current_box_opens_speed_window(self):
+        env = self.make_speed_reward_env()
+        near_box = self.LeggedRobotBox._near_box_for_speed_control(env)
+
+        self.assertEqual(
+            near_box.tolist(),
+            [True, True, False, False, False, False],
+        )
 
     def test_speed_error_is_square_and_allows_only_near_box_acceleration(self):
         env = self.make_speed_reward_env()
@@ -386,12 +484,12 @@ class BoxRewardTest(unittest.TestCase):
 
         torch.testing.assert_close(
             reward,
-            torch.tensor([0.25, 0.01, 0.25]),
+            torch.tensor([0.0, 0.0, 0.25, 0.25, 0.25, 0.25]),
         )
 
         env.base_lin_vel[:, 0] = 0.2
         reward = self.LeggedRobotBox._reward_speed_error_square(env)
-        torch.testing.assert_close(reward, torch.full((3,), 0.09))
+        torch.testing.assert_close(reward, torch.full((6,), 0.09))
 
     def test_overspeed_is_square_with_flat_and_box_margins(self):
         env = self.make_speed_reward_env()
@@ -399,8 +497,74 @@ class BoxRewardTest(unittest.TestCase):
 
         torch.testing.assert_close(
             reward,
-            torch.tensor([0.09, 0.01, 0.09]),
+            torch.tensor([0.0, 0.0, 0.09, 0.09, 0.09, 0.09]),
         )
+
+    def test_target_speed_trajectory_beats_waiting_and_flat_sprint(self):
+        scales = self.env_cfg.rewards.scales
+        dt = 0.02
+        command = 0.5
+        event_total = 5 * (0.1 + 0.2 + 0.5) + 2.0
+
+        target_return = event_total
+        waiting_steps = int(self.env_cfg.env.episode_length_s / dt)
+        waiting_return = (
+            waiting_steps
+            * scales.speed_error_square
+            * dt
+            * (0.0 - command) ** 2
+            + scales.episode_timeout * dt
+        )
+        sprint_speed = 2.0
+        sprint_steps = int(14.0 / sprint_speed / dt)
+        sprint_return = event_total + sprint_steps * dt * (
+            scales.speed_error_square * (sprint_speed - command) ** 2
+            + scales.overspeed
+            * (sprint_speed - self.env_cfg.rewards.flat_speed_limit) ** 2
+        )
+
+        self.assertGreater(target_return, waiting_return)
+        self.assertGreater(target_return, sprint_return)
+
+    def test_speed_statistics_are_finite_and_reset_to_zero(self):
+        env = self.make_speed_reward_env()
+        num_envs = env.root_states.shape[0]
+        float_names = (
+            "forward_speed_sum",
+            "max_forward_speed",
+            "flat_forward_speed_sum",
+            "flat_forward_speed_max",
+            "box_forward_speed_sum",
+            "box_forward_speed_max",
+        )
+        count_names = (
+            "flat_forward_speed_count",
+            "box_forward_speed_count",
+            "flat_overspeed_count",
+            "flat_severe_overspeed_count",
+            "box_overspeed_count",
+        )
+        for name in float_names:
+            setattr(env, name, torch.zeros(num_envs))
+        for name in count_names:
+            setattr(env, name, torch.zeros(num_envs, dtype=torch.long))
+        env.episode_length_buf = torch.ones(num_envs, dtype=torch.long)
+        env_ids = torch.arange(num_envs)
+
+        near_box = self.LeggedRobotBox._near_box_for_speed_control(env)
+        self.LeggedRobotBox._update_speed_statistics(
+            env, env.base_lin_vel[:, 0], near_box
+        )
+        stats = self.LeggedRobotBox._get_speed_statistics(env, env_ids)
+
+        self.assertTrue(all(torch.isfinite(value) for value in stats.values()))
+        self.assertGreater(stats["flat_speed_sample_count"].item(), 0.0)
+        self.assertGreater(stats["box_speed_sample_count"].item(), 0.0)
+
+        self.LeggedRobotBox._reset_speed_statistics(env, env_ids)
+        zero_stats = self.LeggedRobotBox._get_speed_statistics(env, env_ids)
+        self.assertTrue(all(torch.isfinite(value) for value in zero_stats.values()))
+        self.assertTrue(all(value.item() == 0.0 for value in zero_stats.values()))
 
     def test_4096_event_reward_shapes(self):
         env = SimpleNamespace(
@@ -433,10 +597,11 @@ class BoxRewardTest(unittest.TestCase):
 
     def test_commands_are_per_episode_and_in_locked_range(self):
         commands = self.env_cfg.commands
-        self.assertEqual(commands.ranges.lin_vel_x, [0.4, 0.8])
+        self.assertEqual(commands.ranges.lin_vel_x, [0.45, 0.55])
         self.assertEqual(commands.ranges.lin_vel_y, [0.0, 0.0])
         self.assertEqual(commands.ranges.ang_vel_yaw, [0.0, 0.0])
         self.assertGreater(commands.resampling_time, self.env_cfg.env.episode_length_s)
+        self.assertEqual(self.env_cfg.env.episode_length_s, 45)
 
     def test_expanded_height_grid_contains_the_original_grid_at_locked_indices(self):
         import numpy as np
@@ -484,9 +649,9 @@ class BoxRewardTest(unittest.TestCase):
         self.assertEqual(runner.checkpoint, 11700)
         self.assertEqual(
             runner.run_name,
-            "five_box_v7_speed_control_from11700",
+            "five_box_v8_pre_curriculum_from11700",
         )
-        self.assertEqual(runner.ckpt_manipulator, "reset_optimizer_state")
+        self.assertIsNone(runner.ckpt_manipulator)
         self.assertTrue(
             runner.load_run.endswith(
                 "Jul19_23-03-03_five_box_v5_stable_from11000"
@@ -495,6 +660,35 @@ class BoxRewardTest(unittest.TestCase):
         self.assertEqual(algorithm.schedule, "fixed")
         self.assertEqual(algorithm.learning_rate, 5e-5)
         self.assertEqual(algorithm.entropy_coef, 0.003)
+        self.assertEqual(algorithm.gamma, 0.999)
+        self.assertEqual(algorithm.lam, 0.95)
+        self.assertEqual(runner.save_interval, 250)
+        self.assertEqual(runner.log_interval, 50)
+
+    def test_cli_checkpoint_manipulator_override_is_explicit(self):
+        args = SimpleNamespace(
+            seed=None,
+            max_iterations=None,
+            resume=False,
+            experiment_name=None,
+            run_name=None,
+            load_run=None,
+            checkpoint=None,
+            ckpt_manipulator="reset_critic_and_optimizer",
+        )
+        cfg = SimpleNamespace(
+            runner=SimpleNamespace(ckpt_manipulator=None)
+        )
+
+        _, updated = self.update_cfg_from_args(None, cfg, args)
+        self.assertEqual(
+            updated.runner.ckpt_manipulator,
+            "reset_critic_and_optimizer",
+        )
+
+        args.ckpt_manipulator = "none"
+        _, updated = self.update_cfg_from_args(None, cfg, args)
+        self.assertIsNone(updated.runner.ckpt_manipulator)
 
 
 if __name__ == "__main__":

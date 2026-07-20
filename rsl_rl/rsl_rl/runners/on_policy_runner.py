@@ -192,9 +192,10 @@ class OnPolicyRunner:
         self.writer.add_scalar('Perf/total_fps', fps, self.current_learning_iteration)
         self.writer.add_scalar('Perf/collection time', locs['collection_time'], self.current_learning_iteration)
         self.writer.add_scalar('Perf/learning_time', locs['learn_time'], self.current_learning_iteration)
-        self.writer.add_scalar('Perf/gpu_allocated', torch.cuda.memory_allocated(self.device) / 1024 ** 3, self.current_learning_iteration)
-        self.writer.add_scalar('Perf/gpu_global_free_mem', torch.cuda.mem_get_info(self.device)[0] / 1024 ** 3, self.current_learning_iteration)
-        self.writer.add_scalar('Perf/gpu_total', torch.cuda.mem_get_info(self.device)[1] / 1024 ** 3, self.current_learning_iteration)
+        if torch.device(self.device).type == "cuda":
+            self.writer.add_scalar('Perf/gpu_allocated', torch.cuda.memory_allocated(self.device) / 1024 ** 3, self.current_learning_iteration)
+            self.writer.add_scalar('Perf/gpu_global_free_mem', torch.cuda.mem_get_info(self.device)[0] / 1024 ** 3, self.current_learning_iteration)
+            self.writer.add_scalar('Perf/gpu_total', torch.cuda.mem_get_info(self.device)[1] / 1024 ** 3, self.current_learning_iteration)
         self.writer.add_scalar('Train/mean_reward_each_timestep', statistics.mean(locs['rframebuffer']), self.current_learning_iteration)
         if len(locs['rewbuffer']) > 0:
             self.writer.add_scalar('Train/mean_reward', statistics.mean(locs['rewbuffer']), self.current_learning_iteration)
@@ -228,7 +229,7 @@ class OnPolicyRunner:
                 f"""{'Computation:':>{pad}} {fps:.0f} steps/s (collection: {locs[
                     'collection_time']:.3f}s, learning {locs['learn_time']:.3f}s)\n"""
             )
-            for k. v in locs["losses"].items():
+            for k, v in locs["losses"].items():
                 log_string += f"""{k:>{pad}} {v.item():.4f}\n"""
             log_string += (
                 f"""{'Value function loss:':>{pad}} {locs["losses"]['value_loss']:.4f}\n"""

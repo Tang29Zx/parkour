@@ -14,7 +14,7 @@ class Go2BoxParkourCfg(DebugGo2BoxCfg):
 
     class env(DebugGo2BoxCfg.env):
         num_envs = 4096
-        episode_length_s = 30
+        episode_length_s = 45
         debug_geometry = False
         debug_zero_actions = False
 
@@ -42,8 +42,7 @@ class Go2BoxParkourCfg(DebugGo2BoxCfg):
         resampling_time = 1e16
 
         class ranges(DebugGo2BoxCfg.commands.ranges):
-            # Stage-one range; restore [0.5, 1.2] after box-top contact emerges.
-            lin_vel_x = [0.4, 0.8]
+            lin_vel_x = [0.45, 0.55]
             lin_vel_y = [0.0, 0.0]
             ang_vel_yaw = [0.0, 0.0]
 
@@ -58,7 +57,6 @@ class Go2BoxParkourCfg(DebugGo2BoxCfg):
 
     class rewards(DebugGo2BoxCfg.rewards):
         class scales:
-            tracking_lin_vel = 1.0
             tracking_ang_vel = 0.2
             speed_error_square = -1.0
             overspeed = -1.5
@@ -71,22 +69,23 @@ class Go2BoxParkourCfg(DebugGo2BoxCfg):
             collision = -0.05
             exceed_dof_pos_limits = -0.1
             exceed_torque_limits_l1norm = -0.1
-            box_first_foot_contact = 25.0
-            box_second_foot_contact = 100.0
-            box_passed = 250.0
-            success = 500.0
+            box_first_foot_contact = 5.0
+            box_second_foot_contact = 10.0
+            box_passed = 25.0
+            success = 100.0
             termination = -100.0
-            episode_timeout = -250.0
+            episode_timeout = -150.0
 
         only_positive_rewards = False
         # Track the command closely on flat ground. Near a box, allow a brief
         # positive speed error for jumping or climbing without rewarding it.
-        box_approach_distance = 0.8
-        box_exit_distance = 0.35
+        box_approach_distance = 0.5
+        box_exit_distance = 0.2
         box_lateral_margin = 0.2
-        box_speed_allowance = 0.4
-        flat_overspeed_margin = 0.2
-        box_overspeed_margin = 0.4
+        box_speed_allowance = 0.5
+        flat_speed_limit = 0.7
+        flat_severe_speed_limit = 0.8
+        box_speed_limit = 1.2
 
     class box_progress:
         pass_margin = 0.15
@@ -113,10 +112,12 @@ class Go2BoxParkourCfgPPO(Go2RoughCfgPPO):
         schedule = "fixed"
         learning_rate = 5e-5
         entropy_coef = 0.003
+        gamma = 0.999
+        lam = 0.95
 
     class runner(Go2RoughCfgPPO.runner):
         experiment_name = "go2_box_parkour"
-        run_name = "five_box_v7_speed_control_from11700"
+        run_name = "five_box_v8_pre_curriculum_from11700"
         resume = True
         load_run = osp.join(
             osp.dirname(osp.dirname(osp.dirname(osp.dirname(__file__)))),
@@ -125,5 +126,9 @@ class Go2BoxParkourCfgPPO(Go2RoughCfgPPO):
             "Jul19_23-03-03_five_box_v5_stable_from11000",
         )
         checkpoint = 11700
-        ckpt_manipulator = "reset_optimizer_state"
+        # Initial Critic migration is selected explicitly from the CLI. Keeping
+        # this disabled prevents later v8 resumes from resetting Critic again.
+        ckpt_manipulator = None
         max_iterations = 2000
+        save_interval = 250
+        log_interval = 50

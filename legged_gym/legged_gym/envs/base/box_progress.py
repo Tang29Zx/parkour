@@ -178,7 +178,7 @@ class BoxProgressTracker:
             self.landing_counter + 1,
             torch.zeros_like(self.landing_counter),
         )
-        self.success_buf[:] = all_feet_landed & (
+        landing_success = all_feet_landed & (
             self.landing_counter >= self.landing_steps
         )
 
@@ -187,7 +187,7 @@ class BoxProgressTracker:
             self.body_contact_counter + 1,
             torch.zeros_like(self.body_contact_counter),
         )
-        self.fall_buf[:] = (
+        raw_fall = (
             (roll.abs() > self.roll_threshold)
             | (pitch.abs() > self.pitch_threshold)
             | (base_height < self.base_height_threshold)
@@ -195,13 +195,23 @@ class BoxProgressTracker:
         )
 
         lateral_offset = (base_positions[:, 1] - env_origins[:, 1]).abs()
-        outside_course = (
+        raw_out_of_track = (
             (lateral_offset > self.lateral_limit)
             | (base_positions[:, 0] < track_start_x)
-            | ((base_positions[:, 0] > track_end_x) & ~self.success_buf)
+            | ((base_positions[:, 0] > track_end_x) & ~landing_success)
         )
-        self.out_of_track_buf[:] = outside_course
-        self.episode_timeout_buf[:] = natural_timeout & ~self.success_buf
+
+        # Terminal causes are mutually exclusive. Unsafe task failures take
+        # precedence over success, and natural timeout is considered only when
+        # neither a failure nor success happened on the same control step.
+        self.fall_buf[:] = raw_fall & ~self.missed_box_buf
+        self.out_of_track_buf[:] = (
+            raw_out_of_track & ~self.missed_box_buf & ~raw_fall
+        )
+        self.success_buf[:] = landing_success & ~self.failure_buf
+        self.episode_timeout_buf[:] = (
+            natural_timeout & ~self.failure_buf & ~self.success_buf
+        )
 
     def _get_top_contacts(
         self,
@@ -234,7 +244,6 @@ class BoxProgressTracker:
         return self.missed_box_buf | self.out_of_track_buf | self.fall_buf
 
     def apply_termination(self, reset_buf, time_out_buf):
-        """Apply failure and normal-success semantics to base environment buffers."""
-        time_out_buf |= self.success_buf
-        reset_buf |= self.failure_buf
-        reset_buf |= time_out_buf
+        """Apply exclusive failure, success, and natural-timeout semantics."""
+        time_out_buf.copy_(self.episode_timeout_buf)
+        reset_buf |= self.failure_buf | self.success_buf | time_out_buf

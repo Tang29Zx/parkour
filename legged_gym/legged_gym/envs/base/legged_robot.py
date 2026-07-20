@@ -1677,9 +1677,12 @@ class LeggedRobot(BaseTask):
     
     def _fill_extras(self, env_ids):
         self.extras["episode"] = {}
+        episode_lengths = self.episode_length_buf[env_ids].clamp_min(1)
         for key in self.episode_sums.keys():
             self.extras["episode"]['rew_' + key] = torch.mean(self.episode_sums[key][env_ids]) / self.max_episode_length_s
-            self.extras["episode"]['rew_frame_' + key] = torch.nanmean(self.episode_sums[key][env_ids] / self.episode_length_buf[env_ids])
+            self.extras["episode"]['rew_frame_' + key] = torch.mean(
+                self.episode_sums[key][env_ids] / episode_lengths
+            )
             self.episode_sums[key][env_ids] = 0.
         # log additional curriculum info
         if self.cfg.terrain.curriculum:

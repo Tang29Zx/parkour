@@ -40,8 +40,27 @@ class LeggedRobotBox(LeggedRobot):
         self.forward_speed_sum = torch.zeros(
             self.num_envs, dtype=torch.float, device=self.device
         )
-        self.max_forward_speed = torch.full(
-            (self.num_envs,), -torch.inf, dtype=torch.float, device=self.device
+        self.max_forward_speed = torch.zeros(
+            self.num_envs, dtype=torch.float, device=self.device
+        )
+        self.flat_forward_speed_sum = torch.zeros_like(self.forward_speed_sum)
+        self.flat_forward_speed_count = torch.zeros(
+            self.num_envs, dtype=torch.long, device=self.device
+        )
+        self.flat_forward_speed_max = torch.zeros_like(self.forward_speed_sum)
+        self.box_forward_speed_sum = torch.zeros_like(self.forward_speed_sum)
+        self.box_forward_speed_count = torch.zeros_like(
+            self.flat_forward_speed_count
+        )
+        self.box_forward_speed_max = torch.zeros_like(self.forward_speed_sum)
+        self.flat_overspeed_count = torch.zeros_like(
+            self.flat_forward_speed_count
+        )
+        self.flat_severe_overspeed_count = torch.zeros_like(
+            self.flat_forward_speed_count
+        )
+        self.box_overspeed_count = torch.zeros_like(
+            self.flat_forward_speed_count
         )
 
         rigid_body_names = self.gym.get_actor_rigid_body_names(
@@ -90,10 +109,104 @@ class LeggedRobotBox(LeggedRobot):
     def _post_physics_step_callback(self):
         super()._post_physics_step_callback()
         forward_speed = self.base_lin_vel[:, 0]
+        box_mask = self._near_box_for_speed_control()
+        self._update_speed_statistics(forward_speed, box_mask)
+
+    def _update_speed_statistics(self, forward_speed, box_mask):
+        """Accumulate finite whole-course and mutually exclusive region stats."""
+        flat_mask = ~box_mask
         self.forward_speed_sum += forward_speed
         self.max_forward_speed = torch.maximum(
             self.max_forward_speed, forward_speed
         )
+        self.flat_forward_speed_sum += torch.where(
+            flat_mask, forward_speed, torch.zeros_like(forward_speed)
+        )
+        self.flat_forward_speed_count += flat_mask
+        self.flat_forward_speed_max = torch.where(
+            flat_mask,
+            torch.maximum(self.flat_forward_speed_max, forward_speed),
+            self.flat_forward_speed_max,
+        )
+        self.box_forward_speed_sum += torch.where(
+            box_mask, forward_speed, torch.zeros_like(forward_speed)
+        )
+        self.box_forward_speed_count += box_mask
+        self.box_forward_speed_max = torch.where(
+            box_mask,
+            torch.maximum(self.box_forward_speed_max, forward_speed),
+            self.box_forward_speed_max,
+        )
+        rewards_cfg = self.cfg.rewards
+        self.flat_overspeed_count += flat_mask & (
+            forward_speed > rewards_cfg.flat_speed_limit
+        )
+        self.flat_severe_overspeed_count += flat_mask & (
+            forward_speed > rewards_cfg.flat_severe_speed_limit
+        )
+        self.box_overspeed_count += box_mask & (
+            forward_speed > rewards_cfg.box_speed_limit
+        )
+
+    def _get_speed_statistics(self, env_ids):
+        """Summarize completed episodes without zero-count divisions."""
+        episode_lengths = self.episode_length_buf[env_ids].clamp_min(1)
+        flat_count = self.flat_forward_speed_count[env_ids].sum()
+        box_count = self.box_forward_speed_count[env_ids].sum()
+        return {
+            "mean_forward_speed_mps": torch.mean(
+                self.forward_speed_sum[env_ids] / episode_lengths
+            ),
+            "max_forward_speed_mps": torch.max(
+                self.max_forward_speed[env_ids]
+            ),
+            "flat_forward_speed_mean_mps": (
+                self.flat_forward_speed_sum[env_ids].sum()
+                / flat_count.clamp_min(1)
+            ),
+            "flat_forward_speed_max_mps": torch.max(
+                self.flat_forward_speed_max[env_ids]
+            ),
+            "flat_speed_sample_count": (
+                self.flat_forward_speed_count[env_ids].float().mean()
+            ),
+            "flat_overspeed_ratio": (
+                self.flat_overspeed_count[env_ids].sum()
+                / flat_count.clamp_min(1)
+            ),
+            "flat_severe_overspeed_ratio": (
+                self.flat_severe_overspeed_count[env_ids].sum()
+                / flat_count.clamp_min(1)
+            ),
+            "box_forward_speed_mean_mps": (
+                self.box_forward_speed_sum[env_ids].sum()
+                / box_count.clamp_min(1)
+            ),
+            "box_forward_speed_max_mps": torch.max(
+                self.box_forward_speed_max[env_ids]
+            ),
+            "box_speed_sample_count": (
+                self.box_forward_speed_count[env_ids].float().mean()
+            ),
+            "box_overspeed_ratio": (
+                self.box_overspeed_count[env_ids].sum()
+                / box_count.clamp_min(1)
+            ),
+        }
+
+    def _reset_speed_statistics(self, env_ids):
+        """Clear speed accumulators for selected environments."""
+        self.forward_speed_sum[env_ids] = 0.0
+        self.max_forward_speed[env_ids] = 0.0
+        self.flat_forward_speed_sum[env_ids] = 0.0
+        self.flat_forward_speed_count[env_ids] = 0
+        self.flat_forward_speed_max[env_ids] = 0.0
+        self.box_forward_speed_sum[env_ids] = 0.0
+        self.box_forward_speed_count[env_ids] = 0
+        self.box_forward_speed_max[env_ids] = 0.0
+        self.flat_overspeed_count[env_ids] = 0
+        self.flat_severe_overspeed_count[env_ids] = 0
+        self.box_overspeed_count[env_ids] = 0
 
     def check_termination(self):
         super().check_termination()
@@ -149,13 +262,7 @@ class LeggedRobotBox(LeggedRobot):
             self.out_of_track_buf[env_ids].float().mean()
         )
         episode["fall_rate"] = self.fall_buf[env_ids].float().mean()
-        episode_lengths = self.episode_length_buf[env_ids].clamp_min(1)
-        episode["mean_forward_speed_mps"] = torch.mean(
-            self.forward_speed_sum[env_ids] / episode_lengths
-        )
-        episode["max_forward_speed_mps"] = torch.max(
-            self.max_forward_speed[env_ids]
-        )
+        episode.update(self._get_speed_statistics(env_ids))
         for box_idx in range(self.terrain.num_boxes):
             episode[f"box_{box_idx + 1}_pass_rate"] = (
                 (self.passed_box_count[env_ids] > box_idx).float().mean()
@@ -169,23 +276,29 @@ class LeggedRobotBox(LeggedRobot):
         if hasattr(self, "box_progress"):
             self.box_progress.reset(env_ids)
         if hasattr(self, "forward_speed_sum"):
-            self.forward_speed_sum[env_ids] = 0.0
-            self.max_forward_speed[env_ids] = -torch.inf
+            self._reset_speed_statistics(env_ids)
 
     def _near_box_for_speed_control(self):
-        """Return environments inside a short approach/exit window of any box."""
+        """Return environments inside the current target box speed window."""
         cfg = self.cfg.rewards
-        base_x = self.root_states[:, 0].unsqueeze(1)
-        base_y = self.root_states[:, 1].unsqueeze(1)
+        num_envs = self.root_states.shape[0]
+        env_ids = torch.arange(num_envs, device=self.root_states.device)
+        active = self.next_box_idx < self.env_box_bounds.shape[1]
+        target_indices = self.next_box_idx.clamp(
+            max=self.env_box_bounds.shape[1] - 1
+        )
+        target_bounds = self.env_box_bounds[env_ids, target_indices]
+        base_x = self.root_states[:, 0]
+        base_y = self.root_states[:, 1]
         near_x = (
-            (base_x >= self.env_box_bounds[:, :, 0] - cfg.box_approach_distance)
-            & (base_x <= self.env_box_bounds[:, :, 1] + cfg.box_exit_distance)
+            (base_x >= target_bounds[:, 0] - cfg.box_approach_distance)
+            & (base_x <= target_bounds[:, 1] + cfg.box_exit_distance)
         )
         near_y = (
-            (base_y >= self.env_box_bounds[:, :, 2] - cfg.box_lateral_margin)
-            & (base_y <= self.env_box_bounds[:, :, 3] + cfg.box_lateral_margin)
+            (base_y >= target_bounds[:, 2] - cfg.box_lateral_margin)
+            & (base_y <= target_bounds[:, 3] + cfg.box_lateral_margin)
         )
-        return torch.any(near_x & near_y, dim=1)
+        return active & near_x & near_y
 
     def _positive_speed_allowance(self):
         """Allow a small positive speed error only near a box."""
@@ -205,23 +318,25 @@ class LeggedRobotBox(LeggedRobot):
         return torch.square(adjusted_error)
 
     def _reward_overspeed(self):
-        """Quadratically penalize speed above the local flat/box margin."""
+        """Quadratically penalize speed above the local absolute limit."""
         near_box = self._near_box_for_speed_control()
-        margin = torch.where(
+        speed_limit = torch.where(
             near_box,
             torch.full_like(
                 self.base_lin_vel[:, 0],
-                self.cfg.rewards.box_overspeed_margin,
+                self.cfg.rewards.box_speed_limit,
             ),
             torch.full_like(
                 self.base_lin_vel[:, 0],
-                self.cfg.rewards.flat_overspeed_margin,
+                self.cfg.rewards.flat_speed_limit,
             ),
         )
-        excess_speed = torch.relu(
-            self.base_lin_vel[:, 0] - self.commands[:, 0] - margin
-        )
+        excess_speed = torch.relu(self.base_lin_vel[:, 0] - speed_limit)
         return torch.square(excess_speed)
+
+    def _reward_termination(self):
+        """Penalize only task failures, never success or natural timeout."""
+        return self.box_progress.failure_buf.float()
 
     def _reward_lin_pos_y(self):
         """Penalize lateral displacement from the course centerline."""
