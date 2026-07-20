@@ -157,14 +157,19 @@ def initialize_v11_from_v10_warmup(source_state_dict, algo_state_dict):
     return migrated
 
 
-def enable_v11_target_speed_finetune(source_state_dict, algo_state_dict):
-    """Preserve a healthy v11 checkpoint while relaxing its KL floor to 0.02."""
+def _enable_v11_finetune_with_kl_floor(
+    source_state_dict,
+    algo_state_dict,
+    required_minimum,
+    description,
+):
+    """Preserve a healthy v11 checkpoint and replace only its KL floor."""
     source_algorithm = source_state_dict.get("algorithm_state_dict", {})
     if source_algorithm.get("curriculum_state_version") != 11:
-        raise ValueError("Target-speed fine-tuning requires a v11 checkpoint.")
+        raise ValueError(f"{description} requires a v11 checkpoint.")
     if not source_algorithm.get("actor_finetune_active", False):
         raise ValueError(
-            "Target-speed fine-tuning requires an active Actor checkpoint."
+            f"{description} requires an active Actor checkpoint."
         )
     if source_state_dict.get("reference_model_state_dict") is None:
         raise ValueError("The source checkpoint has no frozen reference Actor.")
@@ -183,9 +188,10 @@ def enable_v11_target_speed_finetune(source_state_dict, algo_state_dict):
 
     target_algorithm = algo_state_dict["algorithm_state_dict"]
     target_minimum = float(target_algorithm["reference_kl_min_coef"])
-    if abs(target_minimum - 0.02) > 1e-12:
+    if abs(target_minimum - required_minimum) > 1e-12:
         raise ValueError(
-            "Target-speed fine-tuning requires reference_kl_min_coef=0.02."
+            f"{description} requires reference_kl_min_coef="
+            f"{required_minimum}."
         )
 
     migrated = copy.deepcopy(source_state_dict)
@@ -198,10 +204,31 @@ def enable_v11_target_speed_finetune(source_state_dict, algo_state_dict):
     migrated_algorithm["reference_kl_stable_window_count"] = 0
     print(
         "\033[1;36m Preserved the complete v11 checkpoint and enabled "
-        "target-speed fine-tuning with KL minimum/current coefficient 0.02. "
+        f"{description} with KL minimum/current coefficient "
+        f"{target_minimum}. "
         "\033[0m"
     )
     return migrated
+
+
+def enable_v11_target_speed_finetune(source_state_dict, algo_state_dict):
+    """Preserve a v11 checkpoint and use the historical 0.02 KL floor."""
+    return _enable_v11_finetune_with_kl_floor(
+        source_state_dict,
+        algo_state_dict,
+        required_minimum=0.02,
+        description="target-speed fine-tuning",
+    )
+
+
+def enable_v14_speed_priority_finetune(source_state_dict, algo_state_dict):
+    """Preserve a v11 checkpoint and start v14 with a 0.002 KL floor."""
+    return _enable_v11_finetune_with_kl_floor(
+        source_state_dict,
+        algo_state_dict,
+        required_minimum=0.002,
+        description="v14 speed-priority fine-tuning",
+    )
 
 
 def reinitialize_height_encoders(source_state_dict, algo_state_dict):

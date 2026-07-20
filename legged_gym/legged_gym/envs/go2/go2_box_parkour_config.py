@@ -58,7 +58,7 @@ class Go2BoxParkourCfg(DebugGo2BoxCfg):
     class rewards(DebugGo2BoxCfg.rewards):
         class scales:
             tracking_ang_vel = 0.2
-            forward_speed_tracking = 1.0
+            forward_speed_tracking = 2.0
             course_progress = 1000.0
             speed_error_square = -1.0
             overspeed = -1.5
@@ -85,7 +85,7 @@ class Go2BoxParkourCfg(DebugGo2BoxCfg):
             incomplete = -2000.0
 
         only_positive_rewards = False
-        forward_speed_tracking_sigma = 0.02
+        forward_speed_tracking_sigma = 0.25
         speed_penalty_initial_level = 0.1
         motion_quality_initial_level = 0.0
         # Track the command closely on flat ground. Near a box, allow a brief
@@ -142,7 +142,7 @@ class Go2BoxParkourCfgPPO(Go2RoughCfgPPO):
         actor_finetune_entropy_coef = 0.001
         # Adapt behavior protection from task capability rather than coupling
         # it directly to the active penalty level.
-        reference_kl_min_coef = 0.02
+        reference_kl_min_coef = 0.002
         reference_kl_max_coef = 1.0
         reference_kl_start_coef = 0.20
         reference_kl_stable_windows = 2
@@ -187,7 +187,7 @@ class Go2BoxParkourCfgPPO(Go2RoughCfgPPO):
 
     class runner(Go2RoughCfgPPO.runner):
         experiment_name = "go2_box_parkour"
-        run_name = "five_box_v11_speed_phase_from11800"
+        run_name = "five_box_v14_speed_priority_from14600"
         # Partial episodes generated at process startup do not represent the
         # checkpoint policy and must not drive the box curriculum or KL state.
         init_at_random_ep_len = False
@@ -196,11 +196,11 @@ class Go2BoxParkourCfgPPO(Go2RoughCfgPPO):
             osp.dirname(osp.dirname(osp.dirname(osp.dirname(__file__)))),
             "logs",
             "go2_box_parkour",
-            "Jul20_18-38-38_five_box_v10_retry3_warmup100_train900",
+            "Jul20_22-17-25_five_box_v13_from14400",
         )
-        checkpoint = 11800
-        # Initial Critic migration is selected explicitly from the CLI. Keeping
-        # this disabled prevents later v10 resumes from resetting Critic again.
+        checkpoint = 14600
+        # Select the v14 KL migration explicitly on the first CLI launch. Keep
+        # this disabled so later v14 resumes do not rewrite learned KL state.
         ckpt_manipulator = None
         max_iterations = 200
         save_interval = 100

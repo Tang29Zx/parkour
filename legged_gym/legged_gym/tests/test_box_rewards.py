@@ -337,6 +337,69 @@ class HeightEncoderMigrationTest(unittest.TestCase):
             source["algorithm_state_dict"]["reference_kl_min_coef"], 0.05
         )
 
+    def test_v14_speed_priority_preserves_checkpoint_and_sets_kl_floor(self):
+        model = OrderedDict(
+            [
+                ("actor.weight", torch.ones(2, 2)),
+                ("critic.weight", torch.full((1, 2), 2.0)),
+            ]
+        )
+        reference = {"actor.weight": torch.full((2, 2), 3.0)}
+        source = {
+            "model_state_dict": model,
+            "optimizer_state_dict": {"state": "trained"},
+            "reference_model_state_dict": reference,
+            "algorithm_state_dict": {
+                "curriculum_state_version": 11,
+                "actor_finetune_active": True,
+                "speed_penalty_level": 1.0,
+                "motion_quality_level": 0.0,
+                "reference_kl_min_coef": 0.02,
+                "reference_kl_max_coef": 1.0,
+                "current_reference_kl_coef": 0.02,
+                "reference_kl_stable_window_count": 1,
+            },
+            "iter": 14600,
+        }
+        target = {
+            "model_state_dict": OrderedDict(
+                (name, torch.zeros_like(value))
+                for name, value in model.items()
+            ),
+            "algorithm_state_dict": {
+                "reference_kl_min_coef": 0.002,
+                "reference_kl_max_coef": 1.0,
+            },
+        }
+
+        migrated = self.module.enable_v14_speed_priority_finetune(
+            source,
+            target,
+        )
+
+        for name, value in model.items():
+            self.assertTrue(
+                torch.equal(migrated["model_state_dict"][name], value)
+            )
+        self.assertTrue(
+            torch.equal(
+                migrated["reference_model_state_dict"]["actor.weight"],
+                reference["actor.weight"],
+            )
+        )
+        self.assertEqual(
+            migrated["optimizer_state_dict"], {"state": "trained"}
+        )
+        state = migrated["algorithm_state_dict"]
+        self.assertEqual(state["speed_penalty_level"], 1.0)
+        self.assertEqual(state["motion_quality_level"], 0.0)
+        self.assertEqual(state["reference_kl_min_coef"], 0.002)
+        self.assertEqual(state["current_reference_kl_coef"], 0.002)
+        self.assertEqual(state["reference_kl_stable_window_count"], 0)
+        self.assertEqual(
+            source["algorithm_state_dict"]["reference_kl_min_coef"], 0.02
+        )
+
     def test_target_speed_finetune_rejects_non_v11_checkpoint(self):
         source = {
             "model_state_dict": OrderedDict([("actor.weight", torch.ones(1))]),
@@ -539,7 +602,7 @@ class BoxRewardTest(unittest.TestCase):
         scales = self.env_cfg.rewards.scales
         expected_scales = {
             "tracking_ang_vel": 0.2,
-            "forward_speed_tracking": 1.0,
+            "forward_speed_tracking": 2.0,
             "speed_error_square": -1.0,
             "overspeed": -1.5,
             "action_rate": -0.01,
@@ -569,7 +632,7 @@ class BoxRewardTest(unittest.TestCase):
         self.assertAlmostEqual(scales.termination * dt, -40.0)
         self.assertAlmostEqual(scales.incomplete * dt, -40.0)
         self.assertEqual(
-            self.env_cfg.rewards.forward_speed_tracking_sigma, 0.02
+            self.env_cfg.rewards.forward_speed_tracking_sigma, 0.25
         )
         self.assertFalse(self.env_cfg.rewards.only_positive_rewards)
         self.assertFalse(hasattr(scales, "lazy_stop"))
@@ -633,7 +696,7 @@ class BoxRewardTest(unittest.TestCase):
             flat_speed_limit=0.7,
             flat_severe_speed_limit=0.8,
             box_speed_limit=1.2,
-            forward_speed_tracking_sigma=0.02,
+            forward_speed_tracking_sigma=0.25,
         )
         single_bounds = torch.tensor(
             [
@@ -784,9 +847,10 @@ class BoxRewardTest(unittest.TestCase):
         self.assertAlmostEqual(reward[0].item(), 1.0)
         self.assertGreater(reward[3].item(), 0.4)
         self.assertGreater(reward[4].item(), 0.6)
-        self.assertLess(reward[1].item(), 1e-5)
+        self.assertGreater(reward[1].item(), 0.3)
+        self.assertLess(reward[1].item(), 0.5)
         self.assertEqual(reward[2].item(), 0.0)
-        self.assertLess(reward[5].item(), 1e-5)
+        self.assertLess(reward[5].item(), 1e-3)
 
     def test_zero_yaw_error_has_zero_reward_and_deviation_is_negative(self):
         env = self.make_speed_reward_env()
@@ -1122,15 +1186,15 @@ class BoxRewardTest(unittest.TestCase):
         algorithm = self.train_cfg.algorithm
         self.assertFalse(runner.init_at_random_ep_len)
         self.assertTrue(runner.resume)
-        self.assertEqual(runner.checkpoint, 11800)
+        self.assertEqual(runner.checkpoint, 14600)
         self.assertEqual(
             runner.run_name,
-            "five_box_v11_speed_phase_from11800",
+            "five_box_v14_speed_priority_from14600",
         )
         self.assertIsNone(runner.ckpt_manipulator)
         self.assertTrue(
             runner.load_run.endswith(
-                "Jul20_18-38-38_five_box_v10_retry3_warmup100_train900"
+                "Jul20_22-17-25_five_box_v13_from14400"
             )
         )
         self.assertEqual(algorithm.schedule, "fixed")
@@ -1142,7 +1206,7 @@ class BoxRewardTest(unittest.TestCase):
         self.assertEqual(algorithm.actor_finetune_learning_rate, 1e-5)
         self.assertEqual(algorithm.actor_finetune_clip_param, 0.1)
         self.assertEqual(algorithm.actor_finetune_entropy_coef, 0.001)
-        self.assertEqual(algorithm.reference_kl_min_coef, 0.02)
+        self.assertEqual(algorithm.reference_kl_min_coef, 0.002)
         self.assertEqual(algorithm.reference_kl_max_coef, 1.0)
         self.assertEqual(algorithm.reference_kl_start_coef, 0.2)
         self.assertEqual(algorithm.speed_penalty_initial_level, 0.1)
