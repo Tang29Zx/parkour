@@ -2686,6 +2686,27 @@ class LeggedRobotBox(LeggedRobot):
         level = float(getattr(self, "speed_penalty_level", 1.0))
         return floor + (1.0 - floor) * level
 
+    def _task_quality_repair_gate(self):
+        """Enable one-box gait repair only for configured curriculum stages."""
+        rewards_cfg = self.cfg.rewards
+        minimum_stage = getattr(
+            rewards_cfg, "quality_repair_min_curriculum_stage", None
+        )
+        if (
+            minimum_stage is None
+            or not bool(getattr(self, "uses_task_curriculum", False))
+        ):
+            return torch.ones_like(self.episode_length_buf, dtype=torch.float)
+        return (
+            self.episode_curriculum_stage >= int(minimum_stage)
+        ).float()
+
+    def _flat_quality_repair_gate(self):
+        """Keep gait repair outside the active obstacle maneuver window."""
+        return self._task_quality_repair_gate() * (
+            1.0 - self._box_speed_blend()
+        )
+
     def _reward_speed_error_square(self):
         """Penalize command error while preserving a short box-speed allowance."""
         speed_error = self.base_lin_vel[:, 0] - self.commands[:, 0]
@@ -2734,9 +2755,15 @@ class LeggedRobotBox(LeggedRobot):
         action_rate = torch.sum(
             torch.square(self.last_actions - self.actions), dim=1
         )
+        spatial_gate = 1.0
+        if bool(
+            getattr(self.cfg.rewards, "action_rate_flat_only", False)
+        ):
+            spatial_gate = self._flat_quality_repair_gate()
         return (
             action_rate
             * (self.episode_length_buf > 1).float()
+            * spatial_gate
             * LeggedRobotBox._effective_motion_quality_level(
                 self, "action_rate_floor"
             )
@@ -2759,6 +2786,34 @@ class LeggedRobotBox(LeggedRobot):
                 self, "overspeed_floor"
             )
         )
+
+    def _reward_lateral_velocity_square(self):
+        """Penalize world-frame lateral motion away from the active box."""
+        return torch.square(self.root_states[:, 8]) * (
+            self._flat_quality_repair_gate()
+        )
+
+    def _reward_flat_lateral_position(self):
+        """Keep the base near the course center outside box maneuvers."""
+        lateral_offset = self.root_states[:, 1] - self.env_origins[:, 1]
+        return torch.abs(lateral_offset) * self._flat_quality_repair_gate()
+
+    def _reward_flat_yaw_abs(self):
+        """Keep world yaw aligned with the course outside box maneuvers."""
+        yaw = get_euler_xyz(self.root_states[:, 3:7])[2]
+        yaw = torch.atan2(torch.sin(yaw), torch.cos(yaw))
+        return torch.abs(yaw) * self._flat_quality_repair_gate()
+
+    def _reward_world_overspeed(self):
+        """Penalize excessive world-horizontal speed on flat ground."""
+        horizontal_speed = torch.linalg.vector_norm(
+            self.root_states[:, 7:9], dim=1
+        )
+        excess = torch.relu(
+            horizontal_speed
+            - float(self.cfg.rewards.quality_repair_flat_speed_limit)
+        )
+        return torch.square(excess) * self._flat_quality_repair_gate()
 
     def _reward_course_progress(self):
         """Return the non-repeatable normalized course-progress increment."""
@@ -2974,7 +3029,11 @@ class LeggedRobotBox(LeggedRobot):
                 > int(self.cfg.rewards.rear_support_window_steps)
             )
         )
-        return torch.square(deficit) * valid.float()
+        return (
+            torch.square(deficit)
+            * valid.float()
+            * self._task_quality_repair_gate()
+        )
 
     def _reward_flat_airborne(self):
         """Penalize excessive flat-ground flight without suppressing running."""
@@ -2991,7 +3050,11 @@ class LeggedRobotBox(LeggedRobot):
                 > int(self.cfg.rewards.rear_support_window_steps)
             )
         )
-        return torch.square(excess) * valid.float()
+        return (
+            torch.square(excess)
+            * valid.float()
+            * self._task_quality_repair_gate()
+        )
 
     def _reward_rear_upper_joint_excursion(self):
         """Return monitored rear-joint excess; Stage A gives it zero weight."""

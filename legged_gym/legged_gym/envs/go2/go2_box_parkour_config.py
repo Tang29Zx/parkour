@@ -88,6 +88,10 @@ class Go2BoxParkourCfg(DebugGo2BoxCfg):
             calf_collision = -0.2
             rear_support_missing = -0.2
             flat_airborne = -0.1
+            lateral_velocity_square = 0.0
+            flat_lateral_position = 0.0
+            flat_yaw_abs = 0.0
+            world_overspeed = 0.0
             rear_upper_joint_excursion = 0.0
             exceed_torque_limits_l1norm = -1.0
             box_front_foot_contact = 5.0
@@ -325,7 +329,7 @@ class Go2BoxParkour1BoxCfg(Go2BoxParkourCfg):
             landing_alignment_progress = 0.0
             speed_error_square = 0.0
             overspeed = -0.2
-            action_rate = 0.0
+            action_rate = -0.005
             flat_orientation = -0.1
             dof_vel = 0.0
             lin_pos_y = -0.1
@@ -337,8 +341,12 @@ class Go2BoxParkour1BoxCfg(Go2BoxParkourCfg):
             body_collision = -5.0
             thigh_collision = 0.0
             calf_collision = 0.0
-            rear_support_missing = 0.0
-            flat_airborne = 0.0
+            rear_support_missing = -0.2
+            flat_airborne = -0.2
+            lateral_velocity_square = -0.3
+            flat_lateral_position = -0.2
+            flat_yaw_abs = -0.2
+            world_overspeed = -0.5
             # Each progress reward is a normalized, non-repeatable high-water
             # increment. The configured values are the requested actual return
             # multiplied by 1 / dt = 50.
@@ -368,6 +376,13 @@ class Go2BoxParkour1BoxCfg(Go2BoxParkourCfg):
         foot_clearance_start_distance = 0.30
         foot_clearance_target_inset = 0.12
         post_front_base_target_fraction = 0.65
+        # Enable gait repair only after the front/rear contact stages have
+        # completed. The active box window remains unconstrained.
+        quality_repair_min_curriculum_stage = 2
+        action_rate_flat_only = True
+        quality_repair_flat_speed_limit = 1.2
+        action_rate_floor = 1.0
+        flat_airborne_free_ratio = 0.20
 
     class box_progress(Go2BoxParkourCfg.box_progress):
         required_boxes = 1
@@ -405,19 +420,19 @@ class Go2BoxParkour1BoxCfgPPO(Go2BoxParkourCfgPPO):
         reference_kl_start_coef = 0.0
 
     class runner(Go2BoxParkourCfgPPO.runner):
-        run_name = "one_box_abc_curriculum_from_rough2000"
+        run_name = "one_box_v184_gait_repair_from2500"
         init_at_random_ep_len = False
         resume = True
         load_run = osp.join(
             osp.dirname(osp.dirname(osp.dirname(osp.dirname(__file__)))),
             "logs",
-            "rough_go2",
-            "Jul19_13-30-09_hold_from_2000_to_10000",
+            "go2_box_parkour",
+            "Jul21_18-05-59_one_box_v183_from_rough2000",
         )
-        checkpoint = 2000
-        ckpt_manipulator = "initialize_one_box_from_rough2000"
-        max_iterations = 1000
-        save_interval = 100
+        checkpoint = 2500
+        ckpt_manipulator = None
+        max_iterations = 200
+        save_interval = 50
         log_interval = 50
 
 

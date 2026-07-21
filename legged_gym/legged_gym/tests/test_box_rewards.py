@@ -1434,6 +1434,48 @@ class BoxRewardTest(unittest.TestCase):
             0.0,
         )
 
+    def test_stage_c_gait_repair_skips_earlier_stages_and_box_window(self):
+        env = object.__new__(self.LeggedRobotBox)
+        env.uses_task_curriculum = True
+        env.episode_curriculum_stage = torch.tensor([1, 2, 2])
+        env.episode_length_buf = torch.full((3,), 2, dtype=torch.long)
+        env.root_states = torch.zeros(3, 13)
+        env.env_origins = torch.zeros(3, 3)
+        env.actions = torch.ones(3, 2)
+        env.last_actions = torch.zeros(3, 2)
+        env.motion_quality_level = 0.0
+        env._box_speed_blend = lambda: torch.tensor([0.0, 0.0, 1.0])
+        env.cfg = SimpleNamespace(
+            rewards=SimpleNamespace(
+                quality_repair_min_curriculum_stage=2,
+                quality_repair_flat_speed_limit=1.2,
+                action_rate_flat_only=True,
+                action_rate_floor=1.0,
+            )
+        )
+
+        env.root_states[:, 8] = 1.0
+        torch.testing.assert_close(
+            self.LeggedRobotBox._reward_lateral_velocity_square(env),
+            torch.tensor([0.0, 1.0, 0.0]),
+        )
+        env.root_states[:, 1] = 0.5
+        torch.testing.assert_close(
+            self.LeggedRobotBox._reward_flat_lateral_position(env),
+            torch.tensor([0.0, 0.5, 0.0]),
+        )
+        torch.testing.assert_close(
+            self.LeggedRobotBox._reward_action_rate(env),
+            torch.tensor([0.0, 2.0, 0.0]),
+        )
+
+        env.root_states[:, 7] = 2.0
+        env.root_states[:, 8] = 0.0
+        torch.testing.assert_close(
+            self.LeggedRobotBox._reward_world_overspeed(env),
+            torch.tensor([0.0, 0.64, 0.0]),
+        )
+
     def test_course_progress_reward_is_monotonic_and_non_repeatable(self):
         env = SimpleNamespace(
             task_progress_buf=torch.tensor([0.2]),
@@ -2250,6 +2292,13 @@ class BoxRewardTest(unittest.TestCase):
         self.assertEqual(scales.course_progress, 0.0)
         self.assertEqual(scales.speed_error_square, 0.0)
         self.assertEqual(scales.overspeed, -0.2)
+        self.assertEqual(scales.action_rate, -0.005)
+        self.assertEqual(scales.rear_support_missing, -0.2)
+        self.assertEqual(scales.flat_airborne, -0.2)
+        self.assertEqual(scales.lateral_velocity_square, -0.3)
+        self.assertEqual(scales.flat_lateral_position, -0.2)
+        self.assertEqual(scales.flat_yaw_abs, -0.2)
+        self.assertEqual(scales.world_overspeed, -0.5)
         self.assertEqual(scales.front_foot_lift_progress, 0.0)
         self.assertEqual(scales.front_foot_reach_progress, 0.0)
         self.assertEqual(scales.rear_foot_lift_progress, 0.0)
@@ -2292,21 +2341,18 @@ class BoxRewardTest(unittest.TestCase):
         runner = train_cfg.runner
         algorithm = train_cfg.algorithm
         self.assertTrue(runner.resume)
-        self.assertEqual(runner.checkpoint, 2000)
+        self.assertEqual(runner.checkpoint, 2500)
         self.assertTrue(
             runner.load_run.endswith(
-                "Jul19_13-30-09_hold_from_2000_to_10000"
+                "Jul21_18-05-59_one_box_v183_from_rough2000"
             )
         )
         self.assertEqual(
-            runner.run_name, "one_box_abc_curriculum_from_rough2000"
+            runner.run_name, "one_box_v184_gait_repair_from2500"
         )
-        self.assertEqual(
-            runner.ckpt_manipulator,
-            "initialize_one_box_from_rough2000",
-        )
-        self.assertEqual(runner.max_iterations, 1000)
-        self.assertEqual(runner.save_interval, 100)
+        self.assertIsNone(runner.ckpt_manipulator)
+        self.assertEqual(runner.max_iterations, 200)
+        self.assertEqual(runner.save_interval, 50)
         self.assertEqual(runner.log_interval, 50)
         self.assertEqual(algorithm.freeze_actor_encoder_iterations, 100)
         self.assertEqual(algorithm.actor_finetune_learning_rate, 2e-5)
@@ -2319,6 +2365,15 @@ class BoxRewardTest(unittest.TestCase):
         self.assertEqual(curriculum.full_height_layouts, (2, 3, 4, 5, 6))
         self.assertEqual(curriculum.promotion_success_rate, 0.65)
         self.assertEqual(env_cfg.box_progress.stagnation_steps, 125)
+        self.assertEqual(
+            env_cfg.rewards.quality_repair_min_curriculum_stage, 2
+        )
+        self.assertTrue(env_cfg.rewards.action_rate_flat_only)
+        self.assertEqual(
+            env_cfg.rewards.quality_repair_flat_speed_limit, 1.2
+        )
+        self.assertEqual(env_cfg.rewards.action_rate_floor, 1.0)
+        self.assertEqual(env_cfg.rewards.flat_airborne_free_ratio, 0.20)
 
     def test_three_and_five_box_tasks_keep_the_five_box_geometry(self):
         stages = (

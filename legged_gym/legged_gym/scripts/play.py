@@ -114,8 +114,31 @@ def play(args):
         env_cfg.env.episode_length_s = 60
         env_cfg.terrain.max_init_terrain_level = 0
         env_cfg.terrain.num_rows = 1
-        env_cfg.terrain.num_cols = 1
-        env_cfg.terrain.RandomBoxTrack_kwargs["num_unique_layouts"] = 1
+        task_curriculum_cfg = getattr(
+            env_cfg, "one_box_curriculum", None
+        )
+        uses_one_box_curriculum = bool(
+            task_curriculum_cfg is not None
+            and getattr(task_curriculum_cfg, "enabled", False)
+        )
+        if uses_one_box_curriculum:
+            layout_indices = tuple(
+                int(value)
+                for value in (
+                    tuple(task_curriculum_cfg.low_height_layouts)
+                    + tuple(task_curriculum_cfg.full_height_layouts)
+                )
+            )
+            required_layouts = max(layout_indices) + 1
+            env_cfg.terrain.num_cols = required_layouts
+            env_cfg.terrain.RandomBoxTrack_kwargs[
+                "num_unique_layouts"
+            ] = required_layouts
+        else:
+            env_cfg.terrain.num_cols = 1
+            env_cfg.terrain.RandomBoxTrack_kwargs[
+                "num_unique_layouts"
+            ] = 1
     else:
         env_cfg.env.num_envs = min(env_cfg.env.num_envs, 1)
         env_cfg.env.episode_length_s = 60
