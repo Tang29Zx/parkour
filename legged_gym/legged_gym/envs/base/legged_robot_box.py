@@ -70,6 +70,9 @@ class LeggedRobotBox(LeggedRobot):
                 progress_cfg.rear_contact_required_steps
             ),
             landing_steps=progress_cfg.landing_steps,
+            landing_min_forward_distance=getattr(
+                progress_cfg, "landing_min_forward_distance", 0.0
+            ),
             landing_min_current_feet=progress_cfg.landing_min_current_feet,
             landing_require_rear_foot=progress_cfg.landing_require_rear_foot,
             landing_roll_threshold=progress_cfg.landing_roll_threshold,
@@ -108,6 +111,9 @@ class LeggedRobotBox(LeggedRobot):
         )
         if self.landing_command_ramp_steps <= 0:
             raise ValueError("landing_command_ramp_steps must be positive.")
+        self.stop_command_after_course = bool(
+            getattr(progress_cfg, "stop_command_after_course", True)
+        )
         self.episode_command_x = torch.zeros(
             self.num_envs, dtype=torch.float, device=self.device
         )
@@ -481,6 +487,13 @@ class LeggedRobotBox(LeggedRobot):
         else:
             self.course_landing_end_x = self.track_end_x.clone()
         minimum_length = float(self.cfg.box_progress.min_landing_zone_length)
+        recovery_distance = float(
+            getattr(
+                self.cfg.box_progress,
+                "landing_min_forward_distance",
+                0.0,
+            )
+        )
         all_box_bounds = self.terrain.box_bounds_pyt
         all_course_rear = all_box_bounds[:, :, required_boxes - 1, 1]
         if required_boxes < self.terrain.num_boxes:
@@ -499,6 +512,12 @@ class LeggedRobotBox(LeggedRobot):
                 "The shortest course landing zone is "
                 f"{actual_minimum:.3f} m, below the configured minimum "
                 f"of {minimum_length:.3f} m."
+            )
+        if actual_minimum + 1e-6 < recovery_distance:
+            raise ValueError(
+                "The shortest course landing zone is "
+                f"{actual_minimum:.3f} m, below the configured recovery "
+                f"distance of {recovery_distance:.3f} m."
             )
 
     def _post_physics_step_callback(self):
@@ -1429,6 +1448,13 @@ class LeggedRobotBox(LeggedRobot):
         landing_phase = (
             self.next_box_idx >= self.box_progress.required_boxes
         )
+        if not bool(getattr(self, "stop_command_after_course", True)):
+            self.commands[landing_phase, 0] = self.episode_command_x[
+                landing_phase
+            ]
+            self.commands[landing_phase, 1] = 0.0
+            self.commands[landing_phase, 2] = 0.0
+            return
         ramp = torch.clamp(
             1.0
             - self.steps_in_landing_phase.float()
@@ -1911,11 +1937,21 @@ class LeggedRobotBox(LeggedRobot):
 
     def _reward_termination(self):
         """Penalize ordinary failure from -40 to -25 by spatial progress."""
+        rewards_cfg = getattr(getattr(self, "cfg", None), "rewards", None)
+        if not bool(
+            getattr(rewards_cfg, "failure_progress_scaling", True)
+        ):
+            return self.generic_failure_buf.float()
         progress_multiplier = 1.0 - 0.375 * self.task_progress_buf
         return self.generic_failure_buf.float() * progress_multiplier
 
     def _reward_incomplete(self):
         """Penalize the 45-second deadline from -40 to -30 by progress."""
+        rewards_cfg = getattr(getattr(self, "cfg", None), "rewards", None)
+        if not bool(
+            getattr(rewards_cfg, "failure_progress_scaling", True)
+        ):
+            return self.incomplete_buf.float()
         progress_multiplier = 1.0 - 0.25 * self.task_progress_buf
         return self.incomplete_buf.float() * progress_multiplier
 

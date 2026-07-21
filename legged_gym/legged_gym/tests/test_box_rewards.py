@@ -229,6 +229,96 @@ class HeightEncoderMigrationTest(unittest.TestCase):
                 dict(model_state_dict=target_model),
             )
 
+    def test_one_box_initializer_expands_actor_scan_and_resets_critic(self):
+        source_model = OrderedDict(
+            [
+                ("std", torch.full((2,), 1.0)),
+                ("actor.weight", torch.full((2, 2), 2.0)),
+                (
+                    "encoders.0.model.0.weight",
+                    torch.arange(12, dtype=torch.float32).reshape(3, 4),
+                ),
+                ("encoders.0.model.0.bias", torch.full((3,), 3.0)),
+                ("memory_a.rnn.weight", torch.full((2, 2), 4.0)),
+                ("memory_s.rnn.weight", torch.full((2, 2), 5.0)),
+                ("state_estimator.model.0.weight", torch.full((2, 2), 6.0)),
+                ("critic.weight", torch.full((2, 2), 7.0)),
+                ("memory_c.rnn.weight", torch.full((2, 2), 8.0)),
+                (
+                    "critic_encoders.0.model.0.weight",
+                    torch.full((3, 4), 9.0),
+                ),
+            ]
+        )
+        target_model = OrderedDict(
+            (
+                name,
+                (
+                    torch.full((3, 12), 99.0)
+                    if name.endswith("encoders.0.model.0.weight")
+                    else torch.full_like(value, 99.0)
+                ),
+            )
+            for name, value in source_model.items()
+        )
+        source = dict(
+            model_state_dict=source_model,
+            optimizer_state_dict={"old": True},
+            lr_scheduler_state_dict={"old": True},
+            iter=2000,
+            infos={"source": "rough"},
+        )
+
+        migrated = self.module.initialize_one_box_from_rough2000(
+            source,
+            dict(model_state_dict=target_model),
+            source_grid_shape=(2, 2),
+            target_grid_shape=(3, 4),
+        )
+
+        actor_grid = migrated["model_state_dict"][
+            "encoders.0.model.0.weight"
+        ].reshape(3, 3, 4)
+        source_grid = source_model[
+            "encoders.0.model.0.weight"
+        ].reshape(3, 2, 2)
+        self.assertTrue(torch.equal(actor_grid[:, :2, 1:3], source_grid))
+        extra_mask = torch.ones(3, 4, dtype=torch.bool)
+        extra_mask[:2, 1:3] = False
+        self.assertTrue((actor_grid[:, extra_mask] == 0.0).all())
+
+        for name in (
+            "std",
+            "actor.weight",
+            "encoders.0.model.0.bias",
+            "memory_a.rnn.weight",
+            "memory_s.rnn.weight",
+            "state_estimator.model.0.weight",
+        ):
+            self.assertTrue(
+                torch.equal(migrated["model_state_dict"][name], source_model[name])
+            )
+        for name in (
+            "critic.weight",
+            "memory_c.rnn.weight",
+            "critic_encoders.0.model.0.weight",
+        ):
+            self.assertTrue(
+                torch.equal(migrated["model_state_dict"][name], target_model[name])
+            )
+        self.assertNotIn("optimizer_state_dict", migrated)
+        self.assertNotIn("lr_scheduler_state_dict", migrated)
+        self.assertEqual(migrated["iter"], 2000)
+
+        source["iter"] = 1999
+        with self.assertRaises(ValueError):
+            self.module.initialize_one_box_from_rough2000(
+                source,
+                dict(model_state_dict=target_model),
+                source_grid_shape=(2, 2),
+                target_grid_shape=(3, 4),
+            )
+
     def test_v11_initializer_preserves_verified_warmup_checkpoint(self):
         model = OrderedDict(
             [("actor.weight", torch.ones(2, 2)), ("critic.weight", torch.ones(1, 2))]
@@ -715,6 +805,26 @@ class BoxRewardTest(unittest.TestCase):
             termination, torch.tensor([0.0, 0.0, 0.90625])
         )
 
+    def test_one_box_failure_rewards_do_not_shrink_with_progress(self):
+        env = SimpleNamespace(
+            cfg=SimpleNamespace(
+                rewards=SimpleNamespace(failure_progress_scaling=False)
+            ),
+            generic_failure_buf=torch.tensor([True, True, False]),
+            incomplete_buf=torch.tensor([False, True, True]),
+            task_progress_buf=torch.tensor([0.0, 0.95, 1.0]),
+        )
+
+        termination = self.LeggedRobotBox._reward_termination(env)
+        incomplete = self.LeggedRobotBox._reward_incomplete(env)
+
+        torch.testing.assert_close(
+            termination, torch.tensor([1.0, 1.0, 0.0])
+        )
+        torch.testing.assert_close(
+            incomplete, torch.tensor([0.0, 1.0, 1.0])
+        )
+
     def test_landing_terminal_rewards_are_exclusive_and_have_stage_a_values(self):
         env = SimpleNamespace(
             landing_timeout_buf=torch.tensor([True, False, False]),
@@ -810,6 +920,24 @@ class BoxRewardTest(unittest.TestCase):
         env.commands[-1, 0] = 0.5
         self.LeggedRobotBox._apply_landing_commands(env)
         self.assertEqual(env.commands[-1, 0].item(), 0.0)
+
+    def test_one_box_landing_keeps_the_episode_forward_command(self):
+        env = SimpleNamespace(
+            next_box_idx=torch.tensor([0, 1]),
+            box_progress=SimpleNamespace(required_boxes=1),
+            stop_command_after_course=False,
+            episode_command_x=torch.tensor([0.5, 0.55]),
+            commands=torch.tensor(
+                [[0.5, 0.0, 0.0], [0.0, 0.2, 0.3]]
+            ),
+        )
+
+        self.LeggedRobotBox._apply_landing_commands(env)
+
+        torch.testing.assert_close(
+            env.commands,
+            torch.tensor([[0.5, 0.0, 0.0], [0.55, 0.0, 0.0]]),
+        )
 
     def test_episode_command_is_saved_for_reset_environments(self):
         env = object.__new__(self.LeggedRobotBox)
@@ -1682,9 +1810,84 @@ class BoxRewardTest(unittest.TestCase):
         self.assertGreater(commands.resampling_time, self.env_cfg.env.episode_length_s)
         self.assertEqual(self.env_cfg.env.episode_length_s, 45)
 
-    def test_curriculum_stage_configs_keep_the_five_box_geometry(self):
+    def test_one_box_task_uses_dedicated_geometry_and_training_source(self):
+        env_cfg = self.one_box_cfg
+        train_cfg = self.one_box_train_cfg
+        terrain = env_cfg.terrain.RandomBoxTrack_kwargs
+
+        self.assertEqual(env_cfg.box_progress.required_boxes, 1)
+        self.assertEqual(env_cfg.env.episode_length_s, 15)
+        self.assertEqual(terrain["track_length"], 5.5)
+        self.assertEqual(terrain["track_width"], 2.0)
+        self.assertEqual(terrain["spawn_margin"], 0.6)
+        self.assertEqual(terrain["first_gap_range"], (1.2, 1.5))
+        self.assertEqual(len(terrain["boxes"]), 1)
+        self.assertEqual(
+            terrain["boxes"][0]["height_choices"],
+            (0.15, 0.20, 0.25, 0.30),
+        )
+        self.assertEqual(env_cfg.box_progress.min_landing_zone_length, 2.0)
+        self.assertEqual(
+            env_cfg.box_progress.landing_min_forward_distance, 0.6
+        )
+        self.assertEqual(
+            env_cfg.box_progress.landing_horizontal_speed_threshold, 1.2
+        )
+        self.assertEqual(
+            env_cfg.box_progress.landing_lateral_speed_threshold, 0.35
+        )
+        self.assertEqual(env_cfg.box_progress.landing_deadline_steps, 200)
+        self.assertFalse(env_cfg.box_progress.stop_command_after_course)
+
+        scales = env_cfg.rewards.scales
+        self.assertEqual(scales.forward_speed_tracking, 0.5)
+        self.assertEqual(scales.course_progress, 1000.0)
+        self.assertEqual(scales.speed_error_square, 0.0)
+        self.assertEqual(scales.overspeed, 0.0)
+        for name in (
+            "landing_quality_progress",
+            "landing_hold_progress",
+            "landing_deceleration_progress",
+            "landing_alignment_progress",
+        ):
+            self.assertEqual(getattr(scales, name), 0.0)
+        self.assertAlmostEqual(scales.success * 0.02, 10.0)
+        for name in (
+            "termination",
+            "landing_overrun",
+            "landing_lateral_exit",
+            "landing_timeout",
+            "incomplete",
+        ):
+            self.assertAlmostEqual(getattr(scales, name) * 0.02, -40.0)
+        self.assertFalse(env_cfg.rewards.failure_progress_scaling)
+        self.assertEqual(
+            env_cfg.rewards.reward_order_mode,
+            "success_above_failures",
+        )
+
+        runner = train_cfg.runner
+        algorithm = train_cfg.algorithm
+        self.assertTrue(runner.resume)
+        self.assertEqual(runner.checkpoint, 2000)
+        self.assertTrue(
+            runner.load_run.endswith(
+                "Jul19_13-30-09_hold_from_2000_to_10000"
+            )
+        )
+        self.assertEqual(runner.run_name, "one_box_clean_gait_from_rough2000")
+        self.assertIsNone(runner.ckpt_manipulator)
+        self.assertEqual(runner.max_iterations, 1000)
+        self.assertEqual(runner.save_interval, 100)
+        self.assertEqual(runner.log_interval, 10)
+        self.assertEqual(algorithm.freeze_actor_encoder_iterations, 100)
+        self.assertEqual(algorithm.actor_finetune_learning_rate, 2e-5)
+        self.assertEqual(algorithm.reference_kl_min_coef, 0.01)
+        self.assertEqual(algorithm.reference_kl_start_coef, 0.05)
+        self.assertEqual(algorithm.reference_kl_max_coef, 0.20)
+
+    def test_three_and_five_box_tasks_keep_the_five_box_geometry(self):
         stages = (
-            (self.one_box_cfg, self.one_box_train_cfg, 1, 15, "one_box"),
             (
                 self.three_box_cfg,
                 self.three_box_train_cfg,
@@ -1707,11 +1910,8 @@ class BoxRewardTest(unittest.TestCase):
             self.assertEqual(len(reference_boxes), 5)
             self.assertTrue(train_cfg.runner.run_name.startswith(run_prefix))
 
-        self.assertFalse(self.one_box_train_cfg.runner.resume)
         self.assertFalse(self.three_box_train_cfg.runner.resume)
-        self.assertIsNone(self.one_box_train_cfg.runner.ckpt_manipulator)
         self.assertIsNone(self.three_box_train_cfg.runner.ckpt_manipulator)
-        self.assertEqual(self.one_box_train_cfg.runner.max_iterations, 1000)
         self.assertEqual(self.three_box_train_cfg.runner.max_iterations, 1000)
 
     def test_curriculum_tasks_are_registered_with_the_box_environment(self):

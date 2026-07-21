@@ -267,6 +267,59 @@ class RandomBoxTrackTest(unittest.TestCase):
         self.assertEqual(set(signatures), {0, 1, 2, 3})
         self.assertEqual(len(set(signatures.values())), 4)
 
+    def test_one_box_height_choices_cycle_across_four_layouts(self):
+        one_box_cfg = deepcopy(self.cfg)
+        one_box_cfg.RandomBoxTrack_kwargs.update(
+            randomize=True,
+            num_unique_layouts=4,
+            track_length=5.5,
+            first_gap_range=(1.2, 1.5),
+            boxes=[
+                dict(
+                    gap=1.2,
+                    length=1.2,
+                    width=1.2,
+                    height=0.20,
+                    height_choices=(0.15, 0.20, 0.25, 0.30),
+                    lateral_offset=0.0,
+                )
+            ],
+        )
+
+        terrain = self.RandomBoxTrack(one_box_cfg, num_robots=4096)
+        layouts = terrain.layout_metadata[0]
+        self.assertEqual(terrain.num_boxes, 1)
+        self.np.testing.assert_allclose(
+            [layout["boxes"][0]["box_max"][2] for layout in layouts],
+            [0.15, 0.20, 0.25, 0.30],
+        )
+        for layout in layouts:
+            self.assertEqual(len(layout["boxes"]), 1)
+            self.assertTrue(layout["layout_id"].startswith("random_1_box"))
+            box = layout["boxes"][0]
+            self.assertGreaterEqual(box["gap"], 1.2 - 1e-8)
+            self.assertLessEqual(box["gap"], 1.5 + 1e-8)
+            track_end = (
+                layout["spawn_position"][0]
+                - one_box_cfg.RandomBoxTrack_kwargs["spawn_margin"]
+                + terrain.env_length
+            )
+            self.assertGreaterEqual(
+                track_end - box["box_max"][0], 2.2 - 1e-6
+            )
+
+    def test_height_choices_are_validated(self):
+        invalid_cfg = deepcopy(self.cfg)
+        invalid_cfg.RandomBoxTrack_kwargs["boxes"][0]["height_choices"] = []
+        with self.assertRaises(ValueError):
+            self.RandomBoxTrack(invalid_cfg, num_robots=4)
+
+        invalid_cfg.RandomBoxTrack_kwargs["boxes"][0]["height_choices"] = (
+            0.201,
+        )
+        with self.assertRaises(ValueError):
+            self.RandomBoxTrack(invalid_cfg, num_robots=4)
+
     def test_repeated_layout_count_is_validated(self):
         invalid_cfg = deepcopy(self.cfg)
         invalid_cfg.RandomBoxTrack_kwargs["num_unique_layouts"] = 0

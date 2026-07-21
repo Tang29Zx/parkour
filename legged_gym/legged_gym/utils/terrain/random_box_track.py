@@ -136,6 +136,27 @@ class RandomBoxTrack:
                 )
             if float(box["gap"]) < 0.0:
                 raise ValueError(f"Box {box_idx} gap must be non-negative.")
+            height_choices = box.get("height_choices")
+            if height_choices is not None:
+                if not isinstance(height_choices, (list, tuple)):
+                    raise TypeError(
+                        f"Box {box_idx} height_choices must be a list or tuple."
+                    )
+                if not height_choices:
+                    raise ValueError(
+                        f"Box {box_idx} height_choices must not be empty."
+                    )
+                for choice_idx, height in enumerate(height_choices):
+                    if float(height) <= 0.0:
+                        raise ValueError(
+                            f"Box {box_idx} height_choices[{choice_idx}] "
+                            "must be positive."
+                        )
+                    self._as_cells(
+                        height,
+                        self.cfg.vertical_scale,
+                        f"boxes[{box_idx}].height_choices[{choice_idx}]",
+                    )
 
             if self.track_kwargs["randomize"]:
                 if box_idx == 0:
@@ -299,6 +320,13 @@ class RandomBoxTrack:
                 forward_distance = 0.0
                 previous_height = 0.0
                 for box_idx, box in enumerate(self.track_kwargs["boxes"]):
+                    height_choices = box.get("height_choices")
+                    if height_choices is None:
+                        box_height = float(box["height"])
+                    else:
+                        box_height = float(
+                            height_choices[layout_idx % len(height_choices)]
+                        )
                     gap, gap_type = self._sample_gap(
                         rng, box_idx, previous_height
                     )
@@ -315,7 +343,7 @@ class RandomBoxTrack:
                         gap_type=gap_type,
                         length=float(box["length"]),
                         width=float(box["width"]),
-                        height=float(box["height"]),
+                        height=box_height,
                         lateral_offset=float(box["lateral_offset"]),
                         front_distance_px=self._as_cells(
                             forward_distance,
@@ -333,7 +361,7 @@ class RandomBoxTrack:
                             f"boxes[{box_idx}].width",
                         ),
                         height_px=self._as_cells(
-                            box["height"],
+                            box_height,
                             vertical_scale,
                             f"boxes[{box_idx}].height",
                         ),
@@ -350,7 +378,7 @@ class RandomBoxTrack:
                         spec["height"],
                     ]
                     forward_distance += float(box["length"])
-                    previous_height = float(box["height"])
+                    previous_height = box_height
                 self.box_specs_by_track[row_idx][col_idx] = box_specs
 
                 box_metadata = []
@@ -417,7 +445,9 @@ class RandomBoxTrack:
                     dict(
                         layout_id=(
                             f"{'random' if self.track_kwargs['randomize'] else 'fixed'}"
-                            f"_five_box_v1_layout{layout_idx}_r{row_idx}_c{col_idx}"
+                            f"_{'five' if self.num_boxes == 5 else self.num_boxes}_box"
+                            f"_v1_layout{layout_idx}"
+                            f"_r{row_idx}_c{col_idx}"
                         ),
                         layout_index=layout_idx,
                         physical_track_index=physical_track_idx,

@@ -96,6 +96,103 @@ def reset_critic_and_optimizer(source_state_dict, algo_state_dict):
     )
 
 
+def initialize_one_box_from_rough2000(
+    source_state_dict,
+    algo_state_dict,
+    source_grid_shape=(21, 11),
+    target_grid_shape=(36, 17),
+):
+    """Expand the rough Actor scan and reset the complete Critic side."""
+    if int(source_state_dict.get("iter", -1)) != 2000:
+        raise ValueError(
+            "One-box initialization requires the rough model_2000.pt "
+            "checkpoint."
+        )
+
+    critic_prefixes = ("critic.", "memory_c.", "critic_encoders.")
+    actor_input_key = "encoders.0.model.0.weight"
+    source_model = source_state_dict["model_state_dict"]
+    target_model = algo_state_dict["model_state_dict"]
+    source_keys = set(source_model)
+    target_keys = set(target_model)
+    if source_keys != target_keys:
+        missing = sorted(target_keys - source_keys)
+        unexpected = sorted(source_keys - target_keys)
+        raise KeyError(
+            "Checkpoint model keys do not match the one-box model. "
+            f"Missing: {missing}; unexpected: {unexpected}."
+        )
+    if actor_input_key not in target_model:
+        raise KeyError(
+            f"Target model has no Actor height input {actor_input_key!r}."
+        )
+    for prefix in critic_prefixes:
+        if not any(key.startswith(prefix) for key in target_model):
+            raise KeyError(f"Target model has no parameters under {prefix!r}.")
+
+    source_x, source_y = map(int, source_grid_shape)
+    target_x, target_y = map(int, target_grid_shape)
+    lateral_padding = target_y - source_y
+    if target_x < source_x or lateral_padding < 0 or lateral_padding % 2:
+        raise ValueError(
+            "The one-box height grid must contain the centered rough grid."
+        )
+    target_y_start = lateral_padding // 2
+    source_input = source_model[actor_input_key]
+    target_input = target_model[actor_input_key]
+    expected_source_shape = (target_input.shape[0], source_x * source_y)
+    expected_target_shape = (target_input.shape[0], target_x * target_y)
+    if tuple(source_input.shape) != expected_source_shape:
+        raise ValueError(
+            f"Actor height input has source shape {tuple(source_input.shape)}, "
+            f"expected {expected_source_shape}."
+        )
+    if tuple(target_input.shape) != expected_target_shape:
+        raise ValueError(
+            f"Actor height input has target shape {tuple(target_input.shape)}, "
+            f"expected {expected_target_shape}."
+        )
+
+    new_model_state_dict = OrderedDict()
+    for key, target_value in target_model.items():
+        source_value = source_model[key]
+        if key.startswith(critic_prefixes):
+            new_model_state_dict[key] = target_value
+            continue
+        if key == actor_input_key:
+            expanded_value = torch.zeros_like(target_value)
+            expanded_grid = expanded_value.reshape(
+                target_value.shape[0], target_x, target_y
+            )
+            source_grid = source_value.to(
+                device=target_value.device,
+                dtype=target_value.dtype,
+            ).reshape(source_value.shape[0], source_x, source_y)
+            expanded_grid[
+                :, :source_x, target_y_start : target_y_start + source_y
+            ] = source_grid
+            new_model_state_dict[key] = expanded_value
+            continue
+        if source_value.shape != target_value.shape:
+            raise ValueError(
+                f"Preserved parameter {key!r} has incompatible shapes: "
+                f"checkpoint {tuple(source_value.shape)} versus target "
+                f"{tuple(target_value.shape)}."
+            )
+        new_model_state_dict[key] = source_value
+
+    print(
+        "\033[1;36m Expanded the rough Actor height encoder; kept Actor, "
+        "Actor memory, estimator, and action noise; reinitialized the "
+        "complete Critic side and optimizer. \033[0m"
+    )
+    return dict(
+        model_state_dict=new_model_state_dict,
+        iter=source_state_dict["iter"],
+        infos=source_state_dict.get("infos"),
+    )
+
+
 def initialize_v11_from_v10_warmup(source_state_dict, algo_state_dict):
     """Initialize v11 curriculum state from the verified v10 warmup boundary."""
     if int(source_state_dict.get("iter", -1)) != 11800:

@@ -124,7 +124,11 @@ class OnPolicyRunner:
             return abs(float(left) - float(right)) <= 1e-8
         return left == right
 
-    def _verify_actor_runtime_config(self, checkpoint_path):
+    def _verify_actor_runtime_config(
+        self,
+        checkpoint_path,
+        allow_height_grid_expansion=False,
+    ):
         """Reject runtime transforms that would change an identical Actor."""
         config_path = os.path.join(
             os.path.dirname(os.path.abspath(checkpoint_path)), "config.json"
@@ -152,7 +156,44 @@ class OnPolicyRunner:
             ("init_state", "default_joint_angles"),
         )
         mismatches = []
+        height_paths = {
+            ("terrain", "measured_points_x"),
+            ("terrain", "measured_points_y"),
+        }
+        if allow_height_grid_expansion:
+            try:
+                source_x = source["terrain"]["measured_points_x"]
+                source_y = source["terrain"]["measured_points_y"]
+                target_x = self.env.cfg.terrain.measured_points_x
+                target_y = self.env.cfg.terrain.measured_points_y
+                lateral_padding = len(target_y) - len(source_y)
+                aligned = (
+                    len(target_x) >= len(source_x)
+                    and lateral_padding >= 0
+                    and lateral_padding % 2 == 0
+                    and self._config_values_equal(
+                        source_x, target_x[: len(source_x)]
+                    )
+                    and self._config_values_equal(
+                        source_y,
+                        target_y[
+                            lateral_padding // 2 :
+                            lateral_padding // 2 + len(source_y)
+                        ],
+                    )
+                )
+            except (AttributeError, KeyError, TypeError):
+                aligned = False
+            if not aligned:
+                mismatches.append(
+                    (
+                        "terrain.measured_points",
+                        "source grid is not aligned inside the target grid",
+                    )
+                )
         for path in paths:
+            if allow_height_grid_expansion and path in height_paths:
+                continue
             source_value = source
             current_value = self.env.cfg
             try:
@@ -195,9 +236,15 @@ class OnPolicyRunner:
                 "Actor runtime configuration is incompatible with the "
                 f"checkpoint: {detail}."
             )
+        expansion_note = (
+            " with an aligned height-grid expansion"
+            if allow_height_grid_expansion
+            else ""
+        )
         print(
-            "Verified Actor runtime compatibility: observations, scaling, "
-            "history inputs, action scale, default pose, and PD gains match."
+            "Verified Actor runtime compatibility"
+            f"{expansion_note}: observations, scaling, history inputs, "
+            "action scale, default pose, and PD gains match."
         )
         return True
 
@@ -374,16 +421,29 @@ class OnPolicyRunner:
             summary["raw/late_minus_early_failure_return"] = torch.tensor(
                 late_return - early_return, device=self.device
             )
-            summary["reward_order_ok"] = torch.tensor(
-                float(
+            env_cfg = getattr(getattr(self, "env", None), "cfg", None)
+            rewards_cfg = getattr(env_cfg, "rewards", None)
+            reward_order_mode = getattr(
+                rewards_cfg, "reward_order_mode", "ordered_failures"
+            )
+            if reward_order_mode == "success_above_failures":
+                reward_order_ok = success_return > best_failure_return
+            elif reward_order_mode == "ordered_failures":
+                reward_order_ok = (
                     success_return > landing_timeout_return
                     and landing_timeout_return > overrun_return
                     and overrun_return > lateral_exit_return
                     and success_return > late_return
                     and lateral_exit_return > early_return
                     and late_return > early_return
-                ),
-                device=self.device,
+                )
+            else:
+                raise ValueError(
+                    "Unknown rewards.reward_order_mode "
+                    f"{reward_order_mode!r}."
+                )
+            summary["reward_order_ok"] = torch.tensor(
+                float(reward_order_ok), device=self.device
             )
         else:
             summary["reward_order_ok"] = torch.tensor(1.0, device=self.device)
@@ -410,10 +470,13 @@ class OnPolicyRunner:
         return summary
 
     def _get_quality_window(self, episode_summary):
+        final_box_key = "box_{}_pass_rate".format(
+            self.env.box_progress.required_boxes
+        )
         required = (
             "num_terminated",
             "success_rate",
-            "box_5_pass_rate",
+            final_box_key,
             "fall_rate",
             "flat_forward_speed_mean_mps",
             "flat_severe_overspeed_ratio",
@@ -433,7 +496,7 @@ class OnPolicyRunner:
             episode_count=episode_count,
             success_rate=self._scalar(episode_summary["success_rate"]),
             box_pass_rate=self._scalar(
-                episode_summary["box_5_pass_rate"]
+                episode_summary[final_box_key]
             ),
             fall_rate=self._scalar(episode_summary["fall_rate"]),
             flat_speed_mean=self._scalar(
@@ -762,11 +825,17 @@ class OnPolicyRunner:
         torch.save(run_state_dict, path)
 
     def load(self, path, load_optimizer=True):
+        manipulator_name = self.cfg.get("ckpt_manipulator", False)
+        expands_rough_height_grid = (
+            manipulator_name == "initialize_one_box_from_rough2000"
+        )
         self.actor_runtime_config_compatible = (
-            self._verify_actor_runtime_config(path)
+            self._verify_actor_runtime_config(
+                path,
+                allow_height_grid_expansion=expands_rough_height_grid,
+            )
         )
         loaded_dict = torch.load(path, map_location=self.device)
-        manipulator_name = self.cfg.get("ckpt_manipulator", False)
         if manipulator_name:
             # suppose to be a string specifying which function to use
             print("\033[1;36m Warning: using a hacky way to load the model. \033[0m")
@@ -780,7 +849,10 @@ class OnPolicyRunner:
             allow_missing_curriculum_state=bool(manipulator_name),
         )
         self.current_learning_iteration = loaded_dict['iter']
-        if manipulator_name == "reset_critic_and_optimizer":
+        if manipulator_name in {
+            "reset_critic_and_optimizer",
+            "initialize_one_box_from_rough2000",
+        }:
             self.alg.start_critic_warmup(self.current_learning_iteration)
             self.alg.set_quality_levels(0.0, 0.0)
             if self.alg.reference_kl_max_coef > 0.0:

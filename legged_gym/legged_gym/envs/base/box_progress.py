@@ -23,6 +23,7 @@ class BoxProgressTracker:
         front_contact_required_steps=2,
         rear_contact_required_steps=2,
         landing_steps=10,
+        landing_min_forward_distance=0.0,
         landing_min_current_feet=2,
         landing_require_rear_foot=True,
         landing_roll_threshold=0.35,
@@ -55,6 +56,10 @@ class BoxProgressTracker:
             raise ValueError("Box contact requirements must be positive.")
         if landing_steps <= 0:
             raise ValueError("landing_steps must be positive.")
+        if landing_min_forward_distance < 0.0:
+            raise ValueError(
+                "landing_min_forward_distance must be non-negative."
+            )
         if not 1 <= landing_min_current_feet <= num_feet:
             raise ValueError(
                 "landing_min_current_feet must be between 1 and num_feet."
@@ -94,6 +99,9 @@ class BoxProgressTracker:
         self.front_contact_required_steps = int(front_contact_required_steps)
         self.rear_contact_required_steps = int(rear_contact_required_steps)
         self.landing_steps = int(landing_steps)
+        self.landing_min_forward_distance = float(
+            landing_min_forward_distance
+        )
         self.landing_min_current_feet = int(landing_min_current_feet)
         self.landing_require_rear_foot = bool(landing_require_rear_foot)
         self.landing_roll_threshold = float(landing_roll_threshold)
@@ -427,7 +435,10 @@ class BoxProgressTracker:
         )
         in_landing_zone = (
             course_complete
-            & (base_positions[:, 0] > course_rear)
+            & (
+                base_positions[:, 0]
+                > course_rear + self.landing_min_forward_distance
+            )
             & (base_positions[:, 0] < landing_end_x)
             & (
                 torch.abs(base_positions[:, 1] - env_origins[:, 1])

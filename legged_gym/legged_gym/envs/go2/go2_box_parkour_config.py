@@ -257,24 +257,108 @@ class Go2BoxParkourCfgPPO(Go2RoughCfgPPO):
 
 
 class Go2BoxParkour1BoxCfg(Go2BoxParkourCfg):
-    """One-box curriculum stage on the unchanged five-box terrain."""
+    """Dedicated one-box task for learning clean obstacle traversal."""
 
     class env(Go2BoxParkourCfg.env):
         episode_length_s = 15
 
+    class terrain(Go2BoxParkourCfg.terrain):
+        RandomBoxTrack_kwargs = deepcopy(
+            Go2BoxParkourCfg.terrain.RandomBoxTrack_kwargs
+        )
+        RandomBoxTrack_kwargs.update(
+            randomize=True,
+            seed=0,
+            num_unique_layouts=4,
+            track_length=5.5,
+            track_width=2.0,
+            spawn_margin=0.6,
+            first_gap_range=(1.2, 1.5),
+            boxes=[
+                dict(
+                    gap=1.2,
+                    length=1.2,
+                    width=1.2,
+                    height=0.20,
+                    height_choices=(0.15, 0.20, 0.25, 0.30),
+                    lateral_offset=0.0,
+                ),
+            ],
+        )
+
+    class rewards(Go2BoxParkourCfg.rewards):
+        class scales(Go2BoxParkourCfg.rewards.scales):
+            tracking_ang_vel = 0.2
+            forward_speed_tracking = 0.5
+            course_progress = 1000.0
+            landing_quality_progress = 0.0
+            landing_hold_progress = 0.0
+            landing_deceleration_progress = 0.0
+            landing_alignment_progress = 0.0
+            speed_error_square = 0.0
+            overspeed = 0.0
+            action_rate = -0.01
+            flat_orientation = -0.5
+            dof_vel = -5e-5
+            lin_pos_y = -0.1
+            yaw_abs = -0.1
+            dof_error_named = -1.0
+            dof_error = -0.005
+            body_collision = -5.0
+            thigh_collision = -0.5
+            calf_collision = -0.5
+            rear_support_missing = -0.5
+            box_front_foot_contact = 5.0
+            box_rear_foot_contact = 10.0
+            box_passed = 25.0
+            success = 500.0
+            termination = -2000.0
+            landing_overrun = -2000.0
+            landing_lateral_exit = -2000.0
+            landing_timeout = -2000.0
+            incomplete = -2000.0
+
+        failure_progress_scaling = False
+        reward_order_mode = "success_above_failures"
+
     class box_progress(Go2BoxParkourCfg.box_progress):
         required_boxes = 1
+        min_landing_zone_length = 2.0
+        landing_min_forward_distance = 0.6
+        landing_horizontal_speed_threshold = 1.2
+        landing_lateral_speed_threshold = 0.35
+        landing_deadline_steps = 200
+        stop_command_after_course = False
 
 
 class Go2BoxParkour1BoxCfgPPO(Go2BoxParkourCfgPPO):
+    class algorithm(Go2BoxParkourCfgPPO.algorithm):
+        freeze_actor_encoder_iterations = 100
+        actor_finetune_learning_rate = 2e-5
+        actor_finetune_clip_param = 0.1
+        actor_finetune_entropy_coef = 0.001
+        reference_kl_min_coef = 0.01
+        reference_kl_max_coef = 0.20
+        reference_kl_start_coef = 0.05
+        reference_kl_stable_decrease = 0.01
+        reference_kl_regression_increase = 0.05
+        reference_kl_regression_floor = 0.10
+
     class runner(Go2BoxParkourCfgPPO.runner):
-        run_name = "one_box_v9_critic_warmup_from11700"
-        # The source checkpoint must be selected explicitly on the CLI.
-        resume = False
-        load_run = -1
-        checkpoint = -1
+        run_name = "one_box_clean_gait_from_rough2000"
+        init_at_random_ep_len = False
+        resume = True
+        load_run = osp.join(
+            osp.dirname(osp.dirname(osp.dirname(osp.dirname(__file__)))),
+            "logs",
+            "rough_go2",
+            "Jul19_13-30-09_hold_from_2000_to_10000",
+        )
+        checkpoint = 2000
         ckpt_manipulator = None
         max_iterations = 1000
+        save_interval = 100
+        log_interval = 10
 
 
 class Go2BoxParkour3BoxCfg(Go2BoxParkourCfg):

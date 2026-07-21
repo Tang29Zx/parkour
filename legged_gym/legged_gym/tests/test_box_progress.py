@@ -596,6 +596,10 @@ class BoxProgressTrackerTest(unittest.TestCase):
             self.BoxProgressTracker(1, 4, 5, "cpu", required_boxes=0)
         with self.assertRaises(ValueError):
             self.BoxProgressTracker(1, 4, 5, "cpu", required_boxes=6)
+        with self.assertRaises(ValueError):
+            self.BoxProgressTracker(
+                1, 4, 5, "cpu", landing_min_forward_distance=-0.1
+            )
 
     def test_one_box_course_ignores_future_boxes_and_lands_before_box_two(self):
         self.tracker = self.BoxProgressTracker(
@@ -632,6 +636,50 @@ class BoxProgressTrackerTest(unittest.TestCase):
         for _ in range(10):
             self.update()
         self.assertTrue(self.tracker.success_buf[0])
+
+    def test_one_box_recovery_requires_forward_line_but_not_stopping(self):
+        self.tracker = self.BoxProgressTracker(
+            2,
+            4,
+            1,
+            "cpu",
+            required_boxes=1,
+            landing_min_forward_distance=0.6,
+            landing_horizontal_speed_threshold=1.2,
+            landing_lateral_speed_threshold=0.35,
+        )
+        self.box_bounds = self.box_bounds[:, :1]
+        self.landing_end_x[:] = 4.4
+        self.tracker.next_box_idx[0] = 1
+        self.tracker.passed_box_count[0] = 1
+        self.feet_positions[0, :, 0] = 2.5
+        self.feet_positions[0, :, 1] = self.torch.tensor(
+            [-0.3, 0.3, -0.3, 0.3]
+        )
+        self.feet_positions[0, :, 2] = 0.0
+        self.contact_forces[0, [0, 2], 2] = 2.0
+        self.base_positions[0, 0] = 2.5
+        self.base_horizontal_speed[0] = 0.5
+
+        for _ in range(10):
+            self.update()
+        self.assertFalse(self.tracker.success_buf[0])
+        self.assertEqual(self.tracker.landing_counter[0].item(), 0)
+
+        self.base_positions[0, 0] = 2.61
+        self.feet_positions[0, :, 0] = 2.61
+        for _ in range(9):
+            self.update()
+        self.assertFalse(self.tracker.success_buf[0])
+        self.update()
+        self.assertTrue(self.tracker.success_buf[0])
+
+        self.tracker.reset(self.torch.tensor([0]))
+        self.tracker.next_box_idx[0] = 1
+        self.tracker.passed_box_count[0] = 1
+        self.base_horizontal_speed[0] = 1.21
+        self.update()
+        self.assertEqual(self.tracker.landing_counter[0].item(), 0)
 
     def test_intermediate_course_landing_overrun_is_a_failure(self):
         self.tracker = self.BoxProgressTracker(

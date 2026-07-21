@@ -556,6 +556,30 @@ class CriticWarmupTest(unittest.TestCase):
         self.assertEqual(summary["reward_order_valid"].item(), 1.0)
         self.assertEqual(summary["reward_order_ok"].item(), 1.0)
 
+    def test_quality_window_uses_the_current_tasks_final_box(self):
+        runner = OnPolicyRunner.__new__(OnPolicyRunner)
+        runner.env = SimpleNamespace(
+            box_progress=SimpleNamespace(required_boxes=1)
+        )
+        summary = {
+            "num_terminated": torch.tensor(256.0),
+            "success_rate": torch.tensor(0.8),
+            "box_1_pass_rate": torch.tensor(0.9),
+            "fall_rate": torch.tensor(0.1),
+            "flat_forward_speed_mean_mps": torch.tensor(0.5),
+            "flat_severe_overspeed_ratio": torch.tensor(0.0),
+            "mean_action_rate_l2": torch.tensor(1.0),
+            "action_saturation_ratio": torch.tensor(0.1),
+            "dof_near_limit_ratio": torch.tensor(0.05),
+            "reward_order_valid": torch.tensor(1.0),
+            "reward_order_ok": torch.tensor(1.0),
+        }
+
+        window = runner._get_quality_window(summary)
+
+        self.assertIsNotNone(window)
+        self.assertAlmostEqual(window["box_pass_rate"], 0.9)
+
     def test_runner_saves_unique_warmup_boundary_checkpoint(self):
         runner = OnPolicyRunner.__new__(OnPolicyRunner)
         runner.alg = self.make_ppo()
