@@ -249,6 +249,48 @@ def initialize_one_box_lift_from_warmup2100(
     return migrated
 
 
+def enable_flat_reference_kl_from_one_box2500(
+    source_state_dict, algo_state_dict
+):
+    """Enable masked rough-walking KL without changing the 2500 policy."""
+    if int(source_state_dict.get("iter", -1)) != 2500:
+        raise ValueError(
+            "Flat-reference KL initialization requires the accepted one-box "
+            "model_2500.pt checkpoint."
+        )
+    source_model = source_state_dict["model_state_dict"]
+    target_model = algo_state_dict["model_state_dict"]
+    if source_model.keys() != target_model.keys():
+        raise KeyError("One-box 2500 and flat-KL model keys do not match.")
+    for name, source_value in source_model.items():
+        if source_value.shape != target_model[name].shape:
+            raise ValueError(
+                f"Parameter {name!r} has incompatible shapes: "
+                f"{tuple(source_value.shape)} versus "
+                f"{tuple(target_model[name].shape)}."
+            )
+
+    target_algorithm = algo_state_dict["algorithm_state_dict"]
+    migrated = copy.deepcopy(source_state_dict)
+    migrated["reference_model_state_dict"] = None
+    migrated_algorithm = migrated.setdefault("algorithm_state_dict", {})
+    for name in (
+        "reference_kl_min_coef",
+        "reference_kl_max_coef",
+        "current_reference_kl_coef",
+    ):
+        migrated_algorithm[name] = copy.deepcopy(target_algorithm[name])
+    migrated_algorithm["reference_kl_stable_window_count"] = 0
+    print(
+        "\033[1;36m Kept the complete one-box 2500 policy, Critic, "
+        "optimizer, and curriculum; enabled flat-only reference KL at "
+        f"{migrated_algorithm['current_reference_kl_coef']}. The runner will "
+        "load the frozen rough Actor separately. "
+        "\033[0m"
+    )
+    return migrated
+
+
 def initialize_v11_from_v10_warmup(source_state_dict, algo_state_dict):
     """Initialize v11 curriculum state from the verified v10 warmup boundary."""
     if int(source_state_dict.get("iter", -1)) != 11800:

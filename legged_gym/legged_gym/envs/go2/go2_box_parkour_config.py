@@ -388,6 +388,10 @@ class Go2BoxParkour1BoxCfg(Go2BoxParkourCfg):
 
     class box_progress(Go2BoxParkourCfg.box_progress):
         required_boxes = 1
+        # After an intermediate box, wait for ten stable support steps before
+        # re-enabling the flat-walking reference. The final landing remains
+        # unconstrained because the episode terminates there.
+        reference_kl_recovery_steps = 10
         recovery_steps = 3
         recovery_min_forward_distance = 0.25
         min_landing_zone_length = 2.0
@@ -422,14 +426,15 @@ class Go2BoxParkour1BoxCfgPPO(Go2BoxParkourCfgPPO):
         actor_finetune_learning_rate = 2e-5
         actor_finetune_clip_param = 0.1
         actor_finetune_entropy_coef = 0.002
-        # A rough walking policy cannot be a behavior reference for box
-        # traversal. Preserve it only as initialization and disable KL.
-        reference_kl_min_coef = 0.0
-        reference_kl_max_coef = 0.0
-        reference_kl_start_coef = 0.0
+        # Use the frozen migrated rough-2000 Actor only on ordinary flat
+        # ground. The environment mask disables KL near the active box and
+        # throughout final landing/recovery.
+        reference_kl_min_coef = 0.02
+        reference_kl_max_coef = 0.02
+        reference_kl_start_coef = 0.02
 
     class runner(Go2BoxParkourCfgPPO.runner):
-        run_name = "one_box_v185_split_landing_from2500"
+        run_name = "one_box_v186_flat_kl_from2500"
         init_at_random_ep_len = False
         resume = True
         load_run = osp.join(
@@ -438,8 +443,13 @@ class Go2BoxParkour1BoxCfgPPO(Go2BoxParkourCfgPPO):
             "go2_box_parkour",
             "Jul21_18-05-59_one_box_v183_from_rough2000",
         )
+        reference_policy_path = osp.join(
+            load_run, "model_2100_warmup.pt"
+        )
         checkpoint = 2500
-        ckpt_manipulator = None
+        # This is a one-time initializer for the original v183 model_2500.
+        # Resume v186 checkpoints with ``--ckpt_manipulator none``.
+        ckpt_manipulator = "enable_flat_reference_kl_from_one_box2500"
         max_iterations = 400
         save_interval = 50
         log_interval = 50

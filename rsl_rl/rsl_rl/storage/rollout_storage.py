@@ -32,7 +32,7 @@ from collections import namedtuple
 import torch
 import numpy as np
 
-from rsl_rl.utils import split_and_pad_trajectories
+from rsl_rl.utils import split_and_pad_trajectories, unpad_trajectories
 from rsl_rl.utils.collections import is_namedarraytuple
 from rsl_rl.utils.buffer import buffer_from_example, buffer_method, buffer_swap, buffer_expand
 
@@ -50,6 +50,7 @@ class RolloutStorage:
             self.action_sigma = None
             self.reference_action_mean = None
             self.reference_action_sigma = None
+            self.reference_kl_mask = None
             self.hidden_states = None
         
         def clear(self):
@@ -67,6 +68,7 @@ class RolloutStorage:
         "old_sigma",
         "reference_mu",
         "reference_sigma",
+        "reference_kl_mask",
         "hidden_states",
         "masks",
     ])
@@ -98,6 +100,12 @@ class RolloutStorage:
         self.sigma = torch.zeros(num_transitions_per_env, num_envs, *actions_shape, device=self.device)
         self.reference_mu = torch.zeros_like(self.mu)
         self.reference_sigma = torch.zeros_like(self.sigma)
+        self.reference_kl_masks = torch.ones(
+            num_transitions_per_env,
+            num_envs,
+            1,
+            device=self.device,
+        )
 
         self.num_transitions_per_env = num_transitions_per_env
         self.num_envs = num_envs
@@ -127,6 +135,17 @@ class RolloutStorage:
             reference_sigma = transition.action_sigma
         self.reference_mu[self.step].copy_(reference_mean)
         self.reference_sigma[self.step].copy_(reference_sigma)
+        reference_kl_mask = transition.reference_kl_mask
+        if reference_kl_mask is None:
+            reference_kl_mask = torch.ones(
+                self.num_envs, 1, device=self.device
+            )
+        self.reference_kl_masks[self.step].copy_(
+            reference_kl_mask.reshape(self.num_envs, 1).to(
+                device=self.device,
+                dtype=self.reference_kl_masks.dtype,
+            )
+        )
         self._save_hidden_states(transition.hidden_states)
         self.step += 1
 
@@ -198,6 +217,15 @@ class RolloutStorage:
         self._padded_obs_trajectories, self._trajectory_masks = split_and_pad_trajectories(self.observations, self.dones)
         if self.privileged_observations is not None: 
             self._padded_critic_obs_trajectories, _ = split_and_pad_trajectories(self.privileged_observations, self.dones)
+        self._padded_reference_mu_trajectories, _ = split_and_pad_trajectories(
+            self.reference_mu, self.dones
+        )
+        self._padded_reference_sigma_trajectories, _ = split_and_pad_trajectories(
+            self.reference_sigma, self.dones
+        )
+        self._padded_reference_kl_mask_trajectories, _ = (
+            split_and_pad_trajectories(self.reference_kl_masks, self.dones)
+        )
 
         mini_batch_size = self.num_envs // num_mini_batches
         for ep in range(num_epochs):
@@ -262,8 +290,31 @@ class RolloutStorage:
         advantage_batch = self.advantages[T_slice, B_slice]
         old_mu_batch = self.mu[T_slice, B_slice]
         old_sigma_batch = self.sigma[T_slice, B_slice]
-        reference_mu_batch = self.reference_mu[T_slice, B_slice]
-        reference_sigma_batch = self.reference_sigma[T_slice, B_slice]
+        if padded_B_slice is None:
+            reference_mu_batch = self.reference_mu[T_slice, B_slice]
+            reference_sigma_batch = self.reference_sigma[T_slice, B_slice]
+            reference_kl_mask_batch = self.reference_kl_masks[
+                T_slice, B_slice
+            ]
+        else:
+            reference_mu_batch = unpad_trajectories(
+                self._padded_reference_mu_trajectories[
+                    T_slice, padded_B_slice
+                ],
+                obs_mask_batch,
+            )
+            reference_sigma_batch = unpad_trajectories(
+                self._padded_reference_sigma_trajectories[
+                    T_slice, padded_B_slice
+                ],
+                obs_mask_batch,
+            )
+            reference_kl_mask_batch = unpad_trajectories(
+                self._padded_reference_kl_mask_trajectories[
+                    T_slice, padded_B_slice
+                ],
+                obs_mask_batch,
+            )
 
         if padded_B_slice is None:
             # flatten the trajectory sample if not recurrent
@@ -279,6 +330,7 @@ class RolloutStorage:
             old_sigma_batch = old_sigma_batch.flatten(0, 1)
             reference_mu_batch = reference_mu_batch.flatten(0, 1)
             reference_sigma_batch = reference_sigma_batch.flatten(0, 1)
+            reference_kl_mask_batch = reference_kl_mask_batch.flatten(0, 1)
 
         return RolloutStorage.MiniBatch(
             obs_batch, critic_obs_batch,
@@ -286,6 +338,7 @@ class RolloutStorage:
             target_value_batch, advantage_batch, return_batch,
             old_action_log_prob_batch, old_mu_batch, old_sigma_batch,
             reference_mu_batch, reference_sigma_batch,
+            reference_kl_mask_batch,
             hid_batch, obs_mask_batch,
         )
 
@@ -379,6 +432,10 @@ class QueueRolloutStorage(RolloutStorage):
             self.reference_sigma,
             torch.zeros(expand_size, self.num_envs, *self.actions_shape, device=self.device),
         ], dim= 0).contiguous()
+        self.reference_kl_masks = torch.cat([
+            self.reference_kl_masks,
+            torch.ones(expand_size, self.num_envs, 1, device=self.device),
+        ], dim=0).contiguous()
 
         # For hidden_states
         if not self.saved_hidden_states is None:
@@ -428,6 +485,9 @@ class QueueRolloutStorage(RolloutStorage):
         self.sigma = self.swap_from_cursor(self.sigma)
         self.reference_mu = self.swap_from_cursor(self.reference_mu)
         self.reference_sigma = self.swap_from_cursor(self.reference_sigma)
+        self.reference_kl_masks = self.swap_from_cursor(
+            self.reference_kl_masks
+        )
         if not self.saved_hidden_states is None:
             with torch.no_grad():
                 self.saved_hidden_states = buffer_swap(self.saved_hidden_states, self.step, contiguous= True)

@@ -557,6 +557,52 @@ class HeightEncoderMigrationTest(unittest.TestCase):
         with self.assertRaises(ValueError):
             self.module.enable_v11_target_speed_finetune(source, target)
 
+    def test_flat_reference_kl_initializer_preserves_model_and_optimizer(self):
+        source_model = OrderedDict(
+            [
+                ("actor.weight", torch.ones(2, 2)),
+                ("memory_a.rnn.weight", torch.full((2, 2), 2.0)),
+                ("critic.weight", torch.full((1, 2), 3.0)),
+            ]
+        )
+        source = {
+            "model_state_dict": source_model,
+            "reference_model_state_dict": None,
+            "optimizer_state_dict": {"kept": True},
+            "algorithm_state_dict": {
+                "reference_kl_min_coef": 0.0,
+                "reference_kl_max_coef": 0.0,
+                "current_reference_kl_coef": 0.0,
+                "reference_kl_stable_window_count": 7,
+            },
+            "iter": 2500,
+        }
+        target = {
+            "model_state_dict": OrderedDict(
+                (name, torch.zeros_like(value))
+                for name, value in source_model.items()
+            ),
+            "algorithm_state_dict": {
+                "reference_kl_min_coef": 0.02,
+                "reference_kl_max_coef": 0.02,
+                "current_reference_kl_coef": 0.02,
+            },
+        }
+
+        migrated = self.module.enable_flat_reference_kl_from_one_box2500(
+            source, target
+        )
+
+        for name, value in source_model.items():
+            torch.testing.assert_close(migrated["model_state_dict"][name], value)
+        self.assertIsNone(migrated["reference_model_state_dict"])
+        self.assertEqual(migrated["optimizer_state_dict"], {"kept": True})
+        algorithm = migrated["algorithm_state_dict"]
+        self.assertEqual(algorithm["reference_kl_min_coef"], 0.02)
+        self.assertEqual(algorithm["reference_kl_max_coef"], 0.02)
+        self.assertEqual(algorithm["current_reference_kl_coef"], 0.02)
+        self.assertEqual(algorithm["reference_kl_stable_window_count"], 0)
+
     def test_v11_initializer_rejects_non_warmup_checkpoint(self):
         source = {
             "model_state_dict": OrderedDict([("actor.weight", torch.ones(1))]),
@@ -2391,19 +2437,29 @@ class BoxRewardTest(unittest.TestCase):
                 "Jul21_18-05-59_one_box_v183_from_rough2000"
             )
         )
-        self.assertEqual(
-            runner.run_name, "one_box_v185_split_landing_from2500"
+        self.assertTrue(
+            runner.reference_policy_path.endswith(
+                "Jul21_18-05-59_one_box_v183_from_rough2000/"
+                "model_2100_warmup.pt"
+            )
         )
-        self.assertIsNone(runner.ckpt_manipulator)
+        self.assertEqual(
+            runner.run_name, "one_box_v186_flat_kl_from2500"
+        )
+        self.assertEqual(
+            runner.ckpt_manipulator,
+            "enable_flat_reference_kl_from_one_box2500",
+        )
         self.assertEqual(runner.max_iterations, 400)
         self.assertEqual(runner.save_interval, 50)
         self.assertEqual(runner.log_interval, 50)
         self.assertEqual(algorithm.freeze_actor_encoder_iterations, 100)
         self.assertEqual(algorithm.actor_finetune_learning_rate, 2e-5)
-        self.assertEqual(algorithm.reference_kl_min_coef, 0.0)
+        self.assertEqual(algorithm.reference_kl_min_coef, 0.02)
         self.assertEqual(algorithm.actor_finetune_entropy_coef, 0.002)
-        self.assertEqual(algorithm.reference_kl_start_coef, 0.0)
-        self.assertEqual(algorithm.reference_kl_max_coef, 0.0)
+        self.assertEqual(algorithm.reference_kl_start_coef, 0.02)
+        self.assertEqual(algorithm.reference_kl_max_coef, 0.02)
+        self.assertEqual(env_cfg.box_progress.reference_kl_recovery_steps, 10)
         curriculum = env_cfg.one_box_curriculum
         self.assertEqual(curriculum.state_version, 2)
         self.assertEqual(
@@ -2510,6 +2566,24 @@ class BoxRewardTest(unittest.TestCase):
         )
         self.assertEqual(self.env_cfg.viewer.lookat, [14.0, 6.0, 0.2])
         self.assertEqual(self.env_cfg.env.num_envs // physical_tracks, 8)
+
+    def test_reference_kl_mask_excludes_box_and_final_landing(self):
+        env = object.__new__(self.LeggedRobotBox)
+        env.root_states = torch.zeros(5, 13)
+        env.box_progress = SimpleNamespace(required_boxes=2)
+        env.next_box_idx = torch.tensor([0, 0, 2, 1, 1])
+        env.passed_box_count = torch.tensor([0, 0, 2, 1, 1])
+        env.reference_kl_recovery_counter = torch.tensor([0, 0, 20, 9, 10])
+        env.reference_kl_recovery_steps = 10
+        env._box_speed_blend = lambda: torch.tensor(
+            [0.0, 1.0, 0.0, 0.0, 0.0]
+        )
+
+        mask = self.LeggedRobotBox.get_reference_kl_mask(env)
+
+        torch.testing.assert_close(
+            mask, torch.tensor([1.0, 0.0, 0.0, 0.0, 1.0])
+        )
 
     def test_geometry_debug_task_keeps_four_physical_tracks(self):
         terrain = self.debug_cfg.terrain

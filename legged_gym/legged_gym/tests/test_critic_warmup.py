@@ -309,12 +309,17 @@ class CriticWarmupTest(unittest.TestCase):
             old_sigma=torch.full_like(actions, 0.5),
             reference_mu=ppo.reference_actor_critic.act_inference(obs).detach(),
             reference_sigma=torch.full_like(actions, 0.5),
+            reference_kl_mask=torch.tensor([[1.0], [0.0]]),
             hidden_states=SimpleNamespace(actor=None, critic=None),
             masks=None,
         )
         ppo._critic_warmup_active = False
         losses, _, stats = ppo.compute_losses(minibatch)
         self.assertGreater(stats["reference_kl"].item(), 0.0)
+        self.assertGreater(stats["flat_reference_kl"].item(), 0.0)
+        self.assertAlmostEqual(
+            stats["flat_reference_sample_ratio"].item(), 0.5
+        )
         self.assertGreater(losses["reference_kl_loss"].item(), 0.0)
         losses["reference_kl_loss"].backward()
         actor_gradients = [

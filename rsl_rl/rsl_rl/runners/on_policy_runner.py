@@ -739,7 +739,14 @@ class OnPolicyRunner:
         self.save(os.path.join(self.log_dir, 'model_{}.pt'.format(self.current_learning_iteration)))
 
     def rollout_step(self, obs, critic_obs):
-        actions = self.alg.act(obs, critic_obs)
+        reference_kl_mask = None
+        if hasattr(self.env, "get_reference_kl_mask"):
+            reference_kl_mask = self.env.get_reference_kl_mask()
+        actions = self.alg.act(
+            obs,
+            critic_obs,
+            reference_kl_mask=reference_kl_mask,
+        )
         obs, privileged_obs, rewards, dones, infos = self.env.step(actions)
         critic_obs = privileged_obs if privileged_obs is not None else obs
         obs, critic_obs, rewards, dones = obs.to(self.device), critic_obs.to(self.device), rewards.to(self.device), dones.to(self.device)
@@ -768,6 +775,7 @@ class OnPolicyRunner:
             self.writer.add_scalar("Loss/" + k, v.item(), self.current_learning_iteration)
         loss_stat_names = {
             "reference_kl",
+            "flat_reference_kl",
             "reference_kl_max",
             "reference_kl_p95",
             "reference_to_surrogate_ratio",
@@ -877,6 +885,26 @@ class OnPolicyRunner:
             loaded_dict,
             allow_missing_curriculum_state=bool(manipulator_name),
         )
+        reference_policy_path = self.cfg.get("reference_policy_path")
+        if (
+            self.alg.reference_kl_coef > 0.0
+            and self.alg.reference_actor_critic is None
+        ):
+            if not reference_policy_path:
+                raise RuntimeError(
+                    "Reference KL is enabled but neither the checkpoint nor "
+                    "runner config provides a reference policy."
+                )
+            reference_checkpoint = torch.load(
+                reference_policy_path, map_location=self.device
+            )
+            self.alg.load_reference_policy_from_model_state(
+                reference_checkpoint["model_state_dict"]
+            )
+            print(
+                "Loaded frozen flat-walking reference Actor from: "
+                f"{reference_policy_path}"
+            )
         self.current_learning_iteration = loaded_dict['iter']
         if manipulator_name in {
             "reset_critic_and_optimizer",

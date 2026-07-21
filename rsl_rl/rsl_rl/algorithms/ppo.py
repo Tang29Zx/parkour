@@ -448,6 +448,25 @@ class PPO:
         for parameter in self.reference_actor_critic.parameters():
             parameter.requires_grad_(False)
 
+    def load_reference_policy_from_model_state(self, model_state_dict):
+        """Strictly load an external checkpoint's Actor side as reference."""
+        expected = {
+            name
+            for name in self.actor_critic.state_dict()
+            if self._is_actor_side_parameter(name)
+        }
+        reference_state = OrderedDict(
+            (name, value)
+            for name, value in model_state_dict.items()
+            if name in expected
+        )
+        if set(reference_state) != expected:
+            raise KeyError(
+                "External reference checkpoint does not contain the complete "
+                "Actor side."
+            )
+        self._restore_reference_policy(reference_state)
+
     @property
     def reference_kl_coef(self):
         return self.current_reference_kl_coef
@@ -718,9 +737,16 @@ class PPO:
     def train_mode(self):
         self.actor_critic.train()
 
-    def act(self, obs, critic_obs):
+    def act(self, obs, critic_obs, reference_kl_mask=None):
         if self.actor_critic.is_recurrent:
             self.transition.hidden_states = self.actor_critic.get_hidden_states()
+        if reference_kl_mask is None:
+            reference_kl_mask = torch.ones(
+                obs.shape[0], 1, device=obs.device
+            )
+        self.transition.reference_kl_mask = (
+            reference_kl_mask.detach().reshape(obs.shape[0], 1)
+        )
         # Compute the actions and values
         self.transition.actions = self.actor_critic.act(obs).detach()
         self.transition.values = self.actor_critic.evaluate(critic_obs).detach()
@@ -1054,16 +1080,52 @@ class PPO:
                 - 0.5,
                 dim=-1,
             )
-            reference_kl = reference_kl_per_sample.mean()
+            reference_kl_mask = getattr(
+                minibatch, "reference_kl_mask", None
+            )
+            if reference_kl_mask is None:
+                reference_kl_mask = torch.ones_like(
+                    reference_kl_per_sample
+                )
+            else:
+                reference_kl_mask = reference_kl_mask.to(
+                    device=reference_kl_per_sample.device,
+                    dtype=reference_kl_per_sample.dtype,
+                ).reshape(-1)
+                if (
+                    reference_kl_mask.numel()
+                    != reference_kl_per_sample.numel()
+                ):
+                    raise ValueError(
+                        "Reference KL mask and policy batch have different "
+                        "sample counts."
+                    )
+                reference_kl_mask = reference_kl_mask.reshape_as(
+                    reference_kl_per_sample
+                ).clamp(0.0, 1.0)
+            active_weight = reference_kl_mask.sum()
+            reference_kl = (
+                reference_kl_per_sample * reference_kl_mask
+            ).sum() / active_weight.clamp_min(1.0)
             reference_kl_loss = self.reference_kl_coef * reference_kl
             return_["reference_kl_loss"] = reference_kl_loss
             stats["reference_kl"] = reference_kl.detach()
-            stats["reference_kl_max"] = (
-                reference_kl_per_sample.detach().max()
+            stats["flat_reference_kl"] = reference_kl.detach()
+            stats["flat_reference_sample_ratio"] = (
+                reference_kl_mask.detach().mean()
             )
-            stats["reference_kl_p95"] = torch.quantile(
-                reference_kl_per_sample.detach().float(), 0.95
-            )
+            active_samples = reference_kl_per_sample[
+                reference_kl_mask > 0.0
+            ].detach()
+            if active_samples.numel() > 0:
+                stats["reference_kl_max"] = active_samples.max()
+                stats["reference_kl_p95"] = torch.quantile(
+                    active_samples.float(), 0.95
+                )
+            else:
+                zero = reference_kl_per_sample.detach().sum() * 0.0
+                stats["reference_kl_max"] = zero
+                stats["reference_kl_p95"] = zero
             stats["reference_to_surrogate_ratio"] = (
                 reference_kl_loss.detach().abs()
                 / surrogate_loss.detach().abs().clamp_min(1e-8)
@@ -1077,6 +1139,8 @@ class PPO:
         else:
             zero = torch.zeros((), device=value_batch.device)
             stats["reference_kl"] = zero
+            stats["flat_reference_kl"] = zero
+            stats["flat_reference_sample_ratio"] = zero
             stats["reference_kl_max"] = zero
             stats["reference_kl_p95"] = zero
             stats["reference_to_surrogate_ratio"] = zero
