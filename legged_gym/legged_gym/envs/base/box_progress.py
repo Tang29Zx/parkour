@@ -29,7 +29,10 @@ class BoxProgressTracker:
         landing_pitch_threshold=0.45,
         landing_base_height_threshold=0.22,
         landing_vertical_speed_threshold=0.5,
-        landing_forward_speed_threshold=0.35,
+        landing_horizontal_speed_threshold=0.35,
+        landing_lateral_speed_threshold=0.20,
+        landing_lateral_offset_threshold=0.40,
+        landing_yaw_threshold=0.35,
         landing_deadline_steps=150,
         body_contact_window_steps=25,
         body_contact_failure_steps=8,
@@ -101,14 +104,25 @@ class BoxProgressTracker:
         self.landing_vertical_speed_threshold = float(
             landing_vertical_speed_threshold
         )
-        self.landing_forward_speed_threshold = float(
-            landing_forward_speed_threshold
+        self.landing_horizontal_speed_threshold = float(
+            landing_horizontal_speed_threshold
         )
+        self.landing_lateral_speed_threshold = float(
+            landing_lateral_speed_threshold
+        )
+        self.landing_lateral_offset_threshold = float(
+            landing_lateral_offset_threshold
+        )
+        self.landing_yaw_threshold = float(landing_yaw_threshold)
         self.landing_deadline_steps = int(landing_deadline_steps)
-        if self.landing_forward_speed_threshold <= 0.0:
-            raise ValueError(
-                "landing_forward_speed_threshold must be positive."
-            )
+        landing_thresholds = (
+            self.landing_horizontal_speed_threshold,
+            self.landing_lateral_speed_threshold,
+            self.landing_lateral_offset_threshold,
+            self.landing_yaw_threshold,
+        )
+        if min(landing_thresholds) <= 0.0:
+            raise ValueError("Landing motion thresholds must be positive.")
         if self.landing_deadline_steps <= 0:
             raise ValueError("landing_deadline_steps must be positive.")
         self.body_contact_window_steps = int(body_contact_window_steps)
@@ -179,6 +193,7 @@ class BoxProgressTracker:
         self.missed_box_buf = torch.zeros_like(self.box_passed_buf)
         self.out_of_track_buf = torch.zeros_like(self.box_passed_buf)
         self.landing_overrun_buf = torch.zeros_like(self.box_passed_buf)
+        self.landing_lateral_exit_buf = torch.zeros_like(self.box_passed_buf)
         self.landing_timeout_buf = torch.zeros_like(self.box_passed_buf)
         self.landing_phase_entry_buf = torch.zeros_like(self.box_passed_buf)
         self.lateral_out_of_track_buf = torch.zeros_like(self.box_passed_buf)
@@ -192,7 +207,10 @@ class BoxProgressTracker:
         )
         for name in (
             "landing_zone",
-            "landing_forward_speed",
+            "landing_horizontal_speed",
+            "landing_lateral_speed",
+            "landing_lateral_offset",
+            "landing_yaw",
             "landing_vertical_speed",
             "landing_roll",
             "landing_pitch",
@@ -232,7 +250,10 @@ class BoxProgressTracker:
         self.max_consecutive_valid_landing_steps[env_ids] = 0
         for name in (
             "landing_zone",
-            "landing_forward_speed",
+            "landing_horizontal_speed",
+            "landing_lateral_speed",
+            "landing_lateral_offset",
+            "landing_yaw",
             "landing_vertical_speed",
             "landing_roll",
             "landing_pitch",
@@ -256,6 +277,7 @@ class BoxProgressTracker:
         self.missed_box_buf[env_ids] = False
         self.out_of_track_buf[env_ids] = False
         self.landing_overrun_buf[env_ids] = False
+        self.landing_lateral_exit_buf[env_ids] = False
         self.landing_timeout_buf[env_ids] = False
         self.landing_phase_entry_buf[env_ids] = False
         self.lateral_out_of_track_buf[env_ids] = False
@@ -282,7 +304,9 @@ class BoxProgressTracker:
         body_contact_force,
         base_vertical_velocity,
         natural_timeout,
-        base_forward_velocity=None,
+        base_horizontal_speed=None,
+        base_lateral_velocity=None,
+        base_yaw=None,
         episode_step=None,
         landing_end_x=None,
         external_timeout=None,
@@ -391,8 +415,16 @@ class BoxProgressTracker:
             dim=1
         )
         base_height = base_positions[:, 2] - env_origins[:, 2]
-        if base_forward_velocity is None:
-            base_forward_velocity = torch.zeros_like(base_vertical_velocity)
+        if base_horizontal_speed is None:
+            base_horizontal_speed = torch.zeros_like(base_vertical_velocity)
+        if base_lateral_velocity is None:
+            base_lateral_velocity = torch.zeros_like(base_vertical_velocity)
+        if base_yaw is None:
+            base_yaw = torch.zeros_like(base_vertical_velocity)
+        base_yaw = torch.atan2(torch.sin(base_yaw), torch.cos(base_yaw))
+        lateral_offset = torch.abs(
+            base_positions[:, 1] - env_origins[:, 1]
+        )
         in_landing_zone = (
             course_complete
             & (base_positions[:, 0] > course_rear)
@@ -402,10 +434,17 @@ class BoxProgressTracker:
                 <= self.lateral_limit
             )
         )
-        forward_speed_valid = (
-            base_forward_velocity.abs()
-            <= self.landing_forward_speed_threshold
+        horizontal_speed_valid = (
+            base_horizontal_speed <= self.landing_horizontal_speed_threshold
         )
+        lateral_speed_valid = (
+            base_lateral_velocity.abs()
+            <= self.landing_lateral_speed_threshold
+        )
+        lateral_offset_valid = (
+            lateral_offset <= self.landing_lateral_offset_threshold
+        )
+        yaw_valid = base_yaw.abs() <= self.landing_yaw_threshold
         vertical_speed_valid = (
             base_vertical_velocity.abs()
             <= self.landing_vertical_speed_threshold
@@ -431,7 +470,10 @@ class BoxProgressTracker:
             & pitch_valid
             & height_valid
             & vertical_speed_valid
-            & forward_speed_valid
+            & horizontal_speed_valid
+            & lateral_speed_valid
+            & lateral_offset_valid
+            & yaw_valid
         )
         self.landing_counter[:] = torch.where(
             stable_landing,
@@ -446,7 +488,29 @@ class BoxProgressTracker:
 
         score_gate = in_landing_zone & no_body_contact
         speed_score = torch.clamp(
-            1.0 - torch.square(base_forward_velocity.abs() / 0.5),
+            1.0 - torch.square(base_horizontal_speed / 0.5),
+            0.0,
+            1.0,
+        )
+        lateral_speed_score = torch.clamp(
+            1.0
+            - torch.square(
+                base_lateral_velocity.abs()
+                / self.landing_lateral_speed_threshold
+            ),
+            0.0,
+            1.0,
+        )
+        lateral_offset_score = torch.clamp(
+            1.0
+            - torch.square(
+                lateral_offset / self.landing_lateral_offset_threshold
+            ),
+            0.0,
+            1.0,
+        )
+        yaw_score = torch.clamp(
+            1.0 - torch.square(base_yaw.abs() / self.landing_yaw_threshold),
             0.0,
             1.0,
         )
@@ -488,8 +552,11 @@ class BoxProgressTracker:
                 + height_score
                 + 2.0 * feet_score
                 + 2.0 * rear_foot_support.float()
+                + lateral_speed_score
+                + lateral_offset_score
+                + yaw_score
             )
-            / 10.0
+            / 13.0
             * score_gate.float()
         )
         new_best_score = torch.maximum(
@@ -510,7 +577,10 @@ class BoxProgressTracker:
         self.landing_phase_step_count += course_complete
         condition_values = {
             "landing_zone": in_landing_zone,
-            "landing_forward_speed": forward_speed_valid,
+            "landing_horizontal_speed": horizontal_speed_valid,
+            "landing_lateral_speed": lateral_speed_valid,
+            "landing_lateral_offset": lateral_offset_valid,
+            "landing_yaw": yaw_valid,
             "landing_vertical_speed": vertical_speed_valid,
             "landing_roll": roll_valid,
             "landing_pitch": pitch_valid,
@@ -553,7 +623,6 @@ class BoxProgressTracker:
             | external_fall
         )
 
-        lateral_offset = (base_positions[:, 1] - env_origins[:, 1]).abs()
         raw_lateral_out = lateral_offset > self.lateral_limit
         raw_backward_out = base_positions[:, 0] < track_start_x
         raw_other_out = (
@@ -571,7 +640,13 @@ class BoxProgressTracker:
         # neither a failure nor success happened on the same control step.
         self.fall_buf[:] = raw_fall & ~self.missed_box_buf
         hard_taken = self.missed_box_buf | self.fall_buf
-        self.lateral_out_of_track_buf[:] = raw_lateral_out & ~hard_taken
+        self.landing_lateral_exit_buf[:] = (
+            raw_lateral_out & course_complete & ~hard_taken
+        )
+        hard_taken |= self.landing_lateral_exit_buf
+        self.lateral_out_of_track_buf[:] = (
+            raw_lateral_out & ~course_complete & ~hard_taken
+        )
         hard_taken |= self.lateral_out_of_track_buf
         self.backward_out_of_track_buf[:] = raw_backward_out & ~hard_taken
         hard_taken |= self.backward_out_of_track_buf
@@ -579,10 +654,11 @@ class BoxProgressTracker:
         hard_taken |= other_out
         self.out_of_track_buf[:] = (
             self.lateral_out_of_track_buf
+            | self.landing_lateral_exit_buf
             | self.backward_out_of_track_buf
             | other_out
         )
-        self.generic_failure_buf[:] = hard_taken
+        self.generic_failure_buf[:] = hard_taken & ~self.landing_lateral_exit_buf
         self.success_buf[:] = landing_success & ~hard_taken
         self.landing_overrun_buf[:] = (
             raw_landing_overrun & ~hard_taken & ~self.success_buf
@@ -592,6 +668,7 @@ class BoxProgressTracker:
             & (self.steps_in_landing_phase >= self.landing_deadline_steps)
             & ~hard_taken
             & ~self.success_buf
+            & ~self.landing_lateral_exit_buf
             & ~self.landing_overrun_buf
         )
         self.incomplete_buf[:] = (
@@ -672,6 +749,7 @@ class BoxProgressTracker:
     def failure_buf(self):
         return (
             self.generic_failure_buf
+            | self.landing_lateral_exit_buf
             | self.landing_overrun_buf
             | self.landing_timeout_buf
         )

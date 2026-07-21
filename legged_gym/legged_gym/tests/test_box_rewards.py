@@ -607,6 +607,8 @@ class BoxRewardTest(unittest.TestCase):
             "overspeed": -0.2,
             "landing_quality_progress": 150.0,
             "landing_hold_progress": 350.0,
+            "landing_deceleration_progress": 200.0,
+            "landing_alignment_progress": 250.0,
             "action_rate": -0.005,
             "flat_orientation": -0.2,
             "flat_base_height": 0.0,
@@ -635,8 +637,13 @@ class BoxRewardTest(unittest.TestCase):
         self.assertAlmostEqual(scales.course_progress * dt, 20.0)
         self.assertAlmostEqual(scales.landing_quality_progress * dt, 3.0)
         self.assertAlmostEqual(scales.landing_hold_progress * dt, 7.0)
+        self.assertAlmostEqual(
+            scales.landing_deceleration_progress * dt, 4.0
+        )
+        self.assertAlmostEqual(scales.landing_alignment_progress * dt, 5.0)
         self.assertAlmostEqual(scales.termination * dt, -40.0)
         self.assertAlmostEqual(scales.landing_overrun * dt, -20.0)
+        self.assertAlmostEqual(scales.landing_lateral_exit * dt, -25.0)
         self.assertAlmostEqual(scales.landing_timeout * dt, -15.0)
         self.assertAlmostEqual(scales.incomplete * dt, -40.0)
         self.assertEqual(
@@ -666,7 +673,11 @@ class BoxRewardTest(unittest.TestCase):
         self.assertEqual(progress.landing_pitch_threshold, 0.45)
         self.assertEqual(progress.landing_base_height_threshold, 0.22)
         self.assertEqual(progress.landing_vertical_speed_threshold, 0.5)
-        self.assertEqual(progress.landing_forward_speed_threshold, 0.35)
+        self.assertEqual(progress.landing_horizontal_speed_threshold, 0.35)
+        self.assertEqual(progress.landing_lateral_speed_threshold, 0.20)
+        self.assertEqual(progress.landing_lateral_offset_threshold, 0.40)
+        self.assertEqual(progress.landing_yaw_threshold, 0.35)
+        self.assertEqual(progress.landing_deceleration_start_speed, 1.5)
         self.assertEqual(progress.landing_deadline_steps, 150)
         self.assertEqual(progress.landing_command_ramp_steps, 20)
         self.assertEqual(progress.flat_low_base_height_threshold, 0.20)
@@ -706,11 +717,12 @@ class BoxRewardTest(unittest.TestCase):
 
     def test_landing_terminal_rewards_are_exclusive_and_have_stage_a_values(self):
         env = SimpleNamespace(
-            landing_timeout_buf=torch.tensor([True, False]),
-            landing_overrun_buf=torch.tensor([False, True]),
-            generic_failure_buf=torch.tensor([False, False]),
-            incomplete_buf=torch.tensor([False, False]),
-            task_progress_buf=torch.ones(2),
+            landing_timeout_buf=torch.tensor([True, False, False]),
+            landing_overrun_buf=torch.tensor([False, True, False]),
+            landing_lateral_exit_buf=torch.tensor([False, False, True]),
+            generic_failure_buf=torch.tensor([False, False, False]),
+            incomplete_buf=torch.tensor([False, False, False]),
+            task_progress_buf=torch.ones(3),
         )
         dt = 0.02
 
@@ -724,13 +736,21 @@ class BoxRewardTest(unittest.TestCase):
             * self.env_cfg.rewards.scales.landing_overrun
             * dt
         )
+        lateral_exit = (
+            self.LeggedRobotBox._reward_landing_lateral_exit(env)
+            * self.env_cfg.rewards.scales.landing_lateral_exit
+            * dt
+        )
         termination = self.LeggedRobotBox._reward_termination(env)
         incomplete = self.LeggedRobotBox._reward_incomplete(env)
 
-        torch.testing.assert_close(timeout, torch.tensor([-15.0, 0.0]))
-        torch.testing.assert_close(overrun, torch.tensor([0.0, -20.0]))
-        torch.testing.assert_close(termination, torch.zeros(2))
-        torch.testing.assert_close(incomplete, torch.zeros(2))
+        torch.testing.assert_close(timeout, torch.tensor([-15.0, 0.0, 0.0]))
+        torch.testing.assert_close(overrun, torch.tensor([0.0, -20.0, 0.0]))
+        torch.testing.assert_close(
+            lateral_exit, torch.tensor([0.0, 0.0, -25.0])
+        )
+        torch.testing.assert_close(termination, torch.zeros(3))
+        torch.testing.assert_close(incomplete, torch.zeros(3))
 
     def test_failure_and_incomplete_progress_multipliers(self):
         env = SimpleNamespace(
@@ -805,6 +825,87 @@ class BoxRewardTest(unittest.TestCase):
         torch.testing.assert_close(
             env.episode_command_x, torch.tensor([0.5, 0.2, 0.7])
         )
+
+    def test_landing_guidance_rewards_only_new_high_water_marks(self):
+        env = object.__new__(self.LeggedRobotBox)
+        env.next_box_idx = torch.tensor([5])
+        env.box_progress = SimpleNamespace(required_boxes=5)
+        env.landing_phase_entry_buf = torch.tensor([True])
+        env.root_states = torch.zeros(1, 13)
+        env.root_states[:, 7] = 1.5
+        env.root_states[:, 8] = 0.20
+        env.root_states[:, 1] = 0.8
+        env.env_origins = torch.zeros(1, 3)
+        env.landing_deceleration_start_speed = 1.5
+        env.cfg = SimpleNamespace(
+            box_progress=SimpleNamespace(
+                landing_horizontal_speed_threshold=0.35,
+            )
+        )
+        env.box_progress.landing_yaw_threshold = 0.35
+        env.box_progress.landing_lateral_speed_threshold = 0.20
+        env.box_progress.landing_lateral_offset_threshold = 0.40
+        env.landing_entry_horizontal_speed = torch.zeros(1)
+        env.landing_deceleration_best = torch.zeros(1)
+        env.landing_deceleration_delta = torch.zeros(1)
+        env.landing_alignment_start = torch.zeros(1)
+        env.landing_alignment_best = torch.zeros(1)
+        env.landing_alignment_delta = torch.zeros(1)
+
+        self.LeggedRobotBox._update_landing_guidance(
+            env, torch.tensor([0.35])
+        )
+        self.assertEqual(env.landing_deceleration_delta.item(), 0.0)
+        self.assertEqual(env.landing_alignment_delta.item(), 0.0)
+
+        env.landing_phase_entry_buf[:] = False
+        env.root_states[:, 7] = 0.35
+        env.root_states[:, 8] = 0.0
+        env.root_states[:, 1] = 0.0
+        self.LeggedRobotBox._update_landing_guidance(
+            env, torch.tensor([0.0])
+        )
+        self.assertAlmostEqual(env.landing_deceleration_delta.item(), 1.0)
+        self.assertAlmostEqual(env.landing_alignment_delta.item(), 1.0)
+
+        env.root_states[:, 7] = 1.0
+        env.root_states[:, 1] = 0.4
+        self.LeggedRobotBox._update_landing_guidance(
+            env, torch.tensor([0.3])
+        )
+        torch.testing.assert_close(
+            env.landing_deceleration_delta, torch.zeros(1)
+        )
+        torch.testing.assert_close(env.landing_alignment_delta, torch.zeros(1))
+
+    def test_landing_guidance_rewards_a_good_entry_without_bad_setup(self):
+        env = object.__new__(self.LeggedRobotBox)
+        env.next_box_idx = torch.tensor([5])
+        env.box_progress = SimpleNamespace(required_boxes=5)
+        env.landing_phase_entry_buf = torch.tensor([True])
+        env.root_states = torch.zeros(1, 13)
+        env.root_states[:, 7] = 0.35
+        env.env_origins = torch.zeros(1, 3)
+        env.landing_deceleration_start_speed = 1.5
+        env.cfg = SimpleNamespace(
+            box_progress=SimpleNamespace(
+                landing_horizontal_speed_threshold=0.35,
+            )
+        )
+        env.box_progress.landing_yaw_threshold = 0.35
+        env.box_progress.landing_lateral_speed_threshold = 0.20
+        env.box_progress.landing_lateral_offset_threshold = 0.40
+        env.landing_entry_horizontal_speed = torch.zeros(1)
+        env.landing_deceleration_best = torch.zeros(1)
+        env.landing_deceleration_delta = torch.zeros(1)
+        env.landing_alignment_start = torch.zeros(1)
+        env.landing_alignment_best = torch.zeros(1)
+        env.landing_alignment_delta = torch.zeros(1)
+
+        self.LeggedRobotBox._update_landing_guidance(env, torch.zeros(1))
+
+        self.assertAlmostEqual(env.landing_deceleration_delta.item(), 1.0)
+        self.assertAlmostEqual(env.landing_alignment_delta.item(), 1.0)
 
     def test_normalized_torque_excess_uses_mean_not_joint_sum(self):
         env = SimpleNamespace(
@@ -1219,20 +1320,22 @@ class BoxRewardTest(unittest.TestCase):
         reward = self.LeggedRobotBox._reward_action_rate(env)
         torch.testing.assert_close(reward, torch.zeros(2))
 
-    def test_stage_a_synthetic_return_order(self):
+    def test_landing_guidance_synthetic_return_order(self):
         scales = self.env_cfg.rewards.scales
         dt = 0.02
-        clean_success = 20.0 + 4.0 + 3.0 + 7.0 + 25.0 - 5.0
-        landing_timeout = 20.0 + 4.0 + 3.0 - 15.0 - 6.0
-        landing_overrun = 20.0 + 4.0 - 20.0 - 6.0
+        clean_success = 20.0 + 4.0 + 3.0 + 7.0 + 4.0 + 5.0 + 25.0 - 5.0
+        landing_timeout = 20.0 + 4.0 + 3.0 + 4.0 + 5.0 - 15.0 - 6.0
+        landing_overrun = 20.0 + 4.0 + 3.0 - 20.0 - 6.0
+        landing_lateral_exit = 20.0 + 4.0 + 5.0 - 25.0 - 6.0
         late_failure = 18.0 + 3.5 - 26.5 - 6.0
         early_failure = 2.0 + 0.2 - 38.5 - 1.0
 
         self.assertGreater(clean_success, landing_timeout)
         self.assertGreater(landing_timeout, landing_overrun)
-        self.assertGreater(landing_overrun, late_failure)
+        self.assertGreater(landing_overrun, landing_lateral_exit)
+        self.assertGreater(landing_lateral_exit, early_failure)
         self.assertGreater(late_failure, early_failure)
-        self.assertEqual(clean_success, 54.0)
+        self.assertEqual(clean_success, 63.0)
         self.assertEqual(scales.landing_quality_progress * dt, 3.0)
         self.assertEqual(scales.landing_hold_progress * dt, 7.0)
         self.assertLess(
@@ -1658,11 +1761,20 @@ class BoxRewardTest(unittest.TestCase):
             terrain.RandomBoxTrack_kwargs["num_unique_layouts"],
             4,
         )
+        self.assertEqual(
+            terrain.RandomBoxTrack_kwargs["track_length"],
+            18.0,
+        )
+        self.assertEqual(self.env_cfg.viewer.lookat, [14.0, 6.0, 0.2])
         self.assertEqual(self.env_cfg.env.num_envs // physical_tracks, 8)
 
     def test_geometry_debug_task_keeps_four_physical_tracks(self):
         terrain = self.debug_cfg.terrain
         self.assertEqual((terrain.num_rows, terrain.num_cols), (1, 4))
+        self.assertEqual(
+            terrain.RandomBoxTrack_kwargs["track_length"],
+            15.5,
+        )
         self.assertNotIn(
             "num_unique_layouts",
             terrain.RandomBoxTrack_kwargs,
@@ -1676,7 +1788,7 @@ class BoxRewardTest(unittest.TestCase):
         self.assertEqual(runner.checkpoint, 11300)
         self.assertEqual(
             runner.run_name,
-            "five_box_v17_landing_repair_stageA_from11300",
+            "five_box_v18_landing_guidance_from11300",
         )
         self.assertIsNone(runner.ckpt_manipulator)
         self.assertTrue(

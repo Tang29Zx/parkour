@@ -32,6 +32,8 @@ class Go2BoxParkourCfg(DebugGo2BoxCfg):
         num_cols = 64
         max_init_terrain_level = 7
         RandomBoxTrack_kwargs["num_unique_layouts"] = 4
+        # Add 2.5 m after the final box while the policy learns to stop.
+        RandomBoxTrack_kwargs["track_length"] = 18.0
         # Oracle scan aligned with the existing 3 m forward-depth camera range.
         measured_points_x = np.linspace(-0.5, 3.0, 36).tolist()
         measured_points_y = np.linspace(-0.8, 0.8, 17).tolist()
@@ -55,6 +57,12 @@ class Go2BoxParkourCfg(DebugGo2BoxCfg):
         pitch_kwargs = dict(threshold=1.6)
         timeout_at_border = False
 
+    class viewer(DebugGo2BoxCfg.viewer):
+        # Center the static view on the 18 m formal track. play.py follows the
+        # robot by default, using this vector as its camera offset.
+        pos = [3.0, 2.0, 9.0]
+        lookat = [14.0, 6.0, 0.2]
+
     class rewards(DebugGo2BoxCfg.rewards):
         class scales:
             tracking_ang_vel = 0.2
@@ -62,7 +70,9 @@ class Go2BoxParkourCfg(DebugGo2BoxCfg):
             course_progress = 1000.0
             landing_quality_progress = 150.0
             landing_hold_progress = 350.0
-            # V17 prioritizes clean landing and four-leg motion over exact speed.
+            landing_deceleration_progress = 200.0
+            landing_alignment_progress = 250.0
+            # V18 prioritizes clean landing and four-leg motion over exact speed.
             speed_error_square = 0.0
             overspeed = -0.2
             action_rate = -0.005
@@ -86,6 +96,7 @@ class Go2BoxParkourCfg(DebugGo2BoxCfg):
             success = 1250.0
             termination = -2000.0
             landing_overrun = -1000.0
+            landing_lateral_exit = -1250.0
             landing_timeout = -750.0
             incomplete = -2000.0
 
@@ -143,7 +154,11 @@ class Go2BoxParkourCfg(DebugGo2BoxCfg):
         landing_pitch_threshold = 0.45
         landing_base_height_threshold = 0.22
         landing_vertical_speed_threshold = 0.5
-        landing_forward_speed_threshold = 0.35
+        landing_horizontal_speed_threshold = 0.35
+        landing_lateral_speed_threshold = 0.20
+        landing_lateral_offset_threshold = 0.40
+        landing_yaw_threshold = 0.35
+        landing_deceleration_start_speed = 1.5
         landing_deadline_steps = 150
         landing_command_ramp_steps = 20
         body_contact_window_steps = 25
@@ -221,7 +236,7 @@ class Go2BoxParkourCfgPPO(Go2RoughCfgPPO):
 
     class runner(Go2RoughCfgPPO.runner):
         experiment_name = "go2_box_parkour"
-        run_name = "five_box_v17_landing_repair_stageA_from11300"
+        run_name = "five_box_v18_landing_guidance_from11300"
         # Partial episodes generated at process startup do not represent the
         # checkpoint policy and must not drive the box curriculum or KL state.
         init_at_random_ep_len = False

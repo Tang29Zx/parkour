@@ -235,6 +235,7 @@ class OnPolicyRunner:
                 "missed_box_failure",
                 "out_of_track_failure",
                 "landing_overrun",
+                "landing_lateral_exit",
                 "landing_timeout",
                 "incomplete",
                 "late_failure",
@@ -296,6 +297,9 @@ class OnPolicyRunner:
         overrun_count = self._scalar(
             summary.get("raw/landing_overrun_episode_count", 0.0)
         )
+        lateral_exit_count = self._scalar(
+            summary.get("raw/landing_lateral_exit_episode_count", 0.0)
+        )
         landing_timeout_count = self._scalar(
             summary.get("raw/landing_timeout_episode_count", 0.0)
         )
@@ -309,6 +313,7 @@ class OnPolicyRunner:
             success_count,
             landing_timeout_count,
             overrun_count,
+            lateral_exit_count,
             late_count,
             early_count,
         ) >= 32.0
@@ -322,13 +327,23 @@ class OnPolicyRunner:
             overrun_return = self._scalar(
                 summary["raw/landing_overrun_mean_return"]
             )
+            lateral_exit_return = self._scalar(
+                summary["raw/landing_lateral_exit_mean_return"]
+            )
             late_return = self._scalar(
                 summary["raw/late_failure_mean_return"]
             )
             early_return = self._scalar(
                 summary["raw/early_failure_mean_return"]
             )
-            margin = success_return - landing_timeout_return
+            best_failure_return = max(
+                landing_timeout_return,
+                overrun_return,
+                lateral_exit_return,
+                late_return,
+                early_return,
+            )
+            margin = success_return - best_failure_return
             summary["raw/success_minus_best_failure_return"] = torch.tensor(
                 margin, device=self.device
             )
@@ -341,6 +356,18 @@ class OnPolicyRunner:
             summary["raw/landing_overrun_minus_late_failure_return"] = (
                 torch.tensor(overrun_return - late_return, device=self.device)
             )
+            summary["raw/landing_overrun_minus_lateral_exit_return"] = (
+                torch.tensor(
+                    overrun_return - lateral_exit_return,
+                    device=self.device,
+                )
+            )
+            summary["raw/landing_lateral_exit_minus_late_failure_return"] = (
+                torch.tensor(
+                    lateral_exit_return - late_return,
+                    device=self.device,
+                )
+            )
             summary["raw/landing_overrun_minus_early_failure_return"] = (
                 torch.tensor(overrun_return - early_return, device=self.device)
             )
@@ -351,7 +378,9 @@ class OnPolicyRunner:
                 float(
                     success_return > landing_timeout_return
                     and landing_timeout_return > overrun_return
-                    and overrun_return > late_return
+                    and overrun_return > lateral_exit_return
+                    and success_return > late_return
+                    and lateral_exit_return > early_return
                     and late_return > early_return
                 ),
                 device=self.device,

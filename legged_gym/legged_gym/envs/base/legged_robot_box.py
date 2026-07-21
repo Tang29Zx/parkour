@@ -80,9 +80,16 @@ class LeggedRobotBox(LeggedRobot):
             landing_vertical_speed_threshold=(
                 progress_cfg.landing_vertical_speed_threshold
             ),
-            landing_forward_speed_threshold=(
-                progress_cfg.landing_forward_speed_threshold
+            landing_horizontal_speed_threshold=(
+                progress_cfg.landing_horizontal_speed_threshold
             ),
+            landing_lateral_speed_threshold=(
+                progress_cfg.landing_lateral_speed_threshold
+            ),
+            landing_lateral_offset_threshold=(
+                progress_cfg.landing_lateral_offset_threshold
+            ),
+            landing_yaw_threshold=progress_cfg.landing_yaw_threshold,
             landing_deadline_steps=progress_cfg.landing_deadline_steps,
             body_contact_window_steps=progress_cfg.body_contact_window_steps,
             body_contact_failure_steps=(
@@ -103,6 +110,34 @@ class LeggedRobotBox(LeggedRobot):
             raise ValueError("landing_command_ramp_steps must be positive.")
         self.episode_command_x = torch.zeros(
             self.num_envs, dtype=torch.float, device=self.device
+        )
+        self.landing_deceleration_start_speed = float(
+            progress_cfg.landing_deceleration_start_speed
+        )
+        if self.landing_deceleration_start_speed <= float(
+            progress_cfg.landing_horizontal_speed_threshold
+        ):
+            raise ValueError(
+                "landing_deceleration_start_speed must exceed the landing "
+                "horizontal-speed threshold."
+            )
+        self.landing_entry_horizontal_speed = torch.zeros(
+            self.num_envs, dtype=torch.float, device=self.device
+        )
+        self.landing_deceleration_best = torch.zeros_like(
+            self.landing_entry_horizontal_speed
+        )
+        self.landing_deceleration_delta = torch.zeros_like(
+            self.landing_entry_horizontal_speed
+        )
+        self.landing_alignment_start = torch.zeros_like(
+            self.landing_entry_horizontal_speed
+        )
+        self.landing_alignment_best = torch.zeros_like(
+            self.landing_entry_horizontal_speed
+        )
+        self.landing_alignment_delta = torch.zeros_like(
+            self.landing_entry_horizontal_speed
         )
         self.forward_speed_sum = torch.zeros(
             self.num_envs, dtype=torch.float, device=self.device
@@ -374,6 +409,7 @@ class LeggedRobotBox(LeggedRobot):
         self.missed_box_buf = tracker.missed_box_buf
         self.out_of_track_buf = tracker.out_of_track_buf
         self.landing_overrun_buf = tracker.landing_overrun_buf
+        self.landing_lateral_exit_buf = tracker.landing_lateral_exit_buf
         self.landing_timeout_buf = tracker.landing_timeout_buf
         self.landing_phase_entry_buf = tracker.landing_phase_entry_buf
         self.lateral_out_of_track_buf = tracker.lateral_out_of_track_buf
@@ -1204,6 +1240,8 @@ class LeggedRobotBox(LeggedRobot):
         tracker = self.box_progress
         landing_steps = tracker.landing_phase_step_count[env_ids].sum()
         denominator = landing_steps.clamp_min(1)
+        landing_entry_mask = tracker.landing_phase_start_step[env_ids] >= 0
+        landing_entry_count = landing_entry_mask.sum().clamp_min(1)
         stats = {
             "landing_phase_entry_rate": (
                 (tracker.landing_phase_start_step[env_ids] >= 0)
@@ -1225,10 +1263,31 @@ class LeggedRobotBox(LeggedRobot):
             "mean_best_landing_hold_steps": tracker.best_landing_hold_steps[
                 env_ids
             ].float().mean(),
+            "landing_entry_horizontal_speed_mean_mps": torch.where(
+                landing_entry_mask,
+                self.landing_entry_horizontal_speed[env_ids],
+                torch.zeros_like(self.landing_entry_horizontal_speed[env_ids]),
+            ).sum()
+            / landing_entry_count,
+            "landing_deceleration_progress_mean": torch.where(
+                landing_entry_mask,
+                self.landing_deceleration_best[env_ids],
+                torch.zeros_like(self.landing_deceleration_best[env_ids]),
+            ).sum()
+            / landing_entry_count,
+            "landing_alignment_progress_mean": torch.where(
+                landing_entry_mask,
+                self.landing_alignment_best[env_ids],
+                torch.zeros_like(self.landing_alignment_best[env_ids]),
+            ).sum()
+            / landing_entry_count,
         }
         for name in (
             "landing_zone",
-            "landing_forward_speed",
+            "landing_horizontal_speed",
+            "landing_lateral_speed",
+            "landing_lateral_offset",
+            "landing_yaw",
             "landing_vertical_speed",
             "landing_roll",
             "landing_pitch",
@@ -1317,9 +1376,10 @@ class LeggedRobotBox(LeggedRobot):
             | (self.episode_length_buf >= self.max_episode_length)
         )
 
-        roll, pitch, _ = get_euler_xyz(self.base_quat)
+        roll, pitch, yaw = get_euler_xyz(self.base_quat)
         roll = torch.where(roll > np.pi, roll - 2.0 * np.pi, roll)
         pitch = torch.where(pitch > np.pi, pitch - 2.0 * np.pi, pitch)
+        yaw = torch.atan2(torch.sin(yaw), torch.cos(yaw))
         body_states = self.all_rigid_body_states.view(self.num_envs, -1, 13)
         feet_positions = body_states[:, self.feet_indices, :3]
         feet_contact_forces = self.contact_forces[:, self.feet_indices, :]
@@ -1347,12 +1407,17 @@ class LeggedRobotBox(LeggedRobot):
             body_contact=body_contact,
             body_contact_force=body_contact_force,
             base_vertical_velocity=self.root_states[:, 9],
-            base_forward_velocity=self.base_lin_vel[:, 0],
+            base_horizontal_speed=torch.linalg.vector_norm(
+                self.root_states[:, 7:9], dim=1
+            ),
+            base_lateral_velocity=self.root_states[:, 8],
+            base_yaw=yaw,
             natural_timeout=natural_timeout,
             episode_step=self.episode_length_buf,
             landing_end_x=self.course_landing_end_x,
             external_fall=self.flat_low_base_height_failure_buf,
         )
+        self._update_landing_guidance(yaw)
         self._apply_landing_commands()
         self._update_course_progress_reward()
         self.box_progress.apply_termination(
@@ -1376,6 +1441,80 @@ class LeggedRobotBox(LeggedRobot):
         )
         self.commands[landing_phase, 1] = 0.0
         self.commands[landing_phase, 2] = 0.0
+
+    def _update_landing_guidance(self, yaw):
+        """Reward one-time improvements in landing speed and alignment."""
+        landing_phase = (
+            self.next_box_idx >= self.box_progress.required_boxes
+        )
+        landing_entry = self.landing_phase_entry_buf
+        world_velocity = self.root_states[:, 7:9]
+        horizontal_speed = torch.linalg.vector_norm(world_velocity, dim=1)
+        lateral_speed = world_velocity[:, 1].abs()
+        lateral_offset = torch.abs(
+            self.root_states[:, 1] - self.env_origins[:, 1]
+        )
+        yaw_score = torch.clamp(
+            1.0 - yaw.abs() / self.box_progress.landing_yaw_threshold,
+            min=0.0,
+            max=1.0,
+        )
+        lateral_score = torch.clamp(
+            1.0
+            - lateral_offset
+            / self.box_progress.landing_lateral_offset_threshold,
+            min=0.0,
+            max=1.0,
+        )
+        lateral_speed_score = torch.clamp(
+            1.0
+            - lateral_speed
+            / self.box_progress.landing_lateral_speed_threshold,
+            min=0.0,
+            max=1.0,
+        )
+        alignment_score = (
+            yaw_score + lateral_score + lateral_speed_score
+        ) / 3.0
+
+        self.landing_entry_horizontal_speed[landing_entry] = horizontal_speed[
+            landing_entry
+        ]
+        self.landing_alignment_start[landing_entry] = alignment_score[
+            landing_entry
+        ]
+
+        target_speed = float(
+            self.cfg.box_progress.landing_horizontal_speed_threshold
+        )
+        speed_denominator = (
+            self.landing_deceleration_start_speed - target_speed
+        )
+        deceleration_progress = torch.clamp(
+            (self.landing_deceleration_start_speed - horizontal_speed)
+            / speed_denominator,
+            min=0.0,
+            max=1.0,
+        )
+        alignment_progress = alignment_score
+        deceleration_progress *= landing_phase.float()
+        alignment_progress *= landing_phase.float()
+
+        new_deceleration_best = torch.maximum(
+            self.landing_deceleration_best, deceleration_progress
+        )
+        self.landing_deceleration_delta[:] = (
+            new_deceleration_best - self.landing_deceleration_best
+        ).clamp_min(0.0)
+        self.landing_deceleration_best[:] = new_deceleration_best
+
+        new_alignment_best = torch.maximum(
+            self.landing_alignment_best, alignment_progress
+        )
+        self.landing_alignment_delta[:] = (
+            new_alignment_best - self.landing_alignment_best
+        ).clamp_min(0.0)
+        self.landing_alignment_best[:] = new_alignment_best
 
     def reset_idx(self, env_ids):
         """Reset environments and preserve their newly sampled commands."""
@@ -1417,6 +1556,9 @@ class LeggedRobotBox(LeggedRobot):
         )
         episode["landing_overrun_rate"] = (
             self.landing_overrun_buf[env_ids].float().mean()
+        )
+        episode["landing_lateral_exit_rate"] = (
+            self.landing_lateral_exit_buf[env_ids].float().mean()
         )
         episode["landing_timeout_rate"] = (
             self.landing_timeout_buf[env_ids].float().mean()
@@ -1468,8 +1610,10 @@ class LeggedRobotBox(LeggedRobot):
             "missed_box_failure": self.missed_box_buf[env_ids],
             "out_of_track_failure": (
                 self.out_of_track_buf[env_ids]
+                & ~self.landing_lateral_exit_buf[env_ids]
             ),
             "landing_overrun": self.landing_overrun_buf[env_ids],
+            "landing_lateral_exit": self.landing_lateral_exit_buf[env_ids],
             "landing_timeout": self.landing_timeout_buf[env_ids],
             "incomplete": self.incomplete_buf[env_ids],
             "early_failure": self.box_progress.failure_buf[env_ids]
@@ -1600,6 +1744,13 @@ class LeggedRobotBox(LeggedRobot):
             self.rewarded_progress_ratio[env_ids] = 0.0
             self.course_progress_delta_buf[env_ids] = 0.0
             self.progress_reward_initialized[env_ids] = False
+        if hasattr(self, "landing_entry_horizontal_speed"):
+            self.landing_entry_horizontal_speed[env_ids] = 0.0
+            self.landing_deceleration_best[env_ids] = 0.0
+            self.landing_deceleration_delta[env_ids] = 0.0
+            self.landing_alignment_start[env_ids] = 0.0
+            self.landing_alignment_best[env_ids] = 0.0
+            self.landing_alignment_delta[env_ids] = 0.0
 
     def _near_box_for_speed_control(self):
         """Return environments with a non-zero current-box speed blend."""
@@ -1772,6 +1923,10 @@ class LeggedRobotBox(LeggedRobot):
         """Penalize crossing the landing-zone end before stabilizing."""
         return self.landing_overrun_buf.float()
 
+    def _reward_landing_lateral_exit(self):
+        """Penalize leaving the course laterally after the final box."""
+        return self.landing_lateral_exit_buf.float()
+
     def _reward_landing_timeout(self):
         """Penalize exhausting the configured landing-attempt window."""
         return self.landing_timeout_buf.float()
@@ -1783,6 +1938,14 @@ class LeggedRobotBox(LeggedRobot):
     def _reward_landing_hold_progress(self):
         """Reward only a new high-water mark in stable landing duration."""
         return self.landing_hold_delta
+
+    def _reward_landing_deceleration_progress(self):
+        """Reward only new high-water progress toward landing speed."""
+        return self.landing_deceleration_delta
+
+    def _reward_landing_alignment_progress(self):
+        """Reward only new high-water progress in yaw and lateral alignment."""
+        return self.landing_alignment_delta
 
     def _reward_flat_orientation(self):
         """Penalize base tilt only outside the active box maneuver window."""
