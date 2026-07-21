@@ -132,6 +132,82 @@ class BoxProgressTrackerTest(unittest.TestCase):
         self.assertTrue(self.tracker.rear_foot_contact_buf[0])
         self.assertTrue(self.tracker.curriculum_success_buf[0])
 
+    def test_stage_c1_ends_after_basic_post_box_recovery(self):
+        self.tracker = self.BoxProgressTracker(
+            2,
+            4,
+            1,
+            "cpu",
+            required_boxes=1,
+            recovery_steps=3,
+            recovery_min_forward_distance=0.25,
+            landing_min_forward_distance=0.6,
+            landing_horizontal_speed_threshold=1.2,
+        )
+        self.box_bounds = self.box_bounds[:, :1]
+        self.landing_end_x[:] = 4.4
+        self.curriculum_stage = self.torch.tensor([2, 2])
+        self.tracker.next_box_idx[0] = 1
+        self.tracker.passed_box_count[0] = 1
+        self.base_positions[0, 0] = 2.3
+        self.feet_positions[0, :, 0] = 2.3
+        self.feet_positions[0, :, 1] = self.torch.tensor(
+            [-0.3, 0.3, -0.3, 0.3]
+        )
+        self.contact_forces[0, [0, 2], 2] = 2.0
+        # C1 deliberately ignores strict yaw and forward-speed targets.
+        self.base_yaw[0] = 0.8
+        self.base_horizontal_speed[0] = 1.8
+
+        self.update()
+        self.update()
+        self.assertFalse(self.tracker.curriculum_success_buf[0])
+        self.update()
+
+        self.assertTrue(self.tracker.curriculum_success_buf[0])
+        self.assertFalse(self.tracker.success_buf[0])
+        self.assertEqual(
+            self.tracker.best_recovery_hold_steps[0].item(), 3
+        )
+
+    def test_stage_c2_keeps_the_strict_ten_step_landing(self):
+        self.tracker = self.BoxProgressTracker(
+            2,
+            4,
+            1,
+            "cpu",
+            required_boxes=1,
+            recovery_steps=3,
+            recovery_min_forward_distance=0.25,
+            landing_steps=10,
+            landing_min_forward_distance=0.6,
+            landing_horizontal_speed_threshold=1.2,
+            landing_lateral_speed_threshold=0.35,
+        )
+        self.box_bounds = self.box_bounds[:, :1]
+        self.landing_end_x[:] = 4.4
+        self.curriculum_stage = self.torch.tensor([3, 3])
+        self.tracker.next_box_idx[0] = 1
+        self.tracker.passed_box_count[0] = 1
+        self.base_positions[0, 0] = 2.7
+        self.feet_positions[0, :, 0] = 2.7
+        self.feet_positions[0, :, 1] = self.torch.tensor(
+            [-0.3, 0.3, -0.3, 0.3]
+        )
+        self.contact_forces[0, [0, 2], 2] = 2.0
+        self.base_yaw[0] = 0.5
+        for _ in range(10):
+            self.update()
+        self.assertFalse(self.tracker.success_buf[0])
+        self.assertFalse(self.tracker.curriculum_success_buf[0])
+
+        self.base_yaw[0] = 0.0
+        for _ in range(9):
+            self.update()
+        self.assertFalse(self.tracker.success_buf[0])
+        self.update()
+        self.assertTrue(self.tracker.success_buf[0])
+
     def test_stagnation_is_a_failure_and_overrides_stage_success(self):
         self.curriculum_stage = self.torch.tensor([0, 0])
         self.put_foot_on_box(0, 0, 0)

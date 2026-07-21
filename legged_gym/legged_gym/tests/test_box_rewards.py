@@ -920,10 +920,10 @@ class BoxRewardTest(unittest.TestCase):
             severe, torch.tensor([-50.0, 0.0, 0.0, 0.0])
         )
         torch.testing.assert_close(
-            stagnation, torch.tensor([0.0, 0.0, -40.0, 0.0])
+            stagnation, torch.tensor([0.0, 0.0, -50.0, 0.0])
         )
         torch.testing.assert_close(
-            incomplete, torch.tensor([0.0, 0.0, 0.0, -40.0])
+            incomplete, torch.tensor([0.0, 0.0, 0.0, -50.0])
         )
 
     def test_landing_terminal_rewards_are_exclusive_and_have_stage_a_values(self):
@@ -1476,6 +1476,29 @@ class BoxRewardTest(unittest.TestCase):
             torch.tensor([0.0, 0.64, 0.0]),
         )
 
+        env.episode_curriculum_stage[:] = torch.tensor([2, 3, 3])
+        env.landing_quality_delta = torch.ones(3)
+        env.landing_hold_delta = torch.ones(3)
+        env.landing_alignment_delta = torch.ones(3)
+        env.curriculum_success_buf = torch.tensor([True, True, False])
+        env.success_buf = torch.zeros(3, dtype=torch.bool)
+        torch.testing.assert_close(
+            self.LeggedRobotBox._reward_landing_quality_progress(env),
+            torch.tensor([0.0, 1.0, 1.0]),
+        )
+        torch.testing.assert_close(
+            self.LeggedRobotBox._reward_landing_hold_progress(env),
+            torch.tensor([0.0, 1.0, 1.0]),
+        )
+        torch.testing.assert_close(
+            self.LeggedRobotBox._reward_landing_alignment_progress(env),
+            torch.tensor([0.0, 1.0, 1.0]),
+        )
+        torch.testing.assert_close(
+            self.LeggedRobotBox._reward_recovery_success(env),
+            torch.tensor([1.0, 0.0, 0.0]),
+        )
+
     def test_course_progress_reward_is_monotonic_and_non_repeatable(self):
         env = SimpleNamespace(
             task_progress_buf=torch.tensor([0.2]),
@@ -1776,12 +1799,18 @@ class BoxRewardTest(unittest.TestCase):
         )
         self.assertTrue(env.stagnation_candidate_buf.item())
 
-    def test_one_box_curriculum_promotes_a_b_then_height(self):
+    def test_one_box_curriculum_promotes_a_b_c1_c2_then_height(self):
         env = object.__new__(self.LeggedRobotBox)
         env.uses_task_curriculum = True
         env.cfg = SimpleNamespace(
             one_box_curriculum=SimpleNamespace(
-                state_version=1,
+                state_version=2,
+                stage_names=(
+                    "front_contact",
+                    "rear_contact",
+                    "traversal_recovery",
+                    "stable_landing",
+                ),
                 minimum_episodes=256,
                 minimum_stage_iterations=100,
                 promotion_success_rate=0.65,
@@ -1804,6 +1833,10 @@ class BoxRewardTest(unittest.TestCase):
         self.assertEqual(env.one_box_height_level, 0)
         self.assertFalse(env.update_task_curriculum(summary, 2400))
         self.assertTrue(env.update_task_curriculum(summary, 2450))
+        self.assertEqual(env.one_box_curriculum_stage, 3)
+        self.assertEqual(env.one_box_height_level, 0)
+        self.assertFalse(env.update_task_curriculum(summary, 2550))
+        self.assertTrue(env.update_task_curriculum(summary, 2600))
         self.assertEqual(env.one_box_height_level, 1)
 
         state = env.get_task_curriculum_state()
@@ -1812,6 +1845,13 @@ class BoxRewardTest(unittest.TestCase):
         restored.cfg = env.cfg
         restored.load_task_curriculum_state(state)
         self.assertEqual(restored.get_task_curriculum_state(), state)
+
+        legacy_state = dict(state)
+        legacy_state.update(version=1, stage=2, stable_windows=1)
+        restored.load_task_curriculum_state(legacy_state)
+        self.assertEqual(restored.one_box_curriculum_stage, 2)
+        self.assertEqual(restored.one_box_stable_windows, 0)
+        self.assertEqual(restored.get_task_curriculum_state()["version"], 2)
 
     def test_forward_speed_tracking_peaks_only_at_the_command(self):
         env = self.make_speed_reward_env()
@@ -2278,6 +2318,10 @@ class BoxRewardTest(unittest.TestCase):
         self.assertEqual(
             env_cfg.box_progress.landing_min_forward_distance, 0.6
         )
+        self.assertEqual(env_cfg.box_progress.recovery_steps, 3)
+        self.assertEqual(
+            env_cfg.box_progress.recovery_min_forward_distance, 0.25
+        )
         self.assertEqual(
             env_cfg.box_progress.landing_horizontal_speed_threshold, 1.2
         )
@@ -2311,27 +2355,27 @@ class BoxRewardTest(unittest.TestCase):
             "rear_foot_clearance_progress": 2.0,
             "box_rear_foot_contact": 8.0,
             "box_passed": 10.0,
+            "recovery_success": 15.0,
             "success": 15.0,
         }
         for name, expected in expected_events.items():
             self.assertAlmostEqual(getattr(scales, name) * 0.02, expected)
-        for name in (
-            "landing_quality_progress",
-            "landing_hold_progress",
-            "landing_deceleration_progress",
-            "landing_alignment_progress",
-        ):
-            self.assertEqual(getattr(scales, name), 0.0)
+        self.assertAlmostEqual(scales.landing_quality_progress * 0.02, 5.0)
+        self.assertAlmostEqual(scales.landing_hold_progress * 0.02, 10.0)
+        self.assertEqual(scales.landing_deceleration_progress, 0.0)
+        self.assertAlmostEqual(
+            scales.landing_alignment_progress * 0.02, 5.0
+        )
         for name in (
             "termination",
             "landing_overrun",
             "landing_lateral_exit",
-            "landing_timeout",
         ):
             self.assertAlmostEqual(getattr(scales, name) * 0.02, -45.0)
+        self.assertAlmostEqual(scales.landing_timeout * 0.02, -40.0)
         self.assertAlmostEqual(scales.severe_body_impact * 0.02, -50.0)
-        self.assertAlmostEqual(scales.stagnation * 0.02, -40.0)
-        self.assertAlmostEqual(scales.incomplete * 0.02, -40.0)
+        self.assertAlmostEqual(scales.stagnation * 0.02, -50.0)
+        self.assertAlmostEqual(scales.incomplete * 0.02, -50.0)
         self.assertFalse(env_cfg.rewards.failure_progress_scaling)
         self.assertEqual(
             env_cfg.rewards.reward_order_mode,
@@ -2348,10 +2392,10 @@ class BoxRewardTest(unittest.TestCase):
             )
         )
         self.assertEqual(
-            runner.run_name, "one_box_v184_gait_repair_from2500"
+            runner.run_name, "one_box_v185_split_landing_from2500"
         )
         self.assertIsNone(runner.ckpt_manipulator)
-        self.assertEqual(runner.max_iterations, 200)
+        self.assertEqual(runner.max_iterations, 400)
         self.assertEqual(runner.save_interval, 50)
         self.assertEqual(runner.log_interval, 50)
         self.assertEqual(algorithm.freeze_actor_encoder_iterations, 100)
@@ -2361,6 +2405,16 @@ class BoxRewardTest(unittest.TestCase):
         self.assertEqual(algorithm.reference_kl_start_coef, 0.0)
         self.assertEqual(algorithm.reference_kl_max_coef, 0.0)
         curriculum = env_cfg.one_box_curriculum
+        self.assertEqual(curriculum.state_version, 2)
+        self.assertEqual(
+            curriculum.stage_names,
+            (
+                "front_contact",
+                "rear_contact",
+                "traversal_recovery",
+                "stable_landing",
+            ),
+        )
         self.assertEqual(curriculum.low_height_layouts, (0, 1, 2))
         self.assertEqual(curriculum.full_height_layouts, (2, 3, 4, 5, 6))
         self.assertEqual(curriculum.promotion_success_rate, 0.65)

@@ -105,6 +105,7 @@ class Go2BoxParkourCfg(DebugGo2BoxCfg):
             front_foot_clearance_progress = 0.0
             post_front_base_progress = 0.0
             rear_foot_clearance_progress = 0.0
+            recovery_success = 0.0
             box_rear_foot_contact = 10.0
             box_passed = 25.0
             success = 1250.0
@@ -323,10 +324,10 @@ class Go2BoxParkour1BoxCfg(Go2BoxParkourCfg):
             tracking_ang_vel = 0.2
             forward_speed_tracking = 0.5
             course_progress = 0.0
-            landing_quality_progress = 0.0
-            landing_hold_progress = 0.0
+            landing_quality_progress = 250.0
+            landing_hold_progress = 500.0
             landing_deceleration_progress = 0.0
-            landing_alignment_progress = 0.0
+            landing_alignment_progress = 250.0
             speed_error_square = 0.0
             overspeed = -0.2
             action_rate = -0.005
@@ -361,14 +362,15 @@ class Go2BoxParkour1BoxCfg(Go2BoxParkourCfg):
             rear_foot_clearance_progress = 100.0
             box_rear_foot_contact = 400.0
             box_passed = 500.0
+            recovery_success = 750.0
             success = 750.0
             termination = -2250.0
             severe_body_impact = -2500.0
-            stagnation = -2000.0
+            stagnation = -2500.0
             landing_overrun = -2250.0
             landing_lateral_exit = -2250.0
-            landing_timeout = -2250.0
-            incomplete = -2000.0
+            landing_timeout = -2000.0
+            incomplete = -2500.0
 
         failure_progress_scaling = False
         reward_order_mode = "success_above_failures"
@@ -386,6 +388,8 @@ class Go2BoxParkour1BoxCfg(Go2BoxParkourCfg):
 
     class box_progress(Go2BoxParkourCfg.box_progress):
         required_boxes = 1
+        recovery_steps = 3
+        recovery_min_forward_distance = 0.25
         min_landing_zone_length = 2.0
         landing_min_forward_distance = 0.6
         landing_horizontal_speed_threshold = 1.2
@@ -397,8 +401,13 @@ class Go2BoxParkour1BoxCfg(Go2BoxParkourCfg):
 
     class one_box_curriculum:
         enabled = True
-        state_version = 1
-        stage_names = ("front_contact", "rear_contact", "full_traversal")
+        state_version = 2
+        stage_names = (
+            "front_contact",
+            "rear_contact",
+            "traversal_recovery",
+            "stable_landing",
+        )
         low_height_layouts = (0, 1, 2)
         full_height_layouts = (2, 3, 4, 5, 6)
         minimum_stage_iterations = 100
@@ -420,7 +429,7 @@ class Go2BoxParkour1BoxCfgPPO(Go2BoxParkourCfgPPO):
         reference_kl_start_coef = 0.0
 
     class runner(Go2BoxParkourCfgPPO.runner):
-        run_name = "one_box_v184_gait_repair_from2500"
+        run_name = "one_box_v185_split_landing_from2500"
         init_at_random_ep_len = False
         resume = True
         load_run = osp.join(
@@ -431,7 +440,7 @@ class Go2BoxParkour1BoxCfgPPO(Go2BoxParkourCfgPPO):
         )
         checkpoint = 2500
         ckpt_manipulator = None
-        max_iterations = 200
+        max_iterations = 400
         save_interval = 50
         log_interval = 50
 

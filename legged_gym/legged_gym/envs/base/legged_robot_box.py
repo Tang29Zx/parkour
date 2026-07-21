@@ -69,6 +69,10 @@ class LeggedRobotBox(LeggedRobot):
             rear_contact_required_steps=(
                 progress_cfg.rear_contact_required_steps
             ),
+            recovery_steps=getattr(progress_cfg, "recovery_steps", 3),
+            recovery_min_forward_distance=getattr(
+                progress_cfg, "recovery_min_forward_distance", 0.25
+            ),
             landing_steps=progress_cfg.landing_steps,
             landing_min_forward_distance=getattr(
                 progress_cfg, "landing_min_forward_distance", 0.0
@@ -476,6 +480,8 @@ class LeggedRobotBox(LeggedRobot):
         self.severe_body_impact_buf = tracker.severe_body_impact_buf
         self.curriculum_success_buf = tracker.curriculum_success_buf
         self.stagnation_buf = tracker.stagnation_buf
+        self.recovery_counter = tracker.recovery_counter
+        self.best_recovery_hold_steps = tracker.best_recovery_hold_steps
         self.landing_counter = tracker.landing_counter
         self.landing_phase_start_step = tracker.landing_phase_start_step
         self.steps_in_landing_phase = tracker.steps_in_landing_phase
@@ -2184,6 +2190,9 @@ class LeggedRobotBox(LeggedRobot):
         episode["stagnation_rate"] = (
             self.stagnation_buf[env_ids].float().mean()
         )
+        episode["mean_best_recovery_hold_steps"] = (
+            self.best_recovery_hold_steps[env_ids].float().mean()
+        )
         episode["curriculum_success_rate"] = (
             self.curriculum_success_buf[env_ids].float().mean()
         )
@@ -2354,6 +2363,10 @@ class LeggedRobotBox(LeggedRobot):
             "calf_collision",
             "rear_support_missing",
             "flat_airborne",
+            "lateral_velocity_square",
+            "flat_lateral_position",
+            "flat_yaw_abs",
+            "world_overspeed",
             "rear_upper_joint_excursion",
             "exceed_dof_pos_limits",
             "exceed_torque_limits_l1norm",
@@ -2567,7 +2580,9 @@ class LeggedRobotBox(LeggedRobot):
                 "initialize_one_box_from_rough2000 exactly once."
             )
         expected_version = int(self.cfg.one_box_curriculum.state_version)
-        if int(state.get("version", -1)) != expected_version:
+        loaded_version = int(state.get("version", -1))
+        legacy_stage_c = loaded_version == 1 and expected_version == 2
+        if loaded_version != expected_version and not legacy_stage_c:
             raise RuntimeError(
                 "Unsupported one-box curriculum checkpoint version."
             )
@@ -2576,7 +2591,8 @@ class LeggedRobotBox(LeggedRobot):
         max_height_level = len(
             self.cfg.one_box_curriculum.full_height_layouts
         ) - 1
-        if not 0 <= stage <= 2:
+        max_stage = len(self.cfg.one_box_curriculum.stage_names) - 1
+        if not 0 <= stage <= max_stage:
             raise RuntimeError("One-box curriculum stage is out of range.")
         if not 0 <= height_level <= max_height_level:
             raise RuntimeError(
@@ -2591,7 +2607,9 @@ class LeggedRobotBox(LeggedRobot):
         self.one_box_stage_start_iteration = int(
             state["stage_start_iteration"]
         )
-        self.one_box_stable_windows = int(state["stable_windows"])
+        self.one_box_stable_windows = (
+            0 if legacy_stage_c else int(state["stable_windows"])
+        )
         self.one_box_curriculum_promoted = False
 
     @staticmethod
@@ -2602,7 +2620,7 @@ class LeggedRobotBox(LeggedRobot):
         return float(value)
 
     def update_task_curriculum(self, episode_summary, iteration):
-        """Promote A/B/C or the Stage-C height after stable success windows."""
+        """Promote A/B/C1/C2 or the final-stage height after stable windows."""
         self.one_box_curriculum_promoted = False
         if not self.uses_task_curriculum:
             return False
@@ -2627,7 +2645,8 @@ class LeggedRobotBox(LeggedRobot):
             return False
 
         promoted = False
-        if self.one_box_curriculum_stage < 2:
+        final_stage = len(cfg.stage_names) - 1
+        if self.one_box_curriculum_stage < final_stage:
             self.one_box_curriculum_stage += 1
             self.one_box_height_level = 0
             promoted = True
@@ -2706,6 +2725,12 @@ class LeggedRobotBox(LeggedRobot):
         return self._task_quality_repair_gate() * (
             1.0 - self._box_speed_blend()
         )
+
+    def _stable_landing_curriculum_gate(self):
+        """Enable strict landing shaping only in the final one-box stage."""
+        if not bool(getattr(self, "uses_task_curriculum", False)):
+            return torch.ones_like(self.episode_length_buf, dtype=torch.float)
+        return (self.episode_curriculum_stage >= 3).float()
 
     def _reward_speed_error_square(self):
         """Penalize command error while preserving a short box-speed allowance."""
@@ -2887,11 +2912,14 @@ class LeggedRobotBox(LeggedRobot):
 
     def _reward_landing_quality_progress(self):
         """Reward only a new high-water mark in landing quality."""
-        return self.landing_quality_delta
+        return (
+            self.landing_quality_delta
+            * self._stable_landing_curriculum_gate()
+        )
 
     def _reward_landing_hold_progress(self):
         """Reward only a new high-water mark in stable landing duration."""
-        return self.landing_hold_delta
+        return self.landing_hold_delta * self._stable_landing_curriculum_gate()
 
     def _reward_landing_deceleration_progress(self):
         """Reward only new high-water progress toward landing speed."""
@@ -2899,7 +2927,10 @@ class LeggedRobotBox(LeggedRobot):
 
     def _reward_landing_alignment_progress(self):
         """Reward only new high-water progress in yaw and lateral alignment."""
-        return self.landing_alignment_delta
+        return (
+            self.landing_alignment_delta
+            * self._stable_landing_curriculum_gate()
+        )
 
     def _reward_flat_orientation(self):
         """Penalize base tilt only outside the active box maneuver window."""
@@ -3114,3 +3145,12 @@ class LeggedRobotBox(LeggedRobot):
     def _reward_success(self):
         """Emit one event after the required boxes and a stable landing."""
         return self.success_buf.float()
+
+    def _reward_recovery_success(self):
+        """Reward the Stage-C1 transition after basic post-box support."""
+        if not bool(getattr(self, "uses_task_curriculum", False)):
+            return torch.zeros_like(self.success_buf, dtype=torch.float)
+        return (
+            self.curriculum_success_buf
+            & (self.episode_curriculum_stage == 2)
+        ).float()

@@ -22,6 +22,8 @@ class BoxProgressTracker:
         rear_foot_indices=(2, 3),
         front_contact_required_steps=2,
         rear_contact_required_steps=2,
+        recovery_steps=3,
+        recovery_min_forward_distance=0.25,
         landing_steps=10,
         landing_min_forward_distance=0.0,
         landing_min_current_feet=2,
@@ -56,6 +58,12 @@ class BoxProgressTracker:
             raise ValueError("Box contact requirements must be positive.")
         if landing_steps <= 0:
             raise ValueError("landing_steps must be positive.")
+        if recovery_steps <= 0:
+            raise ValueError("recovery_steps must be positive.")
+        if recovery_min_forward_distance < 0.0:
+            raise ValueError(
+                "recovery_min_forward_distance must be non-negative."
+            )
         if landing_min_forward_distance < 0.0:
             raise ValueError(
                 "landing_min_forward_distance must be non-negative."
@@ -98,6 +106,10 @@ class BoxProgressTracker:
         )
         self.front_contact_required_steps = int(front_contact_required_steps)
         self.rear_contact_required_steps = int(rear_contact_required_steps)
+        self.recovery_steps = int(recovery_steps)
+        self.recovery_min_forward_distance = float(
+            recovery_min_forward_distance
+        )
         self.landing_steps = int(landing_steps)
         self.landing_min_forward_distance = float(
             landing_min_forward_distance
@@ -171,6 +183,8 @@ class BoxProgressTracker:
             self.next_box_idx
         )
         self.body_contact_step_count = torch.zeros_like(self.next_box_idx)
+        self.recovery_counter = torch.zeros_like(self.next_box_idx)
+        self.best_recovery_hold_steps = torch.zeros_like(self.next_box_idx)
         self.landing_counter = torch.zeros_like(self.next_box_idx)
         self.best_landing_hold_steps = torch.zeros_like(self.next_box_idx)
         self.landing_phase_start_step = torch.full_like(
@@ -251,6 +265,8 @@ class BoxProgressTracker:
         self.body_contact_window_count[env_ids] = 0
         self.max_body_contact_window_count[env_ids] = 0
         self.body_contact_step_count[env_ids] = 0
+        self.recovery_counter[env_ids] = 0
+        self.best_recovery_hold_steps[env_ids] = 0
         self.landing_counter[env_ids] = 0
         self.best_landing_hold_steps[env_ids] = 0
         self.landing_phase_start_step[env_ids] = -1
@@ -510,6 +526,39 @@ class BoxProgressTracker:
             else torch.ones_like(rear_foot_support)
         )
         no_body_contact = ~body_contact
+        in_recovery_zone = (
+            course_complete
+            & (
+                base_positions[:, 0]
+                > course_rear + self.recovery_min_forward_distance
+            )
+            & (base_positions[:, 0] < landing_end_x)
+            & (lateral_offset <= self.lateral_limit)
+        )
+        basic_recovery = (
+            in_recovery_zone
+            & two_feet_valid
+            & rear_support_valid
+            & no_body_contact
+            & roll_valid
+            & pitch_valid
+            & height_valid
+            & vertical_speed_valid
+        )
+        self.recovery_counter[:] = torch.where(
+            basic_recovery,
+            self.recovery_counter + 1,
+            torch.zeros_like(self.recovery_counter),
+        )
+        recovery_success = self.recovery_counter >= self.recovery_steps
+        self.best_recovery_hold_steps[:] = torch.maximum(
+            self.best_recovery_hold_steps,
+            self.recovery_counter,
+        )
+        if curriculum_stage is not None:
+            curriculum_success_candidate |= (
+                (curriculum_stage == 2) & recovery_success
+            )
         stable_landing = (
             in_landing_zone
             & two_feet_valid
