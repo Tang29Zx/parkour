@@ -2027,6 +2027,148 @@ class BoxRewardTest(unittest.TestCase):
 
         torch.testing.assert_close(reward, torch.tensor([0.0, 1.0, 0.0]))
 
+    def test_box_approach_overspeed_is_local_and_stops_after_front_contact(self):
+        env = SimpleNamespace(
+            num_envs=5,
+            device="cpu",
+            root_states=torch.zeros(5, 13),
+            next_box_idx=torch.tensor([0, 0, 0, 1, 0]),
+            front_contact_counter=torch.tensor([0, 0, 2, 0, 0]),
+            env_box_bounds=torch.tensor(
+                [[[1.0, 2.0, -0.8, 0.8, 0.12]]]
+            ).repeat(5, 1, 1),
+            box_progress=SimpleNamespace(
+                required_boxes=1,
+                front_contact_required_steps=2,
+                pass_margin=0.15,
+            ),
+            cfg=SimpleNamespace(
+                rewards=SimpleNamespace(
+                    box_approach_speed_window=0.5,
+                    box_approach_speed_limit=1.0,
+                    box_approach_speed_normalization=1.0,
+                )
+            ),
+        )
+        env.root_states[:, 0] = torch.tensor([0.6, 0.6, 0.6, 0.6, 1.2])
+        env.root_states[:, 7] = torch.tensor([2.0, 0.5, 2.0, 2.0, 2.0])
+
+        reward = self.LeggedRobotBox._reward_box_approach_overspeed(env)
+
+        torch.testing.assert_close(
+            reward, torch.tensor([1.0, 0.0, 0.0, 0.0, 0.0])
+        )
+
+    def test_rear_swing_penalties_start_only_after_both_groups_contact(self):
+        env = SimpleNamespace(
+            next_box_idx=torch.tensor([0, 0, 0, 1]),
+            front_contact_counter=torch.tensor([2, 2, 1, 2]),
+            rear_contact_counter=torch.tensor([2, 1, 2, 2]),
+            box_progress=SimpleNamespace(
+                required_boxes=1,
+                front_contact_required_steps=2,
+                rear_contact_required_steps=2,
+            ),
+            rear_upper_joint_indices=torch.tensor([0, 1, 2, 3]),
+            dof_vel=torch.tensor(
+                [
+                    [5.0, 8.0, 2.0, 5.0],
+                    [8.0, 8.0, 8.0, 8.0],
+                    [8.0, 8.0, 8.0, 8.0],
+                    [8.0, 8.0, 8.0, 8.0],
+                ]
+            ),
+            actions=torch.tensor(
+                [
+                    [0.0, 0.60, 0.35, 0.10],
+                    [1.0, 1.0, 1.0, 1.0],
+                    [1.0, 1.0, 1.0, 1.0],
+                    [1.0, 1.0, 1.0, 1.0],
+                ]
+            ),
+            last_actions=torch.zeros(4, 4),
+            episode_length_buf=torch.full((4,), 2),
+            cfg=SimpleNamespace(
+                rewards=SimpleNamespace(
+                    rear_post_contact_velocity_threshold=5.0,
+                    rear_post_contact_velocity_normalization=3.0,
+                    rear_post_contact_action_delta_threshold=0.35,
+                    rear_post_contact_action_delta_normalization=0.25,
+                )
+            ),
+        )
+
+        velocity_reward = (
+            self.LeggedRobotBox._reward_rear_post_contact_velocity(env)
+        )
+        action_reward = (
+            self.LeggedRobotBox._reward_rear_post_contact_action_rate(env)
+        )
+
+        torch.testing.assert_close(
+            velocity_reward, torch.tensor([0.25, 0.0, 0.0, 0.0])
+        )
+        torch.testing.assert_close(
+            action_reward, torch.tensor([0.25, 0.0, 0.0, 0.0])
+        )
+
+    def test_front_box_motion_penalties_are_weak_and_local(self):
+        env = SimpleNamespace(
+            next_box_idx=torch.tensor([0, 0, 0, 1]),
+            box_progress=SimpleNamespace(required_boxes=1),
+            front_upper_joint_indices=torch.arange(4),
+            dof_vel=torch.tensor(
+                [
+                    [7.0, 7.0, 7.0, 7.0],
+                    [11.0, 7.0, 7.0, 7.0],
+                    [11.0, 11.0, 11.0, 11.0],
+                    [11.0, 11.0, 11.0, 11.0],
+                ]
+            ),
+            dof_pos=torch.tensor(
+                [
+                    [0.65, 0.65, 1.35, 1.35],
+                    [1.15, 0.65, 1.35, 1.35],
+                    [1.15, 1.15, 1.85, 1.85],
+                    [1.15, 1.15, 1.85, 1.85],
+                ]
+            ),
+            default_dof_pos=torch.zeros(4, 4),
+            actions=torch.tensor(
+                [
+                    [0.50, 0.50, 0.50, 0.50],
+                    [0.85, 0.50, 0.50, 0.50],
+                    [0.85, 0.85, 0.85, 0.85],
+                    [0.85, 0.85, 0.85, 0.85],
+                ]
+            ),
+            last_actions=torch.zeros(4, 4),
+            episode_length_buf=torch.full((4,), 2),
+            cfg=SimpleNamespace(
+                rewards=SimpleNamespace(
+                    front_box_velocity_threshold=7.0,
+                    front_box_velocity_normalization=4.0,
+                    front_box_action_delta_threshold=0.50,
+                    front_box_action_delta_normalization=0.35,
+                    front_box_hip_allowance=0.65,
+                    front_box_thigh_allowance=1.35,
+                    front_box_excursion_normalization=0.50,
+                )
+            ),
+        )
+        env._near_box_for_speed_control = lambda: torch.tensor(
+            [True, True, False, True]
+        )
+
+        velocity = self.LeggedRobotBox._reward_front_box_velocity(env)
+        action_rate = self.LeggedRobotBox._reward_front_box_action_rate(env)
+        excursion = self.LeggedRobotBox._reward_front_box_excursion(env)
+
+        expected = torch.tensor([0.0, 0.25, 0.0, 0.0])
+        torch.testing.assert_close(velocity, expected)
+        torch.testing.assert_close(action_rate, expected)
+        torch.testing.assert_close(excursion, expected)
+
     def test_center_and_direction_shaping_stays_below_terminal_costs(self):
         scales = self.one_box_cfg.rewards.scales
         dt = 0.02
@@ -2518,6 +2660,14 @@ class BoxRewardTest(unittest.TestCase):
         self.assertEqual(scales.flat_lateral_position, -0.3)
         self.assertEqual(scales.flat_yaw_abs, -0.2)
         self.assertEqual(scales.world_overspeed, -0.5)
+        self.assertEqual(scales.thigh_collision, -0.1)
+        self.assertEqual(scales.calf_collision, -0.5)
+        self.assertEqual(scales.box_approach_overspeed, -1.0)
+        self.assertEqual(scales.front_box_velocity, -0.5)
+        self.assertEqual(scales.front_box_action_rate, -0.1)
+        self.assertEqual(scales.front_box_excursion, -0.1)
+        self.assertEqual(scales.rear_post_contact_velocity, -2.0)
+        self.assertEqual(scales.rear_post_contact_action_rate, -0.5)
         self.assertEqual(scales.front_foot_lift_progress, 0.0)
         self.assertEqual(scales.front_foot_reach_progress, 0.0)
         self.assertEqual(scales.rear_foot_lift_progress, 0.0)
@@ -2557,14 +2707,28 @@ class BoxRewardTest(unittest.TestCase):
             env_cfg.rewards.reward_order_mode,
             "success_above_failures",
         )
+        self.assertEqual(env_cfg.rewards.foot_clearance_height, 0.04)
+        self.assertEqual(env_cfg.rewards.box_approach_speed_limit, 1.0)
+        self.assertEqual(env_cfg.rewards.front_box_velocity_threshold, 7.0)
+        self.assertEqual(
+            env_cfg.rewards.front_box_action_delta_threshold, 0.50
+        )
+        self.assertEqual(env_cfg.rewards.front_box_hip_allowance, 0.65)
+        self.assertEqual(env_cfg.rewards.front_box_thigh_allowance, 1.35)
+        self.assertEqual(
+            env_cfg.rewards.rear_post_contact_velocity_threshold, 5.0
+        )
+        self.assertEqual(
+            env_cfg.rewards.rear_post_contact_action_delta_threshold, 0.35
+        )
 
         runner = train_cfg.runner
         algorithm = train_cfg.algorithm
         self.assertTrue(runner.resume)
-        self.assertEqual(runner.checkpoint, 2600)
+        self.assertEqual(runner.checkpoint, 3350)
         self.assertTrue(
             runner.load_run.endswith(
-                "Jul21_20-35-45_one_box_v186_from2500"
+                "Jul21_22-01-16_one_box_v187_from2600"
             )
         )
         self.assertTrue(
@@ -2574,10 +2738,10 @@ class BoxRewardTest(unittest.TestCase):
             )
         )
         self.assertEqual(
-            runner.run_name, "one_box_v187_smooth_landing_from2600"
+            runner.run_name, "one_box_v188_clean_box_from3350"
         )
         self.assertIsNone(runner.ckpt_manipulator)
-        self.assertEqual(runner.max_iterations, 1200)
+        self.assertEqual(runner.max_iterations, 2000)
         self.assertEqual(runner.save_interval, 50)
         self.assertEqual(runner.log_interval, 50)
         self.assertEqual(algorithm.freeze_actor_encoder_iterations, 100)

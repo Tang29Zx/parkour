@@ -341,8 +341,16 @@ class Go2BoxParkour1BoxCfg(Go2BoxParkourCfg):
             dof_error_named = 0.0
             dof_error = 0.0
             body_collision = -5.0
-            thigh_collision = 0.0
-            calf_collision = 0.0
+            thigh_collision = -0.1
+            calf_collision = -0.5
+            box_approach_overspeed = -1.0
+            # Keep necessary front-foot lift, but trim visibly excessive
+            # upper-leg motion in the active box window.
+            front_box_velocity = -0.5
+            front_box_action_rate = -0.1
+            front_box_excursion = -0.1
+            rear_post_contact_velocity = -2.0
+            rear_post_contact_action_rate = -0.5
             rear_support_missing = -0.2
             flat_airborne = -0.2
             lateral_velocity_square = -0.3
@@ -376,10 +384,24 @@ class Go2BoxParkour1BoxCfg(Go2BoxParkourCfg):
 
         failure_progress_scaling = False
         reward_order_mode = "success_above_failures"
-        foot_clearance_height = 0.03
+        foot_clearance_height = 0.04
         foot_clearance_start_distance = 0.30
         foot_clearance_target_inset = 0.12
         post_front_base_target_fraction = 0.65
+        box_approach_speed_window = 0.5
+        box_approach_speed_limit = 1.0
+        box_approach_speed_normalization = 1.0
+        front_box_velocity_threshold = 7.0
+        front_box_velocity_normalization = 4.0
+        front_box_action_delta_threshold = 0.50
+        front_box_action_delta_normalization = 0.35
+        front_box_hip_allowance = 0.65
+        front_box_thigh_allowance = 1.35
+        front_box_excursion_normalization = 0.50
+        rear_post_contact_velocity_threshold = 5.0
+        rear_post_contact_velocity_normalization = 3.0
+        rear_post_contact_action_delta_threshold = 0.35
+        rear_post_contact_action_delta_normalization = 0.25
         # Enable gait repair only after the front/rear contact stages have
         # completed. The active box window remains unconstrained.
         quality_repair_min_curriculum_stage = 2
@@ -455,25 +477,24 @@ class Go2BoxParkour1BoxCfgPPO(Go2BoxParkourCfgPPO):
         reference_kl_start_coef = 0.02
 
     class runner(Go2BoxParkourCfgPPO.runner):
-        run_name = "one_box_v187_smooth_landing_from2600"
+        run_name = "one_box_v188_clean_box_from3350"
         init_at_random_ep_len = False
         resume = True
         load_run = osp.join(
             osp.dirname(osp.dirname(osp.dirname(osp.dirname(__file__)))),
             "logs",
             "go2_box_parkour",
-            "Jul21_20-35-45_one_box_v186_from2500",
+            "Jul21_22-01-16_one_box_v187_from2600",
         )
         reference_policy_path = osp.join(
             osp.dirname(load_run),
             "Jul21_18-05-59_one_box_v183_from_rough2000",
             "model_2100_warmup.pt",
         )
-        checkpoint = 2600
-        # V18.6 already contains the reference Actor and trained optimizer.
-        # Loading its version-2 task state initializes landing_blend at zero.
+        checkpoint = 3350
+        # Resume the V18.7 curriculum, Critic, optimizer, and reference policy.
         ckpt_manipulator = None
-        max_iterations = 1200
+        max_iterations = 2000
         save_interval = 50
         log_interval = 50
 
