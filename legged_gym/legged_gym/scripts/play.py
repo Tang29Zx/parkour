@@ -520,10 +520,11 @@ if __name__ == '__main__':
         dict(name= "--no_throw", action= "store_true", default= False),
         dict(name= "--load_cfg", action= "store_true", default= False, help= "use the config from the logdir"),
         dict(name= "--command_x", type= float, default= None, help= "fixed forward command for policy playback; defaults to 1.2 m/s"),
+        dict(name= "--free_camera", action= "store_true", default= False, help= "disable automatic camera following so the viewer camera can be controlled with the mouse"),
         dict(name= "--record", action= "store_true", default= False, help= "record frames"),
         dict(name= "--frames_dir", type= str, default= "images", help= "which folder to store intermediate recorded frames."),
     ])
-    MOVE_CAMERA = (args.num_envs is None)
+    MOVE_CAMERA = (args.num_envs is None) and not args.free_camera
     CAMERA_FOLLOW = MOVE_CAMERA
     RECORD_FRAMES = args.record
     try:
