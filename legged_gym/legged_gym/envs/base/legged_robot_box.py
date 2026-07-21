@@ -308,7 +308,17 @@ class LeggedRobotBox(LeggedRobot):
         self.front_foot_lift_delta = torch.zeros_like(
             self.forward_speed_sum
         )
-        self.front_foot_lift_target_idx = torch.full(
+        self.front_foot_reach_best = torch.zeros_like(
+            self.forward_speed_sum
+        )
+        self.front_foot_reach_delta = torch.zeros_like(
+            self.forward_speed_sum
+        )
+        self.rear_foot_lift_best = torch.zeros_like(self.forward_speed_sum)
+        self.rear_foot_lift_delta = torch.zeros_like(self.forward_speed_sum)
+        self.rear_foot_reach_best = torch.zeros_like(self.forward_speed_sum)
+        self.rear_foot_reach_delta = torch.zeros_like(self.forward_speed_sum)
+        self.front_foot_guidance_target_idx = torch.full(
             (self.num_envs,), -1, dtype=torch.long, device=self.device
         )
         self.progress_reward_initialized = torch.zeros(
@@ -472,25 +482,37 @@ class LeggedRobotBox(LeggedRobot):
         self.course_progress_delta_buf[uninitialized] = 0.0
         self.rewarded_progress_ratio[:] = new_high_water_mark
 
-    def _update_front_foot_lift_progress(
-        self, feet_positions, feet_contact_forces
+    def _update_foot_guidance_progress(
+        self, feet_positions, feet_terrain_heights, feet_contact_forces
     ):
-        """Reward a new front-foot clearance high-water mark near the box."""
+        """Update staged, non-repeatable front/rear box-foot guidance."""
         self.front_foot_lift_delta.zero_()
-        scale = float(
-            getattr(
-                self.cfg.rewards.scales,
-                "front_foot_lift_progress",
-                0.0,
-            )
+        self.front_foot_reach_delta.zero_()
+        self.rear_foot_lift_delta.zero_()
+        self.rear_foot_reach_delta.zero_()
+        scales = self.cfg.rewards.scales
+        guidance_scales = (
+            float(getattr(scales, "front_foot_lift_progress", 0.0)),
+            float(getattr(scales, "front_foot_reach_progress", 0.0)),
+            float(getattr(scales, "rear_foot_lift_progress", 0.0)),
+            float(getattr(scales, "rear_foot_reach_progress", 0.0)),
         )
-        if scale == 0.0:
+        if not any(scale != 0.0 for scale in guidance_scales):
             return
 
         cfg = self.cfg.rewards
         approach_distance = float(cfg.front_foot_lift_approach_distance)
         clearance = float(cfg.front_foot_lift_clearance)
         lateral_margin = float(cfg.front_foot_lift_lateral_margin)
+        reach_start_distance = float(
+            cfg.front_foot_reach_start_distance
+        )
+        reach_target_inset = float(cfg.front_foot_reach_target_inset)
+        reach_height_tolerance = float(
+            cfg.front_foot_reach_height_tolerance
+        )
+        reach_base_overrun = float(cfg.front_foot_reach_base_overrun)
+        min_forward_speed = float(cfg.foot_guidance_min_forward_speed)
         if approach_distance <= 0.0 or clearance < 0.0:
             raise ValueError(
                 "Front-foot lift distances must be positive/non-negative."
@@ -499,58 +521,184 @@ class LeggedRobotBox(LeggedRobot):
             raise ValueError(
                 "front_foot_lift_lateral_margin must be non-negative."
             )
+        if min(reach_start_distance, reach_target_inset) <= 0.0:
+            raise ValueError(
+                "Front-foot reach start/target distances must be positive."
+            )
+        if min(reach_height_tolerance, reach_base_overrun) < 0.0:
+            raise ValueError(
+                "Front-foot reach tolerance/overrun must be non-negative."
+            )
+        if min_forward_speed < 0.0:
+            raise ValueError(
+                "foot_guidance_min_forward_speed must be non-negative."
+            )
 
         active = self.next_box_idx < self.box_progress.required_boxes
         target_indices = self.next_box_idx.clamp(
             max=self.box_progress.required_boxes - 1
         )
         target_changed = (
-            self.front_foot_lift_target_idx != target_indices
+            self.front_foot_guidance_target_idx != target_indices
         )
         self.front_foot_lift_best[target_changed] = 0.0
-        self.front_foot_lift_target_idx[:] = target_indices
+        self.front_foot_reach_best[target_changed] = 0.0
+        self.rear_foot_lift_best[target_changed] = 0.0
+        self.rear_foot_reach_best[target_changed] = 0.0
+        self.front_foot_guidance_target_idx[:] = target_indices
 
         env_ids = torch.arange(self.num_envs, device=self.device)
         target_bounds = self.env_box_bounds[env_ids, target_indices]
         base_x = self.root_states[:, 0]
         base_y = self.root_states[:, 1]
-        in_approach_window = (
+        front_base_window = (
             (base_x >= target_bounds[:, 0] - approach_distance)
-            & (base_x <= target_bounds[:, 0])
+            & (base_x <= target_bounds[:, 0] + reach_base_overrun)
             & (base_y >= target_bounds[:, 2] - lateral_margin)
             & (base_y <= target_bounds[:, 3] + lateral_margin)
         )
-        needs_front_contact = (
-            self.front_contact_counter
-            < self.box_progress.front_contact_required_steps
+        rear_base_window = (
+            (base_x >= target_bounds[:, 0] - approach_distance)
+            & (
+                base_x
+                <= target_bounds[:, 1] + self.box_progress.pass_margin
+            )
+            & (base_y >= target_bounds[:, 2] - lateral_margin)
+            & (base_y <= target_bounds[:, 3] + lateral_margin)
+        )
+        approaching = self.root_states[:, 7] >= min_forward_speed
+        front_stage = (
+            active
+            & front_base_window
+            & approaching
+            & (
+                self.front_contact_counter
+                < self.box_progress.front_contact_required_steps
+            )
+        )
+        rear_stage = (
+            active
+            & rear_base_window
+            & approaching
+            & (
+                self.front_contact_counter
+                >= self.box_progress.front_contact_required_steps
+            )
+            & (
+                self.rear_contact_counter
+                < self.box_progress.rear_contact_required_steps
+            )
         )
 
-        front_positions = feet_positions[:, self.front_foot_local_indices]
-        front_forces = feet_contact_forces[
-            :, self.front_foot_local_indices
-        ]
-        swing_feet = (
-            torch.linalg.vector_norm(front_forces, dim=-1)
-            <= self.cfg.box_progress.contact_force_threshold
+        top_height = target_bounds[:, 4].unsqueeze(1)
+        edge_start_x = (
+            target_bounds[:, 0] - reach_start_distance
+        ).unsqueeze(1)
+        edge_target_x = (
+            target_bounds[:, 0] + reach_target_inset
+        ).unsqueeze(1)
+        top_front_x = target_bounds[:, 0].unsqueeze(1)
+        top_rear_x = target_bounds[:, 1].unsqueeze(1)
+        top_min_y = target_bounds[:, 2].unsqueeze(1)
+        top_max_y = target_bounds[:, 3].unsqueeze(1)
+        clearance_start = top_height - reach_height_tolerance
+        clearance_target = top_height + clearance
+        clearance_range = (
+            clearance_target - clearance_start
+        ).clamp_min(1e-6)
+
+        def update_group(
+            local_indices,
+            stage,
+            lift_best,
+            lift_delta,
+            reach_best,
+            reach_delta,
+        ):
+            positions = feet_positions[:, local_indices]
+            terrain_heights = feet_terrain_heights[:, local_indices]
+            forces = feet_contact_forces[:, local_indices]
+            force_magnitudes = torch.linalg.vector_norm(forces, dim=-1)
+            swing_feet = (
+                force_magnitudes
+                <= self.cfg.box_progress.contact_force_threshold
+            )
+            near_front_edge = (
+                (positions[:, :, 0] >= edge_start_x)
+                & (positions[:, :, 0] <= edge_target_x)
+                & (positions[:, :, 1] >= top_min_y)
+                & (positions[:, :, 1] <= top_max_y)
+            )
+            clearance_progress = (
+                (positions[:, :, 2] - clearance_start) / clearance_range
+            ).clamp(0.0, 1.0)
+            clearance_progress = torch.where(
+                swing_feet & near_front_edge,
+                clearance_progress,
+                torch.zeros_like(clearance_progress),
+            ).max(dim=1).values
+            clearance_progress = torch.where(
+                stage,
+                clearance_progress,
+                torch.zeros_like(clearance_progress),
+            )
+            new_lift_best = torch.maximum(lift_best, clearance_progress)
+            lift_delta[:] = (new_lift_best - lift_best).clamp_min(0.0)
+            lift_best[:] = new_lift_best
+
+            top_contact = (
+                (positions[:, :, 0] >= top_front_x)
+                & (positions[:, :, 0] <= top_rear_x)
+                & (positions[:, :, 1] >= top_min_y)
+                & (positions[:, :, 1] <= top_max_y)
+                & ((terrain_heights - top_height).abs() <= 1e-6)
+                & (
+                    (positions[:, :, 2] - top_height).abs()
+                    <= self.box_progress.top_contact_tolerance
+                )
+                & (
+                    force_magnitudes
+                    > self.cfg.box_progress.contact_force_threshold
+                )
+            )
+            placement_progress = (
+                (positions[:, :, 0] - top_front_x)
+                / reach_target_inset
+            ).clamp(0.0, 1.0)
+            placement_progress = torch.where(
+                top_contact,
+                placement_progress,
+                torch.zeros_like(placement_progress),
+            ).max(dim=1).values
+            placement_progress = torch.where(
+                stage,
+                placement_progress,
+                torch.zeros_like(placement_progress),
+            )
+            new_reach_best = torch.maximum(
+                reach_best, placement_progress
+            )
+            reach_delta[:] = (
+                new_reach_best - reach_best
+            ).clamp_min(0.0)
+            reach_best[:] = new_reach_best
+
+        update_group(
+            self.front_foot_local_indices,
+            front_stage,
+            self.front_foot_lift_best,
+            self.front_foot_lift_delta,
+            self.front_foot_reach_best,
+            self.front_foot_reach_delta,
         )
-        ground_height = self.env_origins[:, 2].unsqueeze(1)
-        target_height = target_bounds[:, 4].unsqueeze(1) + clearance
-        height_range = (target_height - ground_height).clamp_min(1e-6)
-        lift_progress = (
-            (front_positions[:, :, 2] - ground_height) / height_range
-        ).clamp(0.0, 1.0)
-        lift_progress = torch.where(
-            swing_feet, lift_progress, torch.zeros_like(lift_progress)
-        ).max(dim=1).values
-        valid = active & in_approach_window & needs_front_contact
-        lift_progress = torch.where(
-            valid, lift_progress, torch.zeros_like(lift_progress)
+        update_group(
+            self.rear_foot_local_indices,
+            rear_stage,
+            self.rear_foot_lift_best,
+            self.rear_foot_lift_delta,
+            self.rear_foot_reach_best,
+            self.rear_foot_reach_delta,
         )
-        new_best = torch.maximum(self.front_foot_lift_best, lift_progress)
-        self.front_foot_lift_delta[:] = (
-            new_best - self.front_foot_lift_best
-        ).clamp_min(0.0)
-        self.front_foot_lift_best[:] = new_best
 
     def _refresh_box_course_data(self):
         track_indices = torch.stack(
@@ -1501,8 +1649,8 @@ class LeggedRobotBox(LeggedRobot):
             > self.cfg.box_progress.contact_force_threshold
         )
 
-        self._update_front_foot_lift_progress(
-            feet_positions, feet_contact_forces
+        self._update_foot_guidance_progress(
+            feet_positions, feet_terrain_heights, feet_contact_forces
         )
 
         self.box_progress.update(
@@ -1711,6 +1859,24 @@ class LeggedRobotBox(LeggedRobot):
         episode["front_foot_lift_target_rate"] = (
             self.front_foot_lift_best[env_ids] >= 1.0 - 1e-6
         ).float().mean()
+        episode["front_foot_reach_progress_mean"] = (
+            self.front_foot_reach_best[env_ids].mean()
+        )
+        episode["front_foot_reach_target_rate"] = (
+            self.front_foot_reach_best[env_ids] >= 1.0 - 1e-6
+        ).float().mean()
+        episode["rear_foot_lift_progress_mean"] = (
+            self.rear_foot_lift_best[env_ids].mean()
+        )
+        episode["rear_foot_lift_target_rate"] = (
+            self.rear_foot_lift_best[env_ids] >= 1.0 - 1e-6
+        ).float().mean()
+        episode["rear_foot_reach_progress_mean"] = (
+            self.rear_foot_reach_best[env_ids].mean()
+        )
+        episode["rear_foot_reach_target_rate"] = (
+            self.rear_foot_reach_best[env_ids] >= 1.0 - 1e-6
+        ).float().mean()
         episode.update(self._get_speed_statistics(env_ids))
         episode.update(self._get_motion_quality_statistics(env_ids))
         episode.update(self._get_flat_gait_statistics(env_ids))
@@ -1872,7 +2038,13 @@ class LeggedRobotBox(LeggedRobot):
         if hasattr(self, "front_foot_lift_best"):
             self.front_foot_lift_best[env_ids] = 0.0
             self.front_foot_lift_delta[env_ids] = 0.0
-            self.front_foot_lift_target_idx[env_ids] = -1
+            self.front_foot_reach_best[env_ids] = 0.0
+            self.front_foot_reach_delta[env_ids] = 0.0
+            self.rear_foot_lift_best[env_ids] = 0.0
+            self.rear_foot_lift_delta[env_ids] = 0.0
+            self.rear_foot_reach_best[env_ids] = 0.0
+            self.rear_foot_reach_delta[env_ids] = 0.0
+            self.front_foot_guidance_target_idx[env_ids] = -1
         if hasattr(self, "landing_entry_horizontal_speed"):
             self.landing_entry_horizontal_speed[env_ids] = 0.0
             self.landing_deceleration_best[env_ids] = 0.0
@@ -2271,6 +2443,18 @@ class LeggedRobotBox(LeggedRobot):
     def _reward_front_foot_lift_progress(self):
         """Emit non-repeatable front-foot clearance progress near the box."""
         return self.front_foot_lift_delta
+
+    def _reward_front_foot_reach_progress(self):
+        """Emit non-repeatable forward placement progress near the box top."""
+        return self.front_foot_reach_delta
+
+    def _reward_rear_foot_lift_progress(self):
+        """Emit staged rear-foot clearance progress after front contact."""
+        return self.rear_foot_lift_delta
+
+    def _reward_rear_foot_reach_progress(self):
+        """Emit rear-foot box-top placement progress with real contact."""
+        return self.rear_foot_reach_delta
 
     def _reward_box_rear_foot_contact(self):
         """Emit once after enough rear-foot contact steps on the box top."""

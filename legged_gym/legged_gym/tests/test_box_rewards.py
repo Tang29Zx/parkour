@@ -1421,20 +1421,35 @@ class BoxRewardTest(unittest.TestCase):
             device="cpu",
             cfg=SimpleNamespace(
                 rewards=SimpleNamespace(
-                    scales=SimpleNamespace(front_foot_lift_progress=50.0),
+                    scales=SimpleNamespace(
+                        front_foot_lift_progress=25.0,
+                        front_foot_reach_progress=50.0,
+                        rear_foot_lift_progress=25.0,
+                        rear_foot_reach_progress=50.0,
+                    ),
                     front_foot_lift_approach_distance=0.5,
                     front_foot_lift_clearance=0.03,
                     front_foot_lift_lateral_margin=0.2,
+                    front_foot_reach_start_distance=0.25,
+                    front_foot_reach_target_inset=0.125,
+                    front_foot_reach_height_tolerance=0.02,
+                    front_foot_reach_base_overrun=0.15,
+                    foot_guidance_min_forward_speed=0.05,
                 ),
                 box_progress=SimpleNamespace(contact_force_threshold=1.0),
             ),
             box_progress=SimpleNamespace(
                 required_boxes=1,
                 front_contact_required_steps=2,
+                rear_contact_required_steps=2,
+                pass_margin=0.15,
+                top_contact_tolerance=0.06,
             ),
             next_box_idx=torch.zeros(1, dtype=torch.long),
             front_contact_counter=torch.zeros(1, dtype=torch.long),
+            rear_contact_counter=torch.zeros(1, dtype=torch.long),
             front_foot_local_indices=torch.tensor([0, 1]),
+            rear_foot_local_indices=torch.tensor([2, 3]),
             env_box_bounds=torch.tensor(
                 [[[1.2, 2.4, -0.6, 0.6, 0.15]]]
             ),
@@ -1442,39 +1457,102 @@ class BoxRewardTest(unittest.TestCase):
             root_states=torch.zeros(1, 13),
             front_foot_lift_best=torch.zeros(1),
             front_foot_lift_delta=torch.zeros(1),
-            front_foot_lift_target_idx=torch.full(
+            front_foot_reach_best=torch.zeros(1),
+            front_foot_reach_delta=torch.zeros(1),
+            rear_foot_lift_best=torch.zeros(1),
+            rear_foot_lift_delta=torch.zeros(1),
+            rear_foot_reach_best=torch.zeros(1),
+            rear_foot_reach_delta=torch.zeros(1),
+            front_foot_guidance_target_idx=torch.full(
                 (1,), -1, dtype=torch.long
             ),
         )
         env.root_states[:, 0] = 0.8
+        env.root_states[:, 7] = 0.5
         feet_positions = torch.zeros(1, 4, 3)
         feet_positions[:, :2, 2] = 0.09
+        feet_positions[:, :2, 0] = 0.96
+        feet_terrain_heights = torch.zeros(1, 4)
         feet_forces = torch.zeros(1, 4, 3)
-        update = self.LeggedRobotBox._update_front_foot_lift_progress
+        update = self.LeggedRobotBox._update_foot_guidance_progress
 
-        update(env, feet_positions, feet_forces)
-        self.assertAlmostEqual(env.front_foot_lift_delta.item(), 0.5)
-        update(env, feet_positions, feet_forces)
+        update(env, feet_positions, feet_terrain_heights, feet_forces)
+        self.assertEqual(env.front_foot_lift_delta.item(), 0.0)
+        feet_positions[:, 0, 2] = 0.155
+        update(env, feet_positions, feet_terrain_heights, feet_forces)
+        self.assertAlmostEqual(
+            env.front_foot_lift_delta.item(), 0.5, places=6
+        )
+        update(env, feet_positions, feet_terrain_heights, feet_forces)
         self.assertEqual(env.front_foot_lift_delta.item(), 0.0)
 
         feet_positions[:, 0, 2] = 0.18
-        update(env, feet_positions, feet_forces)
-        self.assertAlmostEqual(env.front_foot_lift_delta.item(), 0.5)
+        update(env, feet_positions, feet_terrain_heights, feet_forces)
+        self.assertAlmostEqual(
+            env.front_foot_lift_delta.item(), 0.5, places=6
+        )
         self.assertAlmostEqual(
             env.front_foot_lift_best.item()
             * self.one_box_cfg.rewards.scales.front_foot_lift_progress
             * 0.02,
+            0.5,
+        )
+
+        feet_positions[:, 0, 0] = 1.2625
+        feet_positions[:, 0, 2] = 0.15
+        feet_terrain_heights[:, 0] = 0.15
+        feet_forces[:, 0, 2] = 2.0
+        update(env, feet_positions, feet_terrain_heights, feet_forces)
+        self.assertAlmostEqual(env.front_foot_reach_delta.item(), 0.5)
+        update(env, feet_positions, feet_terrain_heights, feet_forces)
+        self.assertEqual(env.front_foot_reach_delta.item(), 0.0)
+        feet_positions[:, 0, 0] = 1.325
+        update(env, feet_positions, feet_terrain_heights, feet_forces)
+        self.assertAlmostEqual(env.front_foot_reach_delta.item(), 0.5)
+        self.assertAlmostEqual(
+            env.front_foot_reach_best.item()
+            * self.one_box_cfg.rewards.scales.front_foot_reach_progress
+            * 0.02,
             1.0,
         )
 
+        # Forward placement cannot be rewarded while the foot is only hovering.
+        env.front_foot_reach_best.zero_()
+        feet_forces.zero_()
+        update(env, feet_positions, feet_terrain_heights, feet_forces)
+        self.assertEqual(env.front_foot_reach_delta.item(), 0.0)
+        feet_forces[:, 0, 2] = 2.0
+        feet_positions[:, 0, 1] = 0.7
+        update(env, feet_positions, feet_terrain_heights, feet_forces)
+        self.assertEqual(env.front_foot_reach_delta.item(), 0.0)
+        feet_positions[:, 0, 1] = 0.0
+
+        # Front guidance closes after front contact; only rear guidance opens.
         env.front_foot_lift_best.zero_()
-        env.root_states[:, 0] = 0.6
-        update(env, feet_positions, feet_forces)
+        env.front_foot_reach_best.zero_()
+        env.front_contact_counter[:] = 2
+        feet_forces.zero_()
+        feet_terrain_heights.zero_()
+        feet_positions[:, 2, 0] = 0.96
+        feet_positions[:, 2, 2] = 0.155
+        update(env, feet_positions, feet_terrain_heights, feet_forces)
         self.assertEqual(env.front_foot_lift_delta.item(), 0.0)
-        env.root_states[:, 0] = 0.8
-        feet_forces[:, :2, 2] = 2.0
-        update(env, feet_positions, feet_forces)
-        self.assertEqual(env.front_foot_lift_delta.item(), 0.0)
+        self.assertAlmostEqual(
+            env.rear_foot_lift_delta.item(), 0.5, places=6
+        )
+        feet_positions[:, 2, 0] = 1.325
+        feet_positions[:, 2, 2] = 0.15
+        feet_terrain_heights[:, 2] = 0.15
+        feet_forces[:, 2, 2] = 2.0
+        update(env, feet_positions, feet_terrain_heights, feet_forces)
+        self.assertAlmostEqual(env.rear_foot_reach_delta.item(), 1.0)
+
+        # Merely standing in the window is not an approach.
+        env.rear_foot_lift_best.zero_()
+        env.root_states[:, 7] = 0.0
+        feet_forces.zero_()
+        update(env, feet_positions, feet_terrain_heights, feet_forces)
+        self.assertEqual(env.rear_foot_lift_delta.item(), 0.0)
 
     def test_forward_speed_tracking_peaks_only_at_the_command(self):
         env = self.make_speed_reward_env()
@@ -1954,8 +2032,19 @@ class BoxRewardTest(unittest.TestCase):
         self.assertEqual(scales.speed_error_square, 0.0)
         self.assertEqual(scales.overspeed, 0.0)
         self.assertAlmostEqual(
-            scales.front_foot_lift_progress * 0.02, 1.0
+            scales.front_foot_lift_progress * 0.02, 0.5
         )
+        self.assertAlmostEqual(
+            scales.front_foot_reach_progress * 0.02, 1.0
+        )
+        self.assertAlmostEqual(
+            scales.rear_foot_lift_progress * 0.02, 0.5
+        )
+        self.assertAlmostEqual(
+            scales.rear_foot_reach_progress * 0.02, 1.0
+        )
+        self.assertAlmostEqual(scales.box_front_foot_contact * 0.02, 0.5)
+        self.assertAlmostEqual(scales.box_rear_foot_contact * 0.02, 0.5)
         for name in (
             "landing_quality_progress",
             "landing_hold_progress",
@@ -1981,13 +2070,13 @@ class BoxRewardTest(unittest.TestCase):
         runner = train_cfg.runner
         algorithm = train_cfg.algorithm
         self.assertTrue(runner.resume)
-        self.assertEqual(runner.checkpoint, 2100)
+        self.assertEqual(runner.checkpoint, 2200)
         self.assertTrue(
             runner.load_run.endswith(
-                "Jul21_15-00-03_one_box_clean_gait_from_rough2000"
+                "Jul21_16-10-28_one_box_v181_from2100"
             )
         )
-        self.assertEqual(runner.run_name, "one_box_front_lift_from2100")
+        self.assertEqual(runner.run_name, "one_box_front_reach_from2200")
         self.assertIsNone(runner.ckpt_manipulator)
         self.assertEqual(runner.max_iterations, 1000)
         self.assertEqual(runner.save_interval, 100)

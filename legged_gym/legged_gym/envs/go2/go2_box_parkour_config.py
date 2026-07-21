@@ -94,6 +94,9 @@ class Go2BoxParkourCfg(DebugGo2BoxCfg):
             # Disabled on the five-box task. The dedicated one-box stage uses
             # a non-repeatable approach-window lift signal.
             front_foot_lift_progress = 0.0
+            front_foot_reach_progress = 0.0
+            rear_foot_lift_progress = 0.0
+            rear_foot_reach_progress = 0.0
             box_rear_foot_contact = 10.0
             box_passed = 25.0
             success = 1250.0
@@ -144,6 +147,11 @@ class Go2BoxParkourCfg(DebugGo2BoxCfg):
         front_foot_lift_approach_distance = 0.5
         front_foot_lift_clearance = 0.03
         front_foot_lift_lateral_margin = 0.2
+        front_foot_reach_start_distance = 0.25
+        front_foot_reach_target_inset = 0.125
+        front_foot_reach_height_tolerance = 0.02
+        front_foot_reach_base_overrun = 0.15
+        foot_guidance_min_forward_speed = 0.05
 
     class box_progress:
         required_boxes = 5
@@ -314,11 +322,14 @@ class Go2BoxParkour1BoxCfg(Go2BoxParkourCfg):
             thigh_collision = -0.5
             calf_collision = -0.5
             rear_support_missing = -0.5
-            # A normalized high-water reward: at dt=0.02 its maximum episode
-            # contribution is +1.0, and it cannot be farmed by repeated lifts.
-            front_foot_lift_progress = 50.0
-            box_front_foot_contact = 5.0
-            box_rear_foot_contact = 10.0
+            # Normalized high-water rewards cannot be farmed by repeated
+            # lifts/reaches. Their maximum episode values are +0.5 and +1.0.
+            front_foot_lift_progress = 25.0
+            front_foot_reach_progress = 50.0
+            rear_foot_lift_progress = 25.0
+            rear_foot_reach_progress = 50.0
+            box_front_foot_contact = 25.0
+            box_rear_foot_contact = 25.0
             box_passed = 25.0
             success = 500.0
             termination = -2000.0
@@ -356,16 +367,16 @@ class Go2BoxParkour1BoxCfgPPO(Go2BoxParkourCfgPPO):
         reference_kl_regression_floor = 0.02
 
     class runner(Go2BoxParkourCfgPPO.runner):
-        run_name = "one_box_front_lift_from2100"
+        run_name = "one_box_front_reach_from2200"
         init_at_random_ep_len = False
         resume = True
         load_run = osp.join(
             osp.dirname(osp.dirname(osp.dirname(osp.dirname(__file__)))),
             "logs",
             "go2_box_parkour",
-            "Jul21_15-00-03_one_box_clean_gait_from_rough2000",
+            "Jul21_16-10-28_one_box_v181_from2100",
         )
-        checkpoint = 2100
+        checkpoint = 2200
         ckpt_manipulator = None
         max_iterations = 1000
         save_interval = 100
