@@ -488,6 +488,7 @@ class LeggedRobotBox(LeggedRobot):
             tracker.body_contact_window_failure_buf
         )
         self.severe_body_impact_buf = tracker.severe_body_impact_buf
+        self.basic_recovery_buf = tracker.basic_recovery_buf
         self.curriculum_success_buf = tracker.curriculum_success_buf
         self.stagnation_buf = tracker.stagnation_buf
         self.recovery_counter = tracker.recovery_counter
@@ -512,6 +513,13 @@ class LeggedRobotBox(LeggedRobot):
         self.one_box_stage_start_iteration = 2000
         self.one_box_stable_windows = 0
         self.one_box_curriculum_promoted = False
+        self.landing_blend = 0.0
+        self.landing_blend_start_iteration = 2000
+        self.landing_blend_stable_windows = 0
+        self.landing_blend_regression_windows = 0
+        self.landing_blend_promoted = False
+        self.landing_blend_regressed = False
+        self.landing_blend_resume_pending = False
         self.episode_curriculum_stage = torch.full(
             (self.num_envs,),
             2,
@@ -546,6 +554,41 @@ class LeggedRobotBox(LeggedRobot):
             raise ValueError("required_stable_windows must be positive.")
         if not 0.0 < float(cfg.promotion_success_rate) <= 1.0:
             raise ValueError("promotion_success_rate must be in (0, 1].")
+        if int(cfg.landing_blend_minimum_iterations) <= 0:
+            raise ValueError(
+                "landing_blend_minimum_iterations must be positive."
+            )
+        if not 0.0 < float(cfg.landing_blend_step) <= 1.0:
+            raise ValueError("landing_blend_step must be in (0, 1].")
+        if min(
+            int(cfg.landing_blend_required_stable_windows),
+            int(cfg.landing_blend_required_regression_windows),
+        ) <= 0:
+            raise ValueError("Landing blend window counts must be positive.")
+        self._apply_one_box_landing_blend()
+
+    def _apply_one_box_landing_blend(self):
+        """Apply the global Stage-3 transition level to landing thresholds."""
+        if not self.uses_task_curriculum:
+            return
+        cfg = self.cfg.one_box_curriculum
+        self.box_progress.configure_landing_transition(
+            blend=self.landing_blend,
+            start_steps=cfg.landing_blend_start_steps,
+            start_min_forward_distance=(
+                cfg.landing_blend_start_min_forward_distance
+            ),
+            start_horizontal_speed_threshold=(
+                cfg.landing_blend_start_horizontal_speed_threshold
+            ),
+            start_lateral_speed_threshold=(
+                cfg.landing_blend_start_lateral_speed_threshold
+            ),
+            start_lateral_offset_threshold=(
+                cfg.landing_blend_start_lateral_offset_threshold
+            ),
+            start_yaw_threshold=cfg.landing_blend_start_yaw_threshold,
+        )
 
     def _update_course_progress_reward(self):
         """Reward only a new per-episode high-water mark in course progress."""
@@ -1116,9 +1159,6 @@ class LeggedRobotBox(LeggedRobot):
     def _update_reference_kl_recovery_state(self):
         """Arm flat-walking KL only after stable inter-box recovery."""
         flat = self._box_speed_blend() <= 0.0
-        course_active = (
-            self.next_box_idx < self.box_progress.required_boxes
-        )
         after_a_box = self.passed_box_count > 0
         foot_contact = self._filtered_foot_contacts()
         enough_feet = foot_contact.sum(dim=1) >= 2
@@ -1137,7 +1177,6 @@ class LeggedRobotBox(LeggedRobot):
         base_height = self._base_height_above_terrain()
         stable = (
             flat
-            & course_active
             & after_a_box
             & enough_feet
             & rear_support
@@ -2251,6 +2290,10 @@ class LeggedRobotBox(LeggedRobot):
         episode["mean_best_recovery_hold_steps"] = (
             self.best_recovery_hold_steps[env_ids].float().mean()
         )
+        episode["basic_recovery_rate"] = (
+            self.best_recovery_hold_steps[env_ids]
+            >= self.box_progress.recovery_steps
+        ).float().mean()
         episode["curriculum_success_rate"] = (
             self.curriculum_success_buf[env_ids].float().mean()
         )
@@ -2596,21 +2639,37 @@ class LeggedRobotBox(LeggedRobot):
         ).clamp(0.0, 1.0)
 
     def get_reference_kl_mask(self):
-        """Protect natural walking only on ordinary, recovered flat ground."""
-        flat = self._box_speed_blend() <= 0.0
+        """Protect approach gait and softly recover it after the final box."""
+        flat = (self._box_speed_blend() <= 0.0).to(
+            dtype=self.root_states.dtype
+        )
         course_active = (
             self.next_box_idx < self.box_progress.required_boxes
         )
-        initial_approach = self.passed_box_count == 0
+        course_complete = ~course_active
+        initial_approach = course_active & (self.passed_box_count == 0)
         recovered_between_boxes = (
+            course_active
+            & (self.passed_box_count > 0)
+            & (
             self.reference_kl_recovery_counter
             >= self.reference_kl_recovery_steps
+            )
         )
-        return (
-            flat
-            & course_active
-            & (initial_approach | recovered_between_boxes)
-        ).to(dtype=self.root_states.dtype)
+        if bool(getattr(self, "uses_task_curriculum", False)):
+            final_stage = self.episode_curriculum_stage >= 3
+        else:
+            final_stage = torch.ones_like(course_complete)
+        post_course_ramp = (
+            self.reference_kl_recovery_counter.float()
+            / float(self.reference_kl_recovery_steps)
+        ).clamp(0.0, 1.0) * (course_complete & final_stage).float()
+        protected_flat = (
+            initial_approach.float()
+            + recovered_between_boxes.float()
+            + post_course_ramp
+        ).clamp(0.0, 1.0)
+        return flat * protected_flat
 
     def _positive_speed_allowance(self):
         """Allow a small positive speed error only near a box."""
@@ -2630,6 +2689,19 @@ class LeggedRobotBox(LeggedRobot):
                 self.one_box_stage_start_iteration
             ),
             "stable_windows": int(self.one_box_stable_windows),
+            "landing_blend": float(self.landing_blend),
+            "landing_blend_start_iteration": int(
+                self.landing_blend_start_iteration
+            ),
+            "landing_blend_stable_windows": int(
+                self.landing_blend_stable_windows
+            ),
+            "landing_blend_regression_windows": int(
+                self.landing_blend_regression_windows
+            ),
+            "landing_blend_resume_pending": bool(
+                self.landing_blend_resume_pending
+            ),
         }
 
     def initialize_task_curriculum(self, start_iteration):
@@ -2641,6 +2713,14 @@ class LeggedRobotBox(LeggedRobot):
         self.one_box_stage_start_iteration = int(start_iteration)
         self.one_box_stable_windows = 0
         self.one_box_curriculum_promoted = False
+        self.landing_blend = 0.0
+        self.landing_blend_start_iteration = int(start_iteration)
+        self.landing_blend_stable_windows = 0
+        self.landing_blend_regression_windows = 0
+        self.landing_blend_promoted = False
+        self.landing_blend_regressed = False
+        self.landing_blend_resume_pending = False
+        self._apply_one_box_landing_blend()
 
     def load_task_curriculum_state(self, state):
         """Strictly restore one-box stage and height state."""
@@ -2658,8 +2738,12 @@ class LeggedRobotBox(LeggedRobot):
             )
         expected_version = int(self.cfg.one_box_curriculum.state_version)
         loaded_version = int(state.get("version", -1))
-        legacy_stage_c = loaded_version == 1 and expected_version == 2
-        if loaded_version != expected_version and not legacy_stage_c:
+        legacy_state = (
+            "landing_blend" not in state
+            and loaded_version in (1, 2)
+            and expected_version in (2, 3)
+        )
+        if loaded_version != expected_version and not legacy_state:
             raise RuntimeError(
                 "Unsupported one-box curriculum checkpoint version."
             )
@@ -2685,9 +2769,55 @@ class LeggedRobotBox(LeggedRobot):
             state["stage_start_iteration"]
         )
         self.one_box_stable_windows = (
-            0 if legacy_stage_c else int(state["stable_windows"])
+            0 if legacy_state else int(state["stable_windows"])
         )
+        if legacy_state:
+            # Loading an old run with its saved version-2 config must preserve
+            # the original strict landing for replay. Loading that same v18.6
+            # checkpoint into the current version-3 config intentionally
+            # starts the new smooth transition at the Stage-2 contract.
+            self.landing_blend = 1.0 if expected_version == 2 else 0.0
+            self.landing_blend_start_iteration = int(
+                state["stage_start_iteration"]
+            )
+            self.landing_blend_stable_windows = 0
+            self.landing_blend_regression_windows = 0
+            self.landing_blend_resume_pending = expected_version >= 3
+        else:
+            self.landing_blend = float(state["landing_blend"])
+            self.landing_blend_start_iteration = int(
+                state["landing_blend_start_iteration"]
+            )
+            self.landing_blend_stable_windows = int(
+                state["landing_blend_stable_windows"]
+            )
+            self.landing_blend_regression_windows = int(
+                state["landing_blend_regression_windows"]
+            )
+            self.landing_blend_resume_pending = bool(
+                state.get("landing_blend_resume_pending", False)
+            )
+        if not np.isfinite(self.landing_blend) or not (
+            0.0 <= self.landing_blend <= 1.0
+        ):
+            raise RuntimeError("One-box landing blend is out of range.")
+        if (
+            expected_version >= 3
+            and stage < 3
+            and self.landing_blend != 0.0
+        ):
+            raise RuntimeError(
+                "Landing blend must remain zero before the final stage."
+            )
+        if min(
+            self.landing_blend_stable_windows,
+            self.landing_blend_regression_windows,
+        ) < 0:
+            raise RuntimeError("Landing blend window counters cannot be negative.")
         self.one_box_curriculum_promoted = False
+        self.landing_blend_promoted = False
+        self.landing_blend_regressed = False
+        self._apply_one_box_landing_blend()
 
     @staticmethod
     def _episode_summary_scalar(summary, key, default=0.0):
@@ -2697,46 +2827,141 @@ class LeggedRobotBox(LeggedRobot):
         return float(value)
 
     def update_task_curriculum(self, episode_summary, iteration):
-        """Promote A/B/C1/C2 or the final-stage height after stable windows."""
+        """Promote contacts/recovery, then smoothly tighten final landing."""
         self.one_box_curriculum_promoted = False
+        self.landing_blend_promoted = False
+        self.landing_blend_regressed = False
         if not self.uses_task_curriculum:
             return False
         cfg = self.cfg.one_box_curriculum
+        if self.landing_blend_resume_pending:
+            # Give the first level its full hold period after importing a
+            # pre-blend checkpoint instead of inheriting an old stage age.
+            self.landing_blend_start_iteration = int(iteration)
+            self.landing_blend_stable_windows = 0
+            self.landing_blend_regression_windows = 0
+            self.landing_blend_resume_pending = False
+            return False
         episode_count = self._episode_summary_scalar(
             episode_summary, "one_box_stage_episode_count"
         )
         if episode_count < int(cfg.minimum_episodes):
             return False
-        stage_age = int(iteration) - self.one_box_stage_start_iteration
-        if stage_age < int(cfg.minimum_stage_iterations):
+        final_stage = len(cfg.stage_names) - 1
+        if self.one_box_curriculum_stage < final_stage:
+            stage_age = int(iteration) - self.one_box_stage_start_iteration
+            if stage_age < int(cfg.minimum_stage_iterations):
+                return False
+            success_rate = self._episode_summary_scalar(
+                episode_summary, "one_box_stage_success_rate"
+            )
+            self.one_box_stable_windows = (
+                self.one_box_stable_windows + 1
+                if success_rate >= float(cfg.promotion_success_rate)
+                else 0
+            )
+            if self.one_box_stable_windows < int(
+                cfg.required_stable_windows
+            ):
+                return False
+            self.one_box_curriculum_stage += 1
+            self.one_box_height_level = 0
+            self.one_box_stable_windows = 0
+            self.one_box_stage_start_iteration = int(iteration)
+            if self.one_box_curriculum_stage == final_stage:
+                self.landing_blend = 0.0
+                self.landing_blend_start_iteration = int(iteration)
+                self.landing_blend_stable_windows = 0
+                self.landing_blend_regression_windows = 0
+                self._apply_one_box_landing_blend()
+            self.one_box_curriculum_promoted = True
+            return True
+
+        blend_age = int(iteration) - self.landing_blend_start_iteration
+        if blend_age < int(cfg.landing_blend_minimum_iterations):
             return False
         success_rate = self._episode_summary_scalar(
             episode_summary, "one_box_stage_success_rate"
         )
-        self.one_box_stable_windows = (
-            self.one_box_stable_windows + 1
-            if success_rate >= float(cfg.promotion_success_rate)
+        pass_rate = self._episode_summary_scalar(
+            episode_summary, "box_1_pass_rate"
+        )
+        recovery_rate = self._episode_summary_scalar(
+            episode_summary, "basic_recovery_rate"
+        )
+        fall_rate = self._episode_summary_scalar(
+            episode_summary, "fall_rate"
+        )
+        stagnation_rate = self._episode_summary_scalar(
+            episode_summary, "stagnation_rate"
+        )
+        stable = (
+            success_rate >= float(cfg.landing_blend_success_up)
+            and pass_rate >= float(cfg.landing_blend_box_pass_up)
+            and recovery_rate >= float(cfg.landing_blend_recovery_up)
+            and fall_rate <= float(cfg.landing_blend_fall_up)
+            and stagnation_rate <= float(cfg.landing_blend_stagnation_up)
+        )
+        regression = (
+            pass_rate < float(cfg.landing_blend_box_pass_down)
+            or recovery_rate < float(cfg.landing_blend_recovery_down)
+            or fall_rate > float(cfg.landing_blend_fall_down)
+            or stagnation_rate > float(cfg.landing_blend_stagnation_down)
+        )
+        self.landing_blend_stable_windows = (
+            self.landing_blend_stable_windows + 1 if stable else 0
+        )
+        self.landing_blend_regression_windows = (
+            self.landing_blend_regression_windows + 1
+            if regression
             else 0
         )
-        if self.one_box_stable_windows < int(cfg.required_stable_windows):
+
+        if (
+            self.landing_blend > 0.0
+            and self.landing_blend_regression_windows
+            >= int(cfg.landing_blend_required_regression_windows)
+        ):
+            self.landing_blend = round(
+                max(
+                    0.0,
+                    self.landing_blend - float(cfg.landing_blend_step),
+                ),
+                6,
+            )
+            self.landing_blend_start_iteration = int(iteration)
+            self.landing_blend_stable_windows = 0
+            self.landing_blend_regression_windows = 0
+            self.landing_blend_regressed = True
+            self._apply_one_box_landing_blend()
+            return True
+
+        if self.landing_blend_stable_windows < int(
+            cfg.landing_blend_required_stable_windows
+        ):
             return False
 
-        promoted = False
-        final_stage = len(cfg.stage_names) - 1
-        if self.one_box_curriculum_stage < final_stage:
-            self.one_box_curriculum_stage += 1
-            self.one_box_height_level = 0
-            promoted = True
+        if self.landing_blend < 1.0:
+            self.landing_blend = round(
+                min(
+                    1.0,
+                    self.landing_blend + float(cfg.landing_blend_step),
+                ),
+                6,
+            )
+            self.landing_blend_promoted = True
         else:
             max_height_level = len(cfg.full_height_layouts) - 1
-            if self.one_box_height_level < max_height_level:
-                self.one_box_height_level += 1
-                promoted = True
-        self.one_box_stable_windows = 0
-        if promoted:
-            self.one_box_stage_start_iteration = int(iteration)
+            if self.one_box_height_level >= max_height_level:
+                self.landing_blend_stable_windows = 0
+                return False
+            self.one_box_height_level += 1
             self.one_box_curriculum_promoted = True
-        return promoted
+        self.landing_blend_start_iteration = int(iteration)
+        self.landing_blend_stable_windows = 0
+        self.landing_blend_regression_windows = 0
+        self._apply_one_box_landing_blend()
+        return True
 
     def get_task_curriculum_statistics(self, iteration):
         """Return scalar state for terminal and TensorBoard logging."""
@@ -2753,6 +2978,37 @@ class LeggedRobotBox(LeggedRobot):
             "one_box_stable_windows": float(self.one_box_stable_windows),
             "one_box_curriculum_promoted": float(
                 self.one_box_curriculum_promoted
+            ),
+            "landing_blend": float(self.landing_blend),
+            "landing_blend_age": float(
+                max(
+                    int(iteration) - self.landing_blend_start_iteration,
+                    0,
+                )
+            ),
+            "landing_blend_stable_windows": float(
+                self.landing_blend_stable_windows
+            ),
+            "landing_blend_regression_windows": float(
+                self.landing_blend_regression_windows
+            ),
+            "landing_blend_promoted": float(self.landing_blend_promoted),
+            "landing_blend_regressed": float(self.landing_blend_regressed),
+            "landing_required_steps": float(self.box_progress.landing_steps),
+            "landing_required_forward_distance": float(
+                self.box_progress.landing_min_forward_distance
+            ),
+            "landing_required_horizontal_speed": float(
+                self.box_progress.landing_horizontal_speed_threshold
+            ),
+            "landing_required_lateral_speed": float(
+                self.box_progress.landing_lateral_speed_threshold
+            ),
+            "landing_required_lateral_offset": float(
+                self.box_progress.landing_lateral_offset_threshold
+            ),
+            "landing_required_yaw": float(
+                self.box_progress.landing_yaw_threshold
             ),
         }
 
@@ -2804,10 +3060,13 @@ class LeggedRobotBox(LeggedRobot):
         )
 
     def _stable_landing_curriculum_gate(self):
-        """Enable strict landing shaping only in the final one-box stage."""
+        """Ramp strict landing shaping through the final one-box stage."""
         if not bool(getattr(self, "uses_task_curriculum", False)):
             return torch.ones_like(self.episode_length_buf, dtype=torch.float)
-        return (self.episode_curriculum_stage >= 3).float()
+        return (
+            (self.episode_curriculum_stage >= 3).float()
+            * float(self.landing_blend)
+        )
 
     def _reward_speed_error_square(self):
         """Penalize command error while preserving a short box-speed allowance."""
@@ -2841,6 +3100,22 @@ class LeggedRobotBox(LeggedRobot):
             self.next_box_idx < self.box_progress.required_boxes
         )
         return tracking * forward_fraction * course_phase.float()
+
+    def _reward_world_x_direction(self):
+        """Lightly reward capped positive-x motion before course completion."""
+        command_x = self.commands[:, 0].clamp_min(1e-6)
+        forward_fraction = torch.clamp(
+            self.root_states[:, 7] / command_x,
+            min=0.0,
+            max=1.0,
+        )
+        yaw = get_euler_xyz(self.root_states[:, 3:7])[2]
+        yaw = torch.atan2(torch.sin(yaw), torch.cos(yaw))
+        positive_x_alignment = torch.cos(yaw).clamp(0.0, 1.0)
+        course_active = (
+            self.next_box_idx < self.box_progress.required_boxes
+        ).float()
+        return forward_fraction * positive_x_alignment * course_active
 
     def _reward_tracking_ang_vel(self):
         """Zero-centered yaw tracking; a zero yaw error gives zero."""
@@ -2986,6 +3261,15 @@ class LeggedRobotBox(LeggedRobot):
     def _reward_landing_timeout(self):
         """Penalize exhausting the configured landing-attempt window."""
         return self.landing_timeout_buf.float()
+
+    def _reward_basic_recovery(self):
+        """Reward the first basic post-box recovery during final Stage 3."""
+        if not bool(getattr(self, "uses_task_curriculum", False)):
+            return torch.zeros_like(self.success_buf, dtype=torch.float)
+        return (
+            self.basic_recovery_buf
+            & (self.episode_curriculum_stage >= 3)
+        ).float()
 
     def _reward_landing_quality_progress(self):
         """Reward only a new high-water mark in landing quality."""

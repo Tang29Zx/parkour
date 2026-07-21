@@ -323,6 +323,7 @@ class Go2BoxParkour1BoxCfg(Go2BoxParkourCfg):
         class scales(Go2BoxParkourCfg.rewards.scales):
             tracking_ang_vel = 0.2
             forward_speed_tracking = 0.5
+            world_x_direction = 0.1
             course_progress = 0.0
             landing_quality_progress = 250.0
             landing_hold_progress = 500.0
@@ -333,7 +334,7 @@ class Go2BoxParkour1BoxCfg(Go2BoxParkourCfg):
             action_rate = -0.005
             flat_orientation = -0.1
             dof_vel = 0.0
-            lin_pos_y = -0.1
+            lin_pos_y = -0.15
             yaw_abs = -0.1
             energy_substeps = 0.0
             torques = 0.0
@@ -345,7 +346,7 @@ class Go2BoxParkour1BoxCfg(Go2BoxParkourCfg):
             rear_support_missing = -0.2
             flat_airborne = -0.2
             lateral_velocity_square = -0.3
-            flat_lateral_position = -0.2
+            flat_lateral_position = -0.3
             flat_yaw_abs = -0.2
             world_overspeed = -0.5
             # Each progress reward is a normalized, non-repeatable high-water
@@ -363,6 +364,7 @@ class Go2BoxParkour1BoxCfg(Go2BoxParkourCfg):
             box_rear_foot_contact = 400.0
             box_passed = 500.0
             recovery_success = 750.0
+            basic_recovery = 250.0
             success = 750.0
             termination = -2250.0
             severe_body_impact = -2500.0
@@ -388,9 +390,8 @@ class Go2BoxParkour1BoxCfg(Go2BoxParkourCfg):
 
     class box_progress(Go2BoxParkourCfg.box_progress):
         required_boxes = 1
-        # After an intermediate box, wait for ten stable support steps before
-        # re-enabling the flat-walking reference. The final landing remains
-        # unconstrained because the episode terminates there.
+        # Re-enable the flat-walking reference gradually after stable support,
+        # including the final landing transition.
         reference_kl_recovery_steps = 10
         recovery_steps = 3
         recovery_min_forward_distance = 0.25
@@ -405,7 +406,7 @@ class Go2BoxParkour1BoxCfg(Go2BoxParkourCfg):
 
     class one_box_curriculum:
         enabled = True
-        state_version = 2
+        state_version = 3
         stage_names = (
             "front_contact",
             "rear_contact",
@@ -418,6 +419,27 @@ class Go2BoxParkour1BoxCfg(Go2BoxParkourCfg):
         minimum_episodes = 256
         required_stable_windows = 2
         promotion_success_rate = 0.65
+        # Stage 3 begins exactly at the Stage-2 recovery contract, then
+        # tightens one level at a time toward the final landing contract.
+        landing_blend_step = 0.1
+        landing_blend_minimum_iterations = 100
+        landing_blend_required_stable_windows = 2
+        landing_blend_required_regression_windows = 2
+        landing_blend_start_steps = 3
+        landing_blend_start_min_forward_distance = 0.25
+        landing_blend_start_horizontal_speed_threshold = 2.5
+        landing_blend_start_lateral_speed_threshold = 2.0
+        landing_blend_start_lateral_offset_threshold = 0.8
+        landing_blend_start_yaw_threshold = np.pi
+        landing_blend_success_up = 0.65
+        landing_blend_box_pass_up = 0.90
+        landing_blend_recovery_up = 0.80
+        landing_blend_fall_up = 0.10
+        landing_blend_stagnation_up = 0.08
+        landing_blend_box_pass_down = 0.85
+        landing_blend_recovery_down = 0.70
+        landing_blend_fall_down = 0.15
+        landing_blend_stagnation_down = 0.12
 
 
 class Go2BoxParkour1BoxCfgPPO(Go2BoxParkourCfgPPO):
@@ -426,31 +448,32 @@ class Go2BoxParkour1BoxCfgPPO(Go2BoxParkourCfgPPO):
         actor_finetune_learning_rate = 2e-5
         actor_finetune_clip_param = 0.1
         actor_finetune_entropy_coef = 0.002
-        # Use the frozen migrated rough-2000 Actor only on ordinary flat
-        # ground. The environment mask disables KL near the active box and
-        # throughout final landing/recovery.
+        # Use the frozen migrated rough-2000 Actor on the approach and ramp it
+        # back in only after post-box support starts to recover.
         reference_kl_min_coef = 0.02
         reference_kl_max_coef = 0.02
         reference_kl_start_coef = 0.02
 
     class runner(Go2BoxParkourCfgPPO.runner):
-        run_name = "one_box_v186_flat_kl_from2500"
+        run_name = "one_box_v187_smooth_landing_from2600"
         init_at_random_ep_len = False
         resume = True
         load_run = osp.join(
             osp.dirname(osp.dirname(osp.dirname(osp.dirname(__file__)))),
             "logs",
             "go2_box_parkour",
-            "Jul21_18-05-59_one_box_v183_from_rough2000",
+            "Jul21_20-35-45_one_box_v186_from2500",
         )
         reference_policy_path = osp.join(
-            load_run, "model_2100_warmup.pt"
+            osp.dirname(load_run),
+            "Jul21_18-05-59_one_box_v183_from_rough2000",
+            "model_2100_warmup.pt",
         )
-        checkpoint = 2500
-        # This is a one-time initializer for the original v183 model_2500.
-        # Resume v186 checkpoints with ``--ckpt_manipulator none``.
-        ckpt_manipulator = "enable_flat_reference_kl_from_one_box2500"
-        max_iterations = 400
+        checkpoint = 2600
+        # V18.6 already contains the reference Actor and trained optimizer.
+        # Loading its version-2 task state initializes landing_blend at zero.
+        ckpt_manipulator = None
+        max_iterations = 1200
         save_interval = 50
         log_interval = 50
 

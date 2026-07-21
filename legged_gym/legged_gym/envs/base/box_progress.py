@@ -110,9 +110,13 @@ class BoxProgressTracker:
         self.recovery_min_forward_distance = float(
             recovery_min_forward_distance
         )
-        self.landing_steps = int(landing_steps)
-        self.landing_min_forward_distance = float(
+        self.final_landing_steps = int(landing_steps)
+        self.final_landing_min_forward_distance = float(
             landing_min_forward_distance
+        )
+        self.landing_steps = self.final_landing_steps
+        self.landing_min_forward_distance = (
+            self.final_landing_min_forward_distance
         )
         self.landing_min_current_feet = int(landing_min_current_feet)
         self.landing_require_rear_foot = bool(landing_require_rear_foot)
@@ -124,16 +128,27 @@ class BoxProgressTracker:
         self.landing_vertical_speed_threshold = float(
             landing_vertical_speed_threshold
         )
-        self.landing_horizontal_speed_threshold = float(
+        self.final_landing_horizontal_speed_threshold = float(
             landing_horizontal_speed_threshold
         )
-        self.landing_lateral_speed_threshold = float(
+        self.final_landing_lateral_speed_threshold = float(
             landing_lateral_speed_threshold
         )
-        self.landing_lateral_offset_threshold = float(
+        self.final_landing_lateral_offset_threshold = float(
             landing_lateral_offset_threshold
         )
-        self.landing_yaw_threshold = float(landing_yaw_threshold)
+        self.final_landing_yaw_threshold = float(landing_yaw_threshold)
+        self.landing_horizontal_speed_threshold = (
+            self.final_landing_horizontal_speed_threshold
+        )
+        self.landing_lateral_speed_threshold = (
+            self.final_landing_lateral_speed_threshold
+        )
+        self.landing_lateral_offset_threshold = (
+            self.final_landing_lateral_offset_threshold
+        )
+        self.landing_yaw_threshold = self.final_landing_yaw_threshold
+        self.landing_blend = 1.0
         self.landing_deadline_steps = int(landing_deadline_steps)
         landing_thresholds = (
             self.landing_horizontal_speed_threshold,
@@ -214,6 +229,7 @@ class BoxProgressTracker:
             self.box_passed_buf
         )
         self.severe_body_impact_buf = torch.zeros_like(self.box_passed_buf)
+        self.basic_recovery_buf = torch.zeros_like(self.box_passed_buf)
         self.curriculum_success_buf = torch.zeros_like(self.box_passed_buf)
         self.stagnation_buf = torch.zeros_like(self.box_passed_buf)
         self.success_buf = torch.zeros_like(self.box_passed_buf)
@@ -303,6 +319,7 @@ class BoxProgressTracker:
         self.rear_foot_contact_buf[env_ids] = False
         self.body_contact_window_failure_buf[env_ids] = False
         self.severe_body_impact_buf[env_ids] = False
+        self.basic_recovery_buf[env_ids] = False
         self.curriculum_success_buf[env_ids] = False
         self.stagnation_buf[env_ids] = False
         self.success_buf[env_ids] = False
@@ -319,6 +336,54 @@ class BoxProgressTracker:
         self.incomplete_buf[env_ids] = False
         self.episode_timeout_buf[env_ids] = False
         self.task_progress_buf[env_ids] = 0.0
+
+    def configure_landing_transition(
+        self,
+        blend,
+        start_steps,
+        start_min_forward_distance,
+        start_horizontal_speed_threshold,
+        start_lateral_speed_threshold,
+        start_lateral_offset_threshold,
+        start_yaw_threshold,
+    ):
+        """Interpolate Stage-2 recovery into the final landing contract."""
+        blend = float(blend)
+        if not 0.0 <= blend <= 1.0:
+            raise ValueError("landing transition blend must be within [0, 1].")
+        start_steps = int(start_steps)
+        start_values = (
+            float(start_min_forward_distance),
+            float(start_horizontal_speed_threshold),
+            float(start_lateral_speed_threshold),
+            float(start_lateral_offset_threshold),
+            float(start_yaw_threshold),
+        )
+        if start_steps <= 0 or min(start_values) <= 0.0:
+            raise ValueError("Landing transition start values must be positive.")
+
+        def interpolate(start, final):
+            return start + (final - start) * blend
+
+        self.landing_blend = blend
+        self.landing_steps = int(
+            round(interpolate(start_steps, self.final_landing_steps))
+        )
+        self.landing_min_forward_distance = interpolate(
+            start_values[0], self.final_landing_min_forward_distance
+        )
+        self.landing_horizontal_speed_threshold = interpolate(
+            start_values[1], self.final_landing_horizontal_speed_threshold
+        )
+        self.landing_lateral_speed_threshold = interpolate(
+            start_values[2], self.final_landing_lateral_speed_threshold
+        )
+        self.landing_lateral_offset_threshold = interpolate(
+            start_values[3], self.final_landing_lateral_offset_threshold
+        )
+        self.landing_yaw_threshold = interpolate(
+            start_values[4], self.final_landing_yaw_threshold
+        )
 
     def update(
         self,
@@ -545,12 +610,17 @@ class BoxProgressTracker:
             & height_valid
             & vertical_speed_valid
         )
+        previous_recovery_counter = self.recovery_counter.clone()
         self.recovery_counter[:] = torch.where(
             basic_recovery,
             self.recovery_counter + 1,
             torch.zeros_like(self.recovery_counter),
         )
         recovery_success = self.recovery_counter >= self.recovery_steps
+        self.basic_recovery_buf[:] = (
+            (previous_recovery_counter < self.recovery_steps)
+            & recovery_success
+        )
         self.best_recovery_hold_steps[:] = torch.maximum(
             self.best_recovery_hold_steps,
             self.recovery_counter,

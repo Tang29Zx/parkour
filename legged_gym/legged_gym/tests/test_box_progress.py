@@ -208,6 +208,77 @@ class BoxProgressTrackerTest(unittest.TestCase):
         self.update()
         self.assertTrue(self.tracker.success_buf[0])
 
+    def test_landing_transition_starts_at_recovery_and_interpolates(self):
+        self.tracker = self.BoxProgressTracker(
+            2,
+            4,
+            1,
+            "cpu",
+            required_boxes=1,
+            recovery_steps=3,
+            recovery_min_forward_distance=0.25,
+            landing_steps=10,
+            landing_min_forward_distance=0.6,
+            landing_horizontal_speed_threshold=1.2,
+            landing_lateral_speed_threshold=0.35,
+            landing_lateral_offset_threshold=0.4,
+            landing_yaw_threshold=0.35,
+        )
+        self.tracker.configure_landing_transition(
+            blend=0.0,
+            start_steps=3,
+            start_min_forward_distance=0.25,
+            start_horizontal_speed_threshold=2.5,
+            start_lateral_speed_threshold=2.0,
+            start_lateral_offset_threshold=0.8,
+            start_yaw_threshold=math.pi,
+        )
+        self.assertEqual(self.tracker.landing_steps, 3)
+        self.assertAlmostEqual(
+            self.tracker.landing_min_forward_distance, 0.25
+        )
+        self.assertAlmostEqual(
+            self.tracker.landing_horizontal_speed_threshold, 2.5
+        )
+
+        self.box_bounds = self.box_bounds[:, :1]
+        self.landing_end_x[:] = 4.4
+        self.curriculum_stage = self.torch.tensor([3, 3])
+        self.tracker.next_box_idx[0] = 1
+        self.tracker.passed_box_count[0] = 1
+        self.base_positions[0, 0] = 2.3
+        self.feet_positions[0, :, 0] = 2.3
+        self.feet_positions[0, :, 1] = self.torch.tensor(
+            [-0.3, 0.3, -0.3, 0.3]
+        )
+        self.contact_forces[0, [0, 2], 2] = 2.0
+        self.base_yaw[0] = 0.8
+        self.base_horizontal_speed[0] = 1.8
+        self.update()
+        self.update()
+        self.assertFalse(self.tracker.success_buf[0])
+        self.update()
+        self.assertTrue(self.tracker.basic_recovery_buf[0])
+        self.assertTrue(self.tracker.success_buf[0])
+
+        self.tracker.configure_landing_transition(
+            blend=1.0,
+            start_steps=3,
+            start_min_forward_distance=0.25,
+            start_horizontal_speed_threshold=2.5,
+            start_lateral_speed_threshold=2.0,
+            start_lateral_offset_threshold=0.8,
+            start_yaw_threshold=math.pi,
+        )
+        self.assertEqual(self.tracker.landing_steps, 10)
+        self.assertAlmostEqual(
+            self.tracker.landing_min_forward_distance, 0.6
+        )
+        self.assertAlmostEqual(
+            self.tracker.landing_horizontal_speed_threshold, 1.2
+        )
+        self.assertAlmostEqual(self.tracker.landing_yaw_threshold, 0.35)
+
     def test_stagnation_is_a_failure_and_overrides_stage_success(self):
         self.curriculum_stage = self.torch.tensor([0, 0])
         self.put_foot_on_box(0, 0, 0)
