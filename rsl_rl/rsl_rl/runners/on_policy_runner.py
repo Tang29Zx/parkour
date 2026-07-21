@@ -278,6 +278,9 @@ class OnPolicyRunner:
         if key.startswith("raw/"):
             for result_name in (
                 "success",
+                "curriculum_success",
+                "severe_body_impact",
+                "stagnation",
                 "fall_failure",
                 "missed_box_failure",
                 "out_of_track_failure",
@@ -292,6 +295,8 @@ class OnPolicyRunner:
                     return f"raw/{result_name}_episode_count"
         if key.startswith("layout_") and key.endswith("_success_rate"):
             return key[: -len("_success_rate")] + "_episode_count"
+        if key == "one_box_stage_success_rate":
+            return "one_box_stage_episode_count"
         return "num_terminated"
 
     def _aggregate_episode_infos(self, ep_infos):
@@ -522,7 +527,10 @@ class OnPolicyRunner:
 
     def _update_quality_curriculum(self, episode_summary, stats):
         window = self._get_quality_window(episode_summary)
-        if window is not None:
+        uses_task_curriculum = bool(
+            getattr(self.env, "uses_task_curriculum", False)
+        )
+        if window is not None and not uses_task_curriculum:
             self.alg.update_quality_curriculum(**window)
             self._apply_quality_levels_to_env()
         stats["quality_phase"] = torch.tensor(
@@ -600,6 +608,21 @@ class OnPolicyRunner:
                 "best sufficiently sampled failure outcome."
                 "\033[0m"
             )
+
+    def _update_task_curriculum(self, episode_summary, stats):
+        """Update an environment-owned task curriculum at log boundaries."""
+        if not hasattr(self.env, "update_task_curriculum"):
+            return
+        if not self.alg.is_critic_warmup_active(
+            self.current_learning_iteration
+        ):
+            self.env.update_task_curriculum(
+                episode_summary, self.current_learning_iteration
+            )
+        for name, value in self.env.get_task_curriculum_statistics(
+            self.current_learning_iteration
+        ).items():
+            stats[name] = torch.tensor(float(value), device=self.device)
 
     def _save_warmup_boundary_checkpoint(self):
         warmup_until = self.alg.critic_warmup_until_iteration
@@ -680,6 +703,7 @@ class OnPolicyRunner:
             learn_time = stop - start
             if self.log_dir is not None and self.current_learning_iteration % self.log_interval == 0:
                 episode_summary = self._aggregate_episode_infos(ep_infos)
+                self._update_task_curriculum(episode_summary, stats)
                 self._update_quality_curriculum(episode_summary, stats)
                 self.log(locals())
                 ep_infos.clear()
@@ -822,6 +846,11 @@ class OnPolicyRunner:
             'iter': self.current_learning_iteration,
             'infos': infos,
         })
+        env = getattr(self, "env", None)
+        if env is not None and hasattr(env, "get_task_curriculum_state"):
+            task_state = env.get_task_curriculum_state()
+            if task_state is not None:
+                run_state_dict["task_curriculum_state_dict"] = task_state
         torch.save(run_state_dict, path)
 
     def load(self, path, load_optimizer=True):
@@ -859,6 +888,24 @@ class OnPolicyRunner:
                 self.alg.snapshot_reference_policy()
             else:
                 self.alg.reference_actor_critic = None
+        env = getattr(self, "env", None)
+        if bool(getattr(env, "uses_task_curriculum", False)):
+            if manipulator_name == "initialize_one_box_from_rough2000":
+                curriculum_start_iteration = (
+                    self.alg.critic_warmup_until_iteration
+                    if self.alg.critic_warmup_until_iteration is not None
+                    else self.current_learning_iteration
+                )
+                env.initialize_task_curriculum(
+                    curriculum_start_iteration
+                )
+            else:
+                env.load_task_curriculum_state(
+                    loaded_dict.get("task_curriculum_state_dict")
+                )
+            # Apply the restored stage and height to every environment before
+            # the first rollout. learn() fetches fresh observations afterward.
+            env.reset()
         self._apply_quality_levels_to_env()
         if manipulator_name:
             try:

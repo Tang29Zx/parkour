@@ -156,6 +156,9 @@ class BoxProgressTracker:
             dtype=torch.bool,
             device=device,
         )
+        self.front_contacted_boxes = torch.zeros_like(
+            self.rear_contacted_boxes
+        )
         self.body_contact_history = torch.zeros(
             self.num_envs,
             self.body_contact_window_steps,
@@ -197,6 +200,8 @@ class BoxProgressTracker:
             self.box_passed_buf
         )
         self.severe_body_impact_buf = torch.zeros_like(self.box_passed_buf)
+        self.curriculum_success_buf = torch.zeros_like(self.box_passed_buf)
+        self.stagnation_buf = torch.zeros_like(self.box_passed_buf)
         self.success_buf = torch.zeros_like(self.box_passed_buf)
         self.missed_box_buf = torch.zeros_like(self.box_passed_buf)
         self.out_of_track_buf = torch.zeros_like(self.box_passed_buf)
@@ -241,6 +246,7 @@ class BoxProgressTracker:
         self.front_contact_counter[env_ids] = 0
         self.rear_contact_counter[env_ids] = 0
         self.rear_contacted_boxes[env_ids] = False
+        self.front_contacted_boxes[env_ids] = False
         self.body_contact_history[env_ids] = False
         self.body_contact_window_count[env_ids] = 0
         self.max_body_contact_window_count[env_ids] = 0
@@ -281,6 +287,8 @@ class BoxProgressTracker:
         self.rear_foot_contact_buf[env_ids] = False
         self.body_contact_window_failure_buf[env_ids] = False
         self.severe_body_impact_buf[env_ids] = False
+        self.curriculum_success_buf[env_ids] = False
+        self.stagnation_buf[env_ids] = False
         self.success_buf[env_ids] = False
         self.missed_box_buf[env_ids] = False
         self.out_of_track_buf[env_ids] = False
@@ -319,6 +327,8 @@ class BoxProgressTracker:
         landing_end_x=None,
         external_timeout=None,
         external_fall=None,
+        external_stagnation=None,
+        curriculum_stage=None,
     ):
         """Advance progress by one control step and update event buffers."""
         self._clear_events()
@@ -344,7 +354,15 @@ class BoxProgressTracker:
         previous_front_count = self.front_contact_counter.clone()
         previous_rear_count = self.rear_contact_counter.clone()
         self.front_contact_counter += active & front_contact
-        self.rear_contact_counter += active & rear_contact
+        front_requirement_met = (
+            self.front_contact_counter >= self.front_contact_required_steps
+        )
+        rear_sequence_gate = (
+            torch.ones_like(active)
+            if curriculum_stage is None
+            else front_requirement_met
+        )
+        self.rear_contact_counter += active & rear_contact & rear_sequence_gate
         self.front_contact_counter.clamp_(
             max=self.front_contact_required_steps
         )
@@ -359,6 +377,26 @@ class BoxProgressTracker:
             & (previous_rear_count < self.rear_contact_required_steps)
             & (self.rear_contact_counter >= self.rear_contact_required_steps)
         )
+        front_event_envs = self.front_foot_contact_buf.nonzero(
+            as_tuple=False
+        ).flatten()
+        self.front_contacted_boxes[
+            front_event_envs, target_indices[front_event_envs]
+        ] = True
+        if curriculum_stage is None:
+            curriculum_success_candidate = torch.zeros_like(active)
+        else:
+            curriculum_stage = curriculum_stage.to(
+                device=self.device, dtype=torch.long
+            )
+            curriculum_success_candidate = (
+                ((curriculum_stage == 0) & self.front_foot_contact_buf)
+                | (
+                    (curriculum_stage == 1)
+                    & front_requirement_met
+                    & self.rear_foot_contact_buf
+                )
+            )
         rear_event_envs = self.rear_foot_contact_buf.nonzero(
             as_tuple=False
         ).flatten()
@@ -670,15 +708,30 @@ class BoxProgressTracker:
             | other_out
         )
         self.generic_failure_buf[:] = hard_taken & ~self.landing_lateral_exit_buf
-        self.success_buf[:] = landing_success & ~hard_taken
+        if external_stagnation is None:
+            external_stagnation = torch.zeros_like(natural_timeout)
+        self.stagnation_buf[:] = external_stagnation & ~hard_taken
+        terminal_taken = hard_taken | self.stagnation_buf
+        self.curriculum_success_buf[:] = (
+            curriculum_success_candidate & ~terminal_taken
+        )
+        self.success_buf[:] = (
+            landing_success
+            & ~terminal_taken
+            & ~self.curriculum_success_buf
+        )
         self.landing_overrun_buf[:] = (
-            raw_landing_overrun & ~hard_taken & ~self.success_buf
+            raw_landing_overrun
+            & ~terminal_taken
+            & ~self.success_buf
+            & ~self.curriculum_success_buf
         )
         self.landing_timeout_buf[:] = (
             course_complete
             & (self.steps_in_landing_phase >= self.landing_deadline_steps)
-            & ~hard_taken
+            & ~terminal_taken
             & ~self.success_buf
+            & ~self.curriculum_success_buf
             & ~self.landing_lateral_exit_buf
             & ~self.landing_overrun_buf
         )
@@ -686,6 +739,7 @@ class BoxProgressTracker:
             natural_timeout
             & ~self.failure_buf
             & ~self.success_buf
+            & ~self.curriculum_success_buf
             & ~self.landing_timeout_buf
         )
         if external_timeout is None:
@@ -694,6 +748,7 @@ class BoxProgressTracker:
             external_timeout
             & ~self.failure_buf
             & ~self.success_buf
+            & ~self.curriculum_success_buf
             & ~self.incomplete_buf
         )
         self.task_progress_buf[:] = self.compute_task_progress(
@@ -760,6 +815,7 @@ class BoxProgressTracker:
     def failure_buf(self):
         return (
             self.generic_failure_buf
+            | self.stagnation_buf
             | self.landing_lateral_exit_buf
             | self.landing_overrun_buf
             | self.landing_timeout_buf
@@ -771,6 +827,7 @@ class BoxProgressTracker:
         reset_buf |= (
             self.failure_buf
             | self.success_buf
+            | self.curriculum_success_buf
             | self.incomplete_buf
             | time_out_buf
         )

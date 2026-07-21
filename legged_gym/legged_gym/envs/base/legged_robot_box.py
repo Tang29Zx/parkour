@@ -105,6 +105,7 @@ class LeggedRobotBox(LeggedRobot):
             lateral_limit=progress_cfg.lateral_limit,
         )
         self._bind_progress_buffers()
+        self._init_one_box_curriculum()
         self._refresh_box_course_data()
         self.landing_command_ramp_steps = int(
             getattr(progress_cfg, "landing_command_ramp_steps", 20)
@@ -321,6 +322,31 @@ class LeggedRobotBox(LeggedRobot):
         self.front_foot_guidance_target_idx = torch.full(
             (self.num_envs,), -1, dtype=torch.long, device=self.device
         )
+        for name in (
+            "box_approach",
+            "front_foot_clearance",
+            "post_front_base",
+            "rear_foot_clearance",
+        ):
+            setattr(
+                self,
+                f"{name}_best",
+                torch.zeros_like(self.forward_speed_sum),
+            )
+            setattr(
+                self,
+                f"{name}_delta",
+                torch.zeros_like(self.forward_speed_sum),
+            )
+        self.stagnation_counter = torch.zeros(
+            self.num_envs, dtype=torch.long, device=self.device
+        )
+        self.max_stagnation_steps = torch.zeros_like(
+            self.stagnation_counter
+        )
+        self.stagnation_candidate_buf = torch.zeros(
+            self.num_envs, dtype=torch.bool, device=self.device
+        )
         self.progress_reward_initialized = torch.zeros(
             self.num_envs, dtype=torch.bool, device=self.device
         )
@@ -448,6 +474,8 @@ class LeggedRobotBox(LeggedRobot):
             tracker.body_contact_window_failure_buf
         )
         self.severe_body_impact_buf = tracker.severe_body_impact_buf
+        self.curriculum_success_buf = tracker.curriculum_success_buf
+        self.stagnation_buf = tracker.stagnation_buf
         self.landing_counter = tracker.landing_counter
         self.landing_phase_start_step = tracker.landing_phase_start_step
         self.steps_in_landing_phase = tracker.steps_in_landing_phase
@@ -456,6 +484,52 @@ class LeggedRobotBox(LeggedRobot):
         self.landing_quality_delta = tracker.landing_quality_delta
         self.landing_hold_delta = tracker.landing_hold_delta
         self.episode_timeout_buf = tracker.episode_timeout_buf
+
+    def _init_one_box_curriculum(self):
+        """Initialize global and per-episode state for the one-box course."""
+        cfg = getattr(self.cfg, "one_box_curriculum", None)
+        self.uses_task_curriculum = bool(
+            cfg is not None and getattr(cfg, "enabled", False)
+        )
+        self.one_box_curriculum_stage = 0
+        self.one_box_height_level = 0
+        self.one_box_stage_start_iteration = 2000
+        self.one_box_stable_windows = 0
+        self.one_box_curriculum_promoted = False
+        self.episode_curriculum_stage = torch.full(
+            (self.num_envs,),
+            2,
+            dtype=torch.long,
+            device=self.device,
+        )
+        self.episode_curriculum_height_level = torch.zeros(
+            self.num_envs, dtype=torch.long, device=self.device
+        )
+        if not self.uses_task_curriculum:
+            return
+        if self.box_progress.required_boxes != 1 or self.terrain.num_boxes != 1:
+            raise ValueError(
+                "The one-box curriculum requires exactly one physical and "
+                "one required box."
+            )
+        stage_names = tuple(cfg.stage_names)
+        if len(stage_names) != 3:
+            raise ValueError("one_box_curriculum.stage_names must have 3 entries.")
+        low_layouts = tuple(int(value) for value in cfg.low_height_layouts)
+        full_layouts = tuple(int(value) for value in cfg.full_height_layouts)
+        all_layouts = low_layouts + full_layouts
+        if not low_layouts or not full_layouts:
+            raise ValueError("One-box height layout groups must be non-empty.")
+        if min(all_layouts) < 0 or max(all_layouts) >= self.terrain.num_unique_layouts:
+            raise ValueError("One-box height layout index is out of range.")
+        if int(cfg.minimum_stage_iterations) <= 0:
+            raise ValueError("minimum_stage_iterations must be positive.")
+        if int(cfg.minimum_episodes) <= 0:
+            raise ValueError("minimum_episodes must be positive.")
+        if int(cfg.required_stable_windows) <= 0:
+            raise ValueError("required_stable_windows must be positive.")
+        if not 0.0 < float(cfg.promotion_success_rate) <= 1.0:
+            raise ValueError("promotion_success_rate must be in (0, 1].")
 
     def _update_course_progress_reward(self):
         """Reward only a new per-episode high-water mark in course progress."""
@@ -700,29 +774,278 @@ class LeggedRobotBox(LeggedRobot):
             self.rear_foot_reach_delta,
         )
 
-    def _refresh_box_course_data(self):
+    @staticmethod
+    def _update_high_water(best, delta, score, active):
+        """Update a normalized progress high-water mark in place."""
+        score = torch.where(active, score, torch.zeros_like(score))
+        new_best = torch.maximum(best, score.clamp(0.0, 1.0))
+        delta[:] = (new_best - best).clamp_min(0.0)
+        best[:] = new_best
+
+    def _update_one_box_stage_progress(
+        self, feet_positions, feet_terrain_heights, feet_contact_forces
+    ):
+        """Update ordered A/B/C progress without rewarding foot height alone."""
+        for name in (
+            "box_approach",
+            "front_foot_clearance",
+            "post_front_base",
+            "rear_foot_clearance",
+        ):
+            getattr(self, f"{name}_delta").zero_()
+
+        env_ids = torch.arange(self.num_envs, device=self.device)
+        active = self.next_box_idx < self.box_progress.required_boxes
+        target_indices = self.next_box_idx.clamp(
+            max=self.box_progress.required_boxes - 1
+        )
+        bounds = self.env_box_bounds[env_ids, target_indices]
+        base_x = self.root_states[:, 0]
+        cfg = self.cfg.rewards
+
+        approach_denominator = (
+            bounds[:, 0] - self.env_origins[:, 0]
+        ).clamp_min(1e-6)
+        approach_score = (
+            (base_x - self.env_origins[:, 0]) / approach_denominator
+        ).clamp(0.0, 1.0)
+        self._update_high_water(
+            self.box_approach_best,
+            self.box_approach_delta,
+            approach_score,
+            active,
+        )
+
+        top_height = bounds[:, 4].unsqueeze(1)
+        top_min_y = bounds[:, 2].unsqueeze(1)
+        top_max_y = bounds[:, 3].unsqueeze(1)
+        edge_start = (
+            bounds[:, 0] - float(cfg.foot_clearance_start_distance)
+        ).unsqueeze(1)
+        edge_target = (
+            bounds[:, 0] + float(cfg.foot_clearance_target_inset)
+        ).unsqueeze(1)
+        edge_range = (edge_target - edge_start).clamp_min(1e-6)
+        force_magnitudes = torch.linalg.vector_norm(
+            feet_contact_forces, dim=-1
+        )
+
+        top_contact = self.box_progress._get_top_contacts(
+            active,
+            bounds,
+            feet_positions,
+            feet_terrain_heights,
+            feet_contact_forces,
+        )
+        front_contact_now = top_contact[
+            :, self.front_foot_local_indices
+        ].any(dim=1)
+        front_will_complete = (
+            self.front_contact_counter + (active & front_contact_now).long()
+            >= self.box_progress.front_contact_required_steps
+        )
+        rear_contact_now = top_contact[
+            :, self.rear_foot_local_indices
+        ].any(dim=1)
+        rear_will_complete = (
+            self.rear_contact_counter
+            + (active & front_will_complete & rear_contact_now).long()
+            >= self.box_progress.rear_contact_required_steps
+        )
+
+        def clearance_score(local_indices):
+            positions = feet_positions[:, local_indices]
+            group_forces = force_magnitudes[:, local_indices]
+            horizontal_progress = (
+                (positions[:, :, 0] - edge_start) / edge_range
+            ).clamp(0.0, 1.0)
+            valid = (
+                (positions[:, :, 2]
+                 >= top_height + float(cfg.foot_clearance_height))
+                & (positions[:, :, 1] >= top_min_y)
+                & (positions[:, :, 1] <= top_max_y)
+                & (positions[:, :, 0] >= edge_start)
+                & (positions[:, :, 0] <= edge_target)
+                & (
+                    group_forces
+                    <= self.cfg.box_progress.contact_force_threshold
+                )
+            )
+            return torch.where(
+                valid,
+                horizontal_progress,
+                torch.zeros_like(horizontal_progress),
+            ).max(dim=1).values
+
+        front_done = (
+            self.front_contact_counter
+            >= self.box_progress.front_contact_required_steps
+        )
+        rear_done = (
+            self.rear_contact_counter
+            >= self.box_progress.rear_contact_required_steps
+        )
+        self._update_high_water(
+            self.front_foot_clearance_best,
+            self.front_foot_clearance_delta,
+            clearance_score(self.front_foot_local_indices),
+            active & ~front_done,
+        )
+
+        base_target = bounds[:, 0] + (
+            bounds[:, 1] - bounds[:, 0]
+        ) * float(cfg.post_front_base_target_fraction)
+        base_start = bounds[:, 0] - self.box_progress.pass_margin
+        base_progress = (
+            (base_x - base_start) / (base_target - base_start).clamp_min(1e-6)
+        ).clamp(0.0, 1.0)
+        self._update_high_water(
+            self.post_front_base_best,
+            self.post_front_base_delta,
+            base_progress,
+            active & front_will_complete,
+        )
+        self._update_high_water(
+            self.rear_foot_clearance_best,
+            self.rear_foot_clearance_delta,
+            clearance_score(self.rear_foot_local_indices),
+            active & front_will_complete & ~rear_done,
+        )
+
+        front_event = ~front_done & front_will_complete
+        rear_event = ~rear_done & rear_will_complete
+        pass_event = (
+            active
+            & front_will_complete
+            & rear_will_complete
+            & (base_x > bounds[:, 1] + self.box_progress.pass_margin)
+        )
+        refreshed = (
+            (self.box_approach_delta > 1e-6)
+            | (self.front_foot_clearance_delta > 1e-6)
+            | front_event
+            | (self.post_front_base_delta > 1e-6)
+            | (self.rear_foot_clearance_delta > 1e-6)
+            | rear_event
+            | pass_event
+        )
+        in_stagnation_region = (
+            active
+            & (
+                base_x
+                >= bounds[:, 0]
+                - float(self.cfg.box_progress.stagnation_region_distance)
+            )
+            & (base_x <= bounds[:, 1] + self.box_progress.pass_margin)
+        )
+        self.stagnation_counter[:] = torch.where(
+            in_stagnation_region & ~refreshed,
+            self.stagnation_counter + 1,
+            torch.zeros_like(self.stagnation_counter),
+        )
+        self.max_stagnation_steps[:] = torch.maximum(
+            self.max_stagnation_steps, self.stagnation_counter
+        )
+        self.stagnation_candidate_buf[:] = (
+            self.stagnation_counter
+            >= int(self.cfg.box_progress.stagnation_steps)
+        )
+
+    def _allowed_one_box_layouts(self):
+        cfg = self.cfg.one_box_curriculum
+        if self.one_box_curriculum_stage < 2:
+            return tuple(int(value) for value in cfg.low_height_layouts)
+        layouts = tuple(int(value) for value in cfg.full_height_layouts)
+        return layouts[: self.one_box_height_level + 1]
+
+    def _assign_one_box_layouts(self, env_ids):
+        if not self.uses_task_curriculum or len(env_ids) == 0:
+            return
+        allowed = self._allowed_one_box_layouts()
+        selected_layout = torch.tensor(
+            allowed, dtype=torch.long, device=self.device
+        )[torch.remainder(env_ids, len(allowed))]
+        physical_indices = torch.empty_like(env_ids)
+        num_tracks = self.cfg.terrain.num_rows * self.cfg.terrain.num_cols
+        for layout in allowed:
+            mask = selected_layout == layout
+            candidates = torch.arange(
+                layout,
+                num_tracks,
+                self.terrain.num_unique_layouts,
+                dtype=torch.long,
+                device=self.device,
+            )
+            slots = torch.div(
+                env_ids[mask], len(allowed), rounding_mode="floor"
+            )
+            physical_indices[mask] = candidates[
+                torch.remainder(slots, len(candidates))
+            ]
+        self.terrain_levels[env_ids] = torch.div(
+            physical_indices,
+            self.cfg.terrain.num_cols,
+            rounding_mode="floor",
+        )
+        self.terrain_types[env_ids] = torch.remainder(
+            physical_indices, self.cfg.terrain.num_cols
+        )
+        self.env_origins[env_ids] = self.terrain_origins[
+            self.terrain_levels[env_ids], self.terrain_types[env_ids]
+        ]
+        self.episode_curriculum_stage[env_ids] = (
+            self.one_box_curriculum_stage
+        )
+        self.episode_curriculum_height_level[env_ids] = (
+            self.one_box_height_level
+        )
+
+    def _reset_root_states(self, env_ids):
+        if bool(getattr(self, "uses_task_curriculum", False)):
+            self._assign_one_box_layouts(env_ids)
+            self._refresh_box_course_data(env_ids)
+        super()._reset_root_states(env_ids)
+
+    def _refresh_box_course_data(self, env_ids=None):
+        full_refresh = env_ids is None
+        if full_refresh:
+            env_ids = torch.arange(self.num_envs, device=self.device)
         track_indices = torch.stack(
-            (self.terrain_levels, self.terrain_types), dim=1
+            (self.terrain_levels[env_ids], self.terrain_types[env_ids]), dim=1
         )
-        self.env_box_bounds = self.terrain.get_box_bounds(track_indices)
+        box_bounds = self.terrain.get_box_bounds(track_indices)
         physical_track_indices = (
-            self.terrain_levels * self.cfg.terrain.num_cols
-            + self.terrain_types
+            self.terrain_levels[env_ids] * self.cfg.terrain.num_cols
+            + self.terrain_types[env_ids]
         )
-        self.layout_indices = torch.remainder(
+        layout_indices = torch.remainder(
             physical_track_indices, self.terrain.num_unique_layouts
         )
         spawn_margin = float(self.terrain.track_kwargs["spawn_margin"])
-        self.track_start_x = self.env_origins[:, 0] - spawn_margin
-        self.track_end_x = self.track_start_x + float(self.terrain.env_length)
+        track_start_x = self.env_origins[env_ids, 0] - spawn_margin
+        track_end_x = track_start_x + float(self.terrain.env_length)
+
+        if full_refresh:
+            self.env_box_bounds = box_bounds
+            self.layout_indices = layout_indices
+            self.track_start_x = track_start_x
+            self.track_end_x = track_end_x
+        else:
+            self.env_box_bounds[env_ids] = box_bounds
+            self.layout_indices[env_ids] = layout_indices
+            self.track_start_x[env_ids] = track_start_x
+            self.track_end_x[env_ids] = track_end_x
 
         required_boxes = self.box_progress.required_boxes
         if required_boxes < self.terrain.num_boxes:
-            self.course_landing_end_x = self.env_box_bounds[
-                :, required_boxes, 0
-            ]
+            landing_end_x = box_bounds[:, required_boxes, 0]
         else:
-            self.course_landing_end_x = self.track_end_x.clone()
+            landing_end_x = track_end_x.clone()
+        if full_refresh:
+            self.course_landing_end_x = landing_end_x
+        else:
+            self.course_landing_end_x[env_ids] = landing_end_x
+            return
         minimum_length = float(self.cfg.box_progress.min_landing_zone_length)
         recovery_distance = float(
             getattr(
@@ -1649,9 +1972,14 @@ class LeggedRobotBox(LeggedRobot):
             > self.cfg.box_progress.contact_force_threshold
         )
 
-        self._update_foot_guidance_progress(
-            feet_positions, feet_terrain_heights, feet_contact_forces
-        )
+        if self.uses_task_curriculum:
+            self._update_one_box_stage_progress(
+                feet_positions, feet_terrain_heights, feet_contact_forces
+            )
+        else:
+            self._update_foot_guidance_progress(
+                feet_positions, feet_terrain_heights, feet_contact_forces
+            )
 
         self.box_progress.update(
             box_bounds=self.env_box_bounds,
@@ -1676,6 +2004,16 @@ class LeggedRobotBox(LeggedRobot):
             episode_step=self.episode_length_buf,
             landing_end_x=self.course_landing_end_x,
             external_fall=self.flat_low_base_height_failure_buf,
+            external_stagnation=(
+                self.stagnation_candidate_buf
+                if self.uses_task_curriculum
+                else None
+            ),
+            curriculum_stage=(
+                self.episode_curriculum_stage
+                if self.uses_task_curriculum
+                else None
+            ),
         )
         self._update_landing_guidance(yaw)
         self._apply_landing_commands()
@@ -1843,6 +2181,12 @@ class LeggedRobotBox(LeggedRobot):
         episode["severe_body_impact_rate"] = (
             self.severe_body_impact_buf[env_ids].float().mean()
         )
+        episode["stagnation_rate"] = (
+            self.stagnation_buf[env_ids].float().mean()
+        )
+        episode["curriculum_success_rate"] = (
+            self.curriculum_success_buf[env_ids].float().mean()
+        )
         episode["required_boxes"] = torch.tensor(
             float(self.box_progress.required_boxes), device=self.device
         )
@@ -1853,30 +2197,81 @@ class LeggedRobotBox(LeggedRobot):
         episode["rewarded_progress_ratio"] = self.rewarded_progress_ratio[
             env_ids
         ].mean()
-        episode["front_foot_lift_progress_mean"] = (
-            self.front_foot_lift_best[env_ids].mean()
+        if not self.uses_task_curriculum:
+            episode["front_foot_lift_progress_mean"] = (
+                self.front_foot_lift_best[env_ids].mean()
+            )
+            episode["front_foot_lift_target_rate"] = (
+                self.front_foot_lift_best[env_ids] >= 1.0 - 1e-6
+            ).float().mean()
+            episode["front_foot_reach_progress_mean"] = (
+                self.front_foot_reach_best[env_ids].mean()
+            )
+            episode["front_foot_reach_target_rate"] = (
+                self.front_foot_reach_best[env_ids] >= 1.0 - 1e-6
+            ).float().mean()
+            episode["rear_foot_lift_progress_mean"] = (
+                self.rear_foot_lift_best[env_ids].mean()
+            )
+            episode["rear_foot_lift_target_rate"] = (
+                self.rear_foot_lift_best[env_ids] >= 1.0 - 1e-6
+            ).float().mean()
+            episode["rear_foot_reach_progress_mean"] = (
+                self.rear_foot_reach_best[env_ids].mean()
+            )
+            episode["rear_foot_reach_target_rate"] = (
+                self.rear_foot_reach_best[env_ids] >= 1.0 - 1e-6
+            ).float().mean()
+        episode["box_approach_progress_mean"] = self.box_approach_best[
+            env_ids
+        ].mean()
+        episode["front_foot_clearance_progress_mean"] = (
+            self.front_foot_clearance_best[env_ids].mean()
         )
-        episode["front_foot_lift_target_rate"] = (
-            self.front_foot_lift_best[env_ids] >= 1.0 - 1e-6
+        episode["front_foot_clearance_target_rate"] = (
+            self.front_foot_clearance_best[env_ids] >= 1.0 - 1e-6
         ).float().mean()
-        episode["front_foot_reach_progress_mean"] = (
-            self.front_foot_reach_best[env_ids].mean()
+        episode["post_front_base_progress_mean"] = (
+            self.post_front_base_best[env_ids].mean()
         )
-        episode["front_foot_reach_target_rate"] = (
-            self.front_foot_reach_best[env_ids] >= 1.0 - 1e-6
-        ).float().mean()
-        episode["rear_foot_lift_progress_mean"] = (
-            self.rear_foot_lift_best[env_ids].mean()
+        episode["rear_foot_clearance_progress_mean"] = (
+            self.rear_foot_clearance_best[env_ids].mean()
         )
-        episode["rear_foot_lift_target_rate"] = (
-            self.rear_foot_lift_best[env_ids] >= 1.0 - 1e-6
+        episode["rear_foot_clearance_target_rate"] = (
+            self.rear_foot_clearance_best[env_ids] >= 1.0 - 1e-6
         ).float().mean()
-        episode["rear_foot_reach_progress_mean"] = (
-            self.rear_foot_reach_best[env_ids].mean()
-        )
-        episode["rear_foot_reach_target_rate"] = (
-            self.rear_foot_reach_best[env_ids] >= 1.0 - 1e-6
-        ).float().mean()
+        episode["max_stagnation_steps"] = self.max_stagnation_steps[
+            env_ids
+        ].float().max()
+        if self.uses_task_curriculum:
+            current_stage_mask = (
+                self.episode_curriculum_stage[env_ids]
+                == self.one_box_curriculum_stage
+            ) & (
+                self.episode_curriculum_height_level[env_ids]
+                == self.one_box_height_level
+            )
+            current_stage_count = current_stage_mask.sum()
+            current_stage_successes = (
+                (
+                    self.curriculum_success_buf[env_ids]
+                    | self.success_buf[env_ids]
+                )
+                & current_stage_mask
+            ).sum()
+            episode["one_box_curriculum_stage"] = torch.tensor(
+                float(self.one_box_curriculum_stage), device=self.device
+            )
+            episode["one_box_height_level"] = torch.tensor(
+                float(self.one_box_height_level), device=self.device
+            )
+            episode["one_box_stage_success_rate"] = (
+                current_stage_successes.float()
+                / current_stage_count.clamp_min(1)
+            )
+            episode["one_box_stage_episode_count"] = (
+                current_stage_count.float()
+            )
         episode.update(self._get_speed_statistics(env_ids))
         episode.update(self._get_motion_quality_statistics(env_ids))
         episode.update(self._get_flat_gait_statistics(env_ids))
@@ -1897,6 +2292,12 @@ class LeggedRobotBox(LeggedRobot):
 
         result_masks = {
             "success": self.success_buf[env_ids],
+            "curriculum_success": self.curriculum_success_buf[env_ids],
+            "severe_body_impact": (
+                self.severe_body_impact_buf[env_ids]
+                & self.fall_buf[env_ids]
+            ),
+            "stagnation": self.stagnation_buf[env_ids],
             "fall_failure": self.fall_buf[env_ids],
             "missed_box_failure": self.missed_box_buf[env_ids],
             "out_of_track_failure": (
@@ -2001,6 +2402,11 @@ class LeggedRobotBox(LeggedRobot):
                     env_ids, box_idx
                 ].float().mean()
             )
+            episode[f"box_{box_idx + 1}_front_contact_rate"] = (
+                self.box_progress.front_contacted_boxes[
+                    env_ids, box_idx
+                ].float().mean()
+            )
         for layout_idx in range(self.terrain.num_unique_layouts):
             layout_mask = self.layout_indices[env_ids] == layout_idx
             layout_count = layout_mask.sum()
@@ -2015,6 +2421,10 @@ class LeggedRobotBox(LeggedRobot):
             )
 
         self.extras["successes"] = self.success_buf.clone()
+        self.extras["curriculum_successes"] = (
+            self.curriculum_success_buf.clone()
+        )
+        self.extras["stagnations"] = self.stagnation_buf.clone()
         self.extras["episode_incompletes"] = self.incomplete_buf.clone()
         self.extras["episode_timeouts"] = self.episode_timeout_buf.clone()
 
@@ -2045,6 +2455,18 @@ class LeggedRobotBox(LeggedRobot):
             self.rear_foot_reach_best[env_ids] = 0.0
             self.rear_foot_reach_delta[env_ids] = 0.0
             self.front_foot_guidance_target_idx[env_ids] = -1
+        if hasattr(self, "box_approach_best"):
+            for name in (
+                "box_approach",
+                "front_foot_clearance",
+                "post_front_base",
+                "rear_foot_clearance",
+            ):
+                getattr(self, f"{name}_best")[env_ids] = 0.0
+                getattr(self, f"{name}_delta")[env_ids] = 0.0
+            self.stagnation_counter[env_ids] = 0
+            self.max_stagnation_steps[env_ids] = 0
+            self.stagnation_candidate_buf[env_ids] = False
         if hasattr(self, "landing_entry_horizontal_speed"):
             self.landing_entry_horizontal_speed[env_ids] = 0.0
             self.landing_deceleration_best[env_ids] = 0.0
@@ -2105,6 +2527,138 @@ class LeggedRobotBox(LeggedRobot):
         return self._box_speed_blend().to(
             self.base_lin_vel.dtype
         ) * self.cfg.rewards.box_speed_allowance
+
+    def get_task_curriculum_state(self):
+        """Return checkpoint-safe one-box curriculum state."""
+        if not self.uses_task_curriculum:
+            return None
+        return {
+            "version": int(self.cfg.one_box_curriculum.state_version),
+            "stage": int(self.one_box_curriculum_stage),
+            "height_level": int(self.one_box_height_level),
+            "stage_start_iteration": int(
+                self.one_box_stage_start_iteration
+            ),
+            "stable_windows": int(self.one_box_stable_windows),
+        }
+
+    def initialize_task_curriculum(self, start_iteration):
+        """Start a clean Stage-A curriculum after rough-policy migration."""
+        if not self.uses_task_curriculum:
+            return
+        self.one_box_curriculum_stage = 0
+        self.one_box_height_level = 0
+        self.one_box_stage_start_iteration = int(start_iteration)
+        self.one_box_stable_windows = 0
+        self.one_box_curriculum_promoted = False
+
+    def load_task_curriculum_state(self, state):
+        """Strictly restore one-box stage and height state."""
+        if not self.uses_task_curriculum:
+            if state is not None:
+                raise RuntimeError(
+                    "Checkpoint contains one-box curriculum state for a task "
+                    "without that curriculum."
+                )
+            return
+        if state is None:
+            raise RuntimeError(
+                "One-box curriculum checkpoint state is missing. Use "
+                "initialize_one_box_from_rough2000 exactly once."
+            )
+        expected_version = int(self.cfg.one_box_curriculum.state_version)
+        if int(state.get("version", -1)) != expected_version:
+            raise RuntimeError(
+                "Unsupported one-box curriculum checkpoint version."
+            )
+        stage = int(state["stage"])
+        height_level = int(state["height_level"])
+        max_height_level = len(
+            self.cfg.one_box_curriculum.full_height_layouts
+        ) - 1
+        if not 0 <= stage <= 2:
+            raise RuntimeError("One-box curriculum stage is out of range.")
+        if not 0 <= height_level <= max_height_level:
+            raise RuntimeError(
+                "One-box curriculum height level is out of range."
+            )
+        if stage < 2 and height_level != 0:
+            raise RuntimeError(
+                "Front/rear contact stages must use the low-height level."
+            )
+        self.one_box_curriculum_stage = stage
+        self.one_box_height_level = height_level
+        self.one_box_stage_start_iteration = int(
+            state["stage_start_iteration"]
+        )
+        self.one_box_stable_windows = int(state["stable_windows"])
+        self.one_box_curriculum_promoted = False
+
+    @staticmethod
+    def _episode_summary_scalar(summary, key, default=0.0):
+        value = summary.get(key, default)
+        if isinstance(value, torch.Tensor):
+            return float(value.detach().float().mean().item())
+        return float(value)
+
+    def update_task_curriculum(self, episode_summary, iteration):
+        """Promote A/B/C or the Stage-C height after stable success windows."""
+        self.one_box_curriculum_promoted = False
+        if not self.uses_task_curriculum:
+            return False
+        cfg = self.cfg.one_box_curriculum
+        episode_count = self._episode_summary_scalar(
+            episode_summary, "one_box_stage_episode_count"
+        )
+        if episode_count < int(cfg.minimum_episodes):
+            return False
+        stage_age = int(iteration) - self.one_box_stage_start_iteration
+        if stage_age < int(cfg.minimum_stage_iterations):
+            return False
+        success_rate = self._episode_summary_scalar(
+            episode_summary, "one_box_stage_success_rate"
+        )
+        self.one_box_stable_windows = (
+            self.one_box_stable_windows + 1
+            if success_rate >= float(cfg.promotion_success_rate)
+            else 0
+        )
+        if self.one_box_stable_windows < int(cfg.required_stable_windows):
+            return False
+
+        promoted = False
+        if self.one_box_curriculum_stage < 2:
+            self.one_box_curriculum_stage += 1
+            self.one_box_height_level = 0
+            promoted = True
+        else:
+            max_height_level = len(cfg.full_height_layouts) - 1
+            if self.one_box_height_level < max_height_level:
+                self.one_box_height_level += 1
+                promoted = True
+        self.one_box_stable_windows = 0
+        if promoted:
+            self.one_box_stage_start_iteration = int(iteration)
+            self.one_box_curriculum_promoted = True
+        return promoted
+
+    def get_task_curriculum_statistics(self, iteration):
+        """Return scalar state for terminal and TensorBoard logging."""
+        if not self.uses_task_curriculum:
+            return {}
+        return {
+            "one_box_curriculum_stage": float(
+                self.one_box_curriculum_stage
+            ),
+            "one_box_height_level": float(self.one_box_height_level),
+            "one_box_stage_age": float(
+                max(int(iteration) - self.one_box_stage_start_iteration, 0)
+            ),
+            "one_box_stable_windows": float(self.one_box_stable_windows),
+            "one_box_curriculum_promoted": float(
+                self.one_box_curriculum_promoted
+            ),
+        }
 
     def set_quality_levels(self, speed_penalty_level, motion_quality_level):
         """Set independent speed and motion-quality curriculum levels."""
@@ -2210,18 +2764,52 @@ class LeggedRobotBox(LeggedRobot):
         """Return the non-repeatable normalized course-progress increment."""
         return self.course_progress_delta_buf
 
+    def _reward_box_approach_progress(self):
+        """Reward only new forward progress from spawn to the box front."""
+        return self.box_approach_delta
+
+    def _reward_front_foot_clearance_progress(self):
+        """Reward front-foot edge crossing only with sufficient clearance."""
+        return self.front_foot_clearance_delta
+
+    def _reward_post_front_base_progress(self):
+        """Reward body advance after the front contact requirement is met."""
+        return self.post_front_base_delta
+
+    def _reward_rear_foot_clearance_progress(self):
+        """Reward rear-foot edge crossing after valid front contact."""
+        return self.rear_foot_clearance_delta
+
     def _reward_termination(self):
-        """Penalize ordinary failure from -40 to -25 by spatial progress."""
+        """Penalize ordinary failures without double-counting severe impact."""
+        severe_impact = getattr(
+            self,
+            "severe_body_impact_buf",
+            torch.zeros_like(self.generic_failure_buf),
+        )
+        fall = getattr(
+            self, "fall_buf", torch.zeros_like(self.generic_failure_buf)
+        )
+        severe_failure = severe_impact & fall
+        ordinary_failure = self.generic_failure_buf & ~severe_failure
         rewards_cfg = getattr(getattr(self, "cfg", None), "rewards", None)
         if not bool(
             getattr(rewards_cfg, "failure_progress_scaling", True)
         ):
-            return self.generic_failure_buf.float()
+            return ordinary_failure.float()
         progress_multiplier = 1.0 - 0.375 * self.task_progress_buf
-        return self.generic_failure_buf.float() * progress_multiplier
+        return ordinary_failure.float() * progress_multiplier
+
+    def _reward_severe_body_impact(self):
+        """Emit the exclusive severe-impact terminal event."""
+        return (self.severe_body_impact_buf & self.fall_buf).float()
+
+    def _reward_stagnation(self):
+        """Emit an early terminal event after no obstacle progress."""
+        return self.stagnation_buf.float()
 
     def _reward_incomplete(self):
-        """Penalize the 45-second deadline from -40 to -30 by progress."""
+        """Penalize an unfinished episode at its configured deadline."""
         rewards_cfg = getattr(getattr(self, "cfg", None), "rewards", None)
         if not bool(
             getattr(rewards_cfg, "failure_progress_scaling", True)

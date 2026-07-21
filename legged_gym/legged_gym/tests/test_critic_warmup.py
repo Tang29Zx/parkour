@@ -508,6 +508,8 @@ class CriticWarmupTest(unittest.TestCase):
                 "raw/early_failure_episode_count": torch.tensor(20.0),
                 "layout_1_success_rate": torch.tensor(1.0),
                 "layout_1_episode_count": torch.tensor(40.0),
+                "one_box_stage_success_rate": torch.tensor(1.0),
+                "one_box_stage_episode_count": torch.tensor(40.0),
             },
             {
                 "num_terminated": torch.tensor(60.0),
@@ -528,6 +530,8 @@ class CriticWarmupTest(unittest.TestCase):
                 "raw/early_failure_episode_count": torch.tensor(20.0),
                 "layout_1_success_rate": torch.tensor(1.0 / 3.0),
                 "layout_1_episode_count": torch.tensor(60.0),
+                "one_box_stage_success_rate": torch.tensor(0.5),
+                "one_box_stage_episode_count": torch.tensor(60.0),
             },
         ]
 
@@ -546,6 +550,11 @@ class CriticWarmupTest(unittest.TestCase):
         self.assertAlmostEqual(
             summary["layout_1_success_rate"].item(),
             0.6,
+            places=6,
+        )
+        self.assertAlmostEqual(
+            summary["one_box_stage_success_rate"].item(),
+            0.7,
             places=6,
         )
         self.assertAlmostEqual(
@@ -596,6 +605,29 @@ class CriticWarmupTest(unittest.TestCase):
             self.assertTrue((Path(temp_dir) / "model_11800.pt").is_file())
             checkpoint = torch.load(checkpoint_path, map_location="cpu")
             self.assertEqual(checkpoint["iter"], 11800)
+
+    def test_runner_checkpoint_includes_environment_curriculum_state(self):
+        runner = OnPolicyRunner.__new__(OnPolicyRunner)
+        runner.alg = self.make_ppo()
+        runner.current_learning_iteration = 2100
+        expected = {
+            "version": 1,
+            "stage": 1,
+            "height_level": 0,
+            "stage_start_iteration": 2090,
+            "stable_windows": 1,
+        }
+        runner.env = SimpleNamespace(
+            get_task_curriculum_state=lambda: expected
+        )
+        with tempfile.TemporaryDirectory() as temp_dir:
+            path = Path(temp_dir) / "model_2100.pt"
+            runner.save(path)
+            checkpoint = torch.load(path, map_location="cpu")
+
+        self.assertEqual(
+            checkpoint["task_curriculum_state_dict"], expected
+        )
 
     def test_runner_starts_warmup_only_for_explicit_critic_reset(self):
         source = self.make_ppo().state_dict()

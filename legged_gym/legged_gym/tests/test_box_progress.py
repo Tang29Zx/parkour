@@ -67,6 +67,8 @@ class BoxProgressTrackerTest(unittest.TestCase):
         self.episode_step = torch.zeros(2, dtype=torch.long)
         self.natural_timeout = torch.zeros(2, dtype=torch.bool)
         self.external_fall = torch.zeros(2, dtype=torch.bool)
+        self.external_stagnation = torch.zeros(2, dtype=torch.bool)
+        self.curriculum_stage = None
 
     def update(self):
         self.episode_step += 1
@@ -91,7 +93,55 @@ class BoxProgressTrackerTest(unittest.TestCase):
             episode_step=self.episode_step,
             landing_end_x=self.landing_end_x,
             external_fall=self.external_fall,
+            external_stagnation=self.external_stagnation,
+            curriculum_stage=self.curriculum_stage,
         )
+
+    def test_stage_a_ends_on_two_front_contact_steps(self):
+        self.curriculum_stage = self.torch.tensor([0, 0])
+        self.put_foot_on_box(0, 0, 0)
+        self.update()
+        self.assertFalse(self.tracker.curriculum_success_buf[0])
+        self.update()
+
+        self.assertTrue(self.tracker.front_foot_contact_buf[0])
+        self.assertTrue(self.tracker.curriculum_success_buf[0])
+        self.assertFalse(self.tracker.success_buf[0])
+        reset_buf = self.torch.zeros(2, dtype=self.torch.bool)
+        time_out_buf = self.torch.zeros(2, dtype=self.torch.bool)
+        self.tracker.apply_termination(reset_buf, time_out_buf)
+        self.assertTrue(reset_buf[0])
+        self.assertFalse(time_out_buf[0])
+
+    def test_stage_b_requires_front_before_rear_contact_accumulates(self):
+        self.curriculum_stage = self.torch.tensor([1, 1])
+        self.put_foot_on_box(0, 2, 0)
+        self.update()
+        self.update()
+        self.assertEqual(self.tracker.rear_contact_counter[0].item(), 0)
+
+        self.contact_forces.zero_()
+        self.put_foot_on_box(0, 0, 0)
+        self.update()
+        self.update()
+        self.contact_forces.zero_()
+        self.put_foot_on_box(0, 2, 0)
+        self.update()
+        self.update()
+
+        self.assertTrue(self.tracker.rear_foot_contact_buf[0])
+        self.assertTrue(self.tracker.curriculum_success_buf[0])
+
+    def test_stagnation_is_a_failure_and_overrides_stage_success(self):
+        self.curriculum_stage = self.torch.tensor([0, 0])
+        self.put_foot_on_box(0, 0, 0)
+        self.update()
+        self.external_stagnation[0] = True
+        self.update()
+
+        self.assertTrue(self.tracker.stagnation_buf[0])
+        self.assertFalse(self.tracker.curriculum_success_buf[0])
+        self.assertTrue(self.tracker.failure_buf[0])
 
     def put_foot_on_box(self, env_idx, foot_idx, box_idx):
         bounds = self.box_bounds[env_idx, box_idx]
