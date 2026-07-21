@@ -351,6 +351,11 @@ class Go2BoxParkour1BoxCfg(Go2BoxParkourCfg):
             front_box_excursion = -0.1
             rear_post_contact_velocity = -2.0
             rear_post_contact_action_rate = -0.5
+            # With all four feet truly supported on top, large motions are no
+            # longer necessary. These remain zero below their soft thresholds.
+            all_feet_box_velocity = -2.0
+            all_feet_box_action_rate = -0.5
+            all_feet_box_excursion = -0.25
             rear_support_missing = -0.2
             flat_airborne = -0.2
             lateral_velocity_square = -0.3
@@ -369,6 +374,7 @@ class Go2BoxParkour1BoxCfg(Go2BoxParkourCfg):
             box_front_foot_contact = 300.0
             post_front_base_progress = 150.0
             rear_foot_clearance_progress = 100.0
+            box_exit_progress = 150.0
             box_rear_foot_contact = 400.0
             box_passed = 500.0
             recovery_success = 750.0
@@ -402,6 +408,13 @@ class Go2BoxParkour1BoxCfg(Go2BoxParkourCfg):
         rear_post_contact_velocity_normalization = 3.0
         rear_post_contact_action_delta_threshold = 0.35
         rear_post_contact_action_delta_normalization = 0.25
+        all_feet_box_velocity_threshold = 4.0
+        all_feet_box_velocity_normalization = 4.0
+        all_feet_box_action_delta_threshold = 0.25
+        all_feet_box_action_delta_normalization = 0.35
+        all_feet_box_hip_allowance = 0.55
+        all_feet_box_thigh_allowance = 1.20
+        all_feet_box_excursion_normalization = 0.50
         # Enable gait repair only after the front/rear contact stages have
         # completed. The active box window remains unconstrained.
         quality_repair_min_curriculum_stage = 2
@@ -477,7 +490,7 @@ class Go2BoxParkour1BoxCfgPPO(Go2BoxParkourCfgPPO):
         reference_kl_start_coef = 0.02
 
     class runner(Go2BoxParkourCfgPPO.runner):
-        run_name = "one_box_v188_clean_box_from3350"
+        run_name = "one_box_v189_exit_quality_from4000"
         init_at_random_ep_len = False
         resume = True
         load_run = osp.join(
@@ -491,7 +504,7 @@ class Go2BoxParkour1BoxCfgPPO(Go2BoxParkourCfgPPO):
             "Jul21_18-05-59_one_box_v183_from_rough2000",
             "model_2100_warmup.pt",
         )
-        checkpoint = 3350
+        checkpoint = 4000
         # Resume the V18.7 curriculum, Critic, optimizer, and reference policy.
         ckpt_manipulator = None
         max_iterations = 2000

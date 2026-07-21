@@ -58,6 +58,9 @@ class LeggedRobotBox(LeggedRobot):
             dtype=torch.long,
             device=self.device,
         )
+        self.all_upper_joint_indices = torch.cat(
+            (self.front_upper_joint_indices, self.rear_upper_joint_indices)
+        )
         progress_cfg = self.cfg.box_progress
         if progress_cfg.flat_low_base_height_threshold <= 0.0:
             raise ValueError(
@@ -354,6 +357,7 @@ class LeggedRobotBox(LeggedRobot):
             "front_foot_clearance",
             "post_front_base",
             "rear_foot_clearance",
+            "box_exit",
         ):
             setattr(
                 self,
@@ -365,6 +369,12 @@ class LeggedRobotBox(LeggedRobot):
                 f"{name}_delta",
                 torch.zeros_like(self.forward_speed_sum),
             )
+        self.current_box_top_contact_mask = torch.zeros(
+            self.num_envs,
+            len(self.feet_indices),
+            dtype=torch.bool,
+            device=self.device,
+        )
         self.stagnation_counter = torch.zeros(
             self.num_envs, dtype=torch.long, device=self.device
         )
@@ -863,8 +873,10 @@ class LeggedRobotBox(LeggedRobot):
             "front_foot_clearance",
             "post_front_base",
             "rear_foot_clearance",
+            "box_exit",
         ):
             getattr(self, f"{name}_delta").zero_()
+        self.current_box_top_contact_mask.zero_()
 
         env_ids = torch.arange(self.num_envs, device=self.device)
         active = self.next_box_idx < self.box_progress.required_boxes
@@ -908,6 +920,9 @@ class LeggedRobotBox(LeggedRobot):
             feet_positions,
             feet_terrain_heights,
             feet_contact_forces,
+        )
+        self.current_box_top_contact_mask[:] = (
+            top_contact & active.unsqueeze(1)
         )
         front_contact_now = top_contact[
             :, self.front_foot_local_indices
@@ -984,6 +999,18 @@ class LeggedRobotBox(LeggedRobot):
             active & front_will_complete & ~rear_done,
         )
 
+        exit_target = bounds[:, 1] + self.box_progress.pass_margin
+        exit_score = (
+            (base_x - base_target)
+            / (exit_target - base_target).clamp_min(1e-6)
+        ).clamp(0.0, 1.0)
+        self._update_high_water(
+            self.box_exit_best,
+            self.box_exit_delta,
+            exit_score,
+            active & front_will_complete & rear_will_complete,
+        )
+
         front_event = ~front_done & front_will_complete
         rear_event = ~rear_done & rear_will_complete
         pass_event = (
@@ -999,6 +1026,7 @@ class LeggedRobotBox(LeggedRobot):
             | (self.post_front_base_delta > 1e-6)
             | (self.rear_foot_clearance_delta > 1e-6)
             | rear_event
+            | (self.box_exit_delta > 1e-6)
             | pass_event
         )
         in_stagnation_region = (
@@ -2363,6 +2391,12 @@ class LeggedRobotBox(LeggedRobot):
         episode["rear_foot_clearance_target_rate"] = (
             self.rear_foot_clearance_best[env_ids] >= 1.0 - 1e-6
         ).float().mean()
+        episode["box_exit_progress_mean"] = self.box_exit_best[
+            env_ids
+        ].mean()
+        episode["box_exit_target_rate"] = (
+            self.box_exit_best[env_ids] >= 1.0 - 1e-6
+        ).float().mean()
         episode["max_stagnation_steps"] = self.max_stagnation_steps[
             env_ids
         ].float().max()
@@ -2458,11 +2492,13 @@ class LeggedRobotBox(LeggedRobot):
                 "action_rate",
                 "front_box_action_rate",
                 "rear_post_contact_action_rate",
+                "all_feet_box_action_rate",
             ),
             "dof_vel_penalty": (
                 "dof_vel",
                 "front_box_velocity",
                 "rear_post_contact_velocity",
+                "all_feet_box_velocity",
             ),
             "height_penalty": ("flat_base_height",),
             "collision_penalty": (
@@ -2495,6 +2531,9 @@ class LeggedRobotBox(LeggedRobot):
             "front_box_excursion",
             "rear_post_contact_velocity",
             "rear_post_contact_action_rate",
+            "all_feet_box_velocity",
+            "all_feet_box_action_rate",
+            "all_feet_box_excursion",
             "rear_upper_joint_excursion",
             "exceed_dof_pos_limits",
             "exceed_torque_limits_l1norm",
@@ -2602,12 +2641,14 @@ class LeggedRobotBox(LeggedRobot):
                 "front_foot_clearance",
                 "post_front_base",
                 "rear_foot_clearance",
+                "box_exit",
             ):
                 getattr(self, f"{name}_best")[env_ids] = 0.0
                 getattr(self, f"{name}_delta")[env_ids] = 0.0
             self.stagnation_counter[env_ids] = 0
             self.max_stagnation_steps[env_ids] = 0
             self.stagnation_candidate_buf[env_ids] = False
+            self.current_box_top_contact_mask[env_ids] = False
         if hasattr(self, "landing_entry_horizontal_speed"):
             self.landing_entry_horizontal_speed[env_ids] = 0.0
             self.landing_deceleration_best[env_ids] = 0.0
@@ -3196,6 +3237,13 @@ class LeggedRobotBox(LeggedRobot):
             self.next_box_idx < self.box_progress.required_boxes
         ) & self._near_box_for_speed_control()
 
+    def _all_feet_box_motion_gate(self):
+        """Select true four-foot box-top support, not merely prior contact."""
+        return (
+            (self.next_box_idx < self.box_progress.required_boxes)
+            & self.current_box_top_contact_mask.all(dim=1)
+        )
+
     def _reward_front_box_velocity(self):
         """Softly suppress only excessive front hip/thigh speed near the box."""
         threshold = float(self.cfg.rewards.front_box_velocity_threshold)
@@ -3208,7 +3256,7 @@ class LeggedRobotBox(LeggedRobot):
         excess = torch.relu(front_velocity - threshold) / normalization
         return (
             torch.square(excess).mean(dim=1).clamp(max=1.0)
-            * self._front_box_motion_gate().float()
+            * LeggedRobotBox._front_box_motion_gate(self).float()
         )
 
     def _reward_front_box_action_rate(self):
@@ -3227,7 +3275,7 @@ class LeggedRobotBox(LeggedRobot):
         excess = torch.relu(action_delta - threshold) / normalization
         return (
             torch.square(excess).mean(dim=1).clamp(max=1.0)
-            * self._front_box_motion_gate().float()
+            * LeggedRobotBox._front_box_motion_gate(self).float()
             * (self.episode_length_buf > 1).float()
         )
 
@@ -3253,7 +3301,65 @@ class LeggedRobotBox(LeggedRobot):
         excess = torch.relu(offsets - allowance) / normalization
         return (
             torch.square(excess).mean(dim=1).clamp(max=1.0)
-            * self._front_box_motion_gate().float()
+            * LeggedRobotBox._front_box_motion_gate(self).float()
+        )
+
+    def _reward_all_feet_box_velocity(self):
+        """Strongly trim excessive upper-joint speed under four-foot support."""
+        threshold = float(self.cfg.rewards.all_feet_box_velocity_threshold)
+        normalization = max(
+            float(self.cfg.rewards.all_feet_box_velocity_normalization), 1e-6
+        )
+        velocity = torch.abs(self.dof_vel[:, self.all_upper_joint_indices])
+        excess = torch.relu(velocity - threshold) / normalization
+        return (
+            torch.square(excess).mean(dim=1).clamp(max=1.0)
+            * LeggedRobotBox._all_feet_box_motion_gate(self).float()
+        )
+
+    def _reward_all_feet_box_action_rate(self):
+        """Penalize abrupt four-leg commands only with all feet on the box."""
+        threshold = float(
+            self.cfg.rewards.all_feet_box_action_delta_threshold
+        )
+        normalization = max(
+            float(
+                self.cfg.rewards.all_feet_box_action_delta_normalization
+            ),
+            1e-6,
+        )
+        action_delta = torch.abs(
+            self.actions[:, self.all_upper_joint_indices]
+            - self.last_actions[:, self.all_upper_joint_indices]
+        )
+        excess = torch.relu(action_delta - threshold) / normalization
+        return (
+            torch.square(excess).mean(dim=1).clamp(max=1.0)
+            * LeggedRobotBox._all_feet_box_motion_gate(self).float()
+            * (self.episode_length_buf > 1).float()
+        )
+
+    def _reward_all_feet_box_excursion(self):
+        """Penalize unusually large four-leg offsets during full top support."""
+        offsets = torch.abs(
+            self.dof_pos[:, self.all_upper_joint_indices]
+            - self.default_dof_pos[:, self.all_upper_joint_indices]
+        )
+        hip = float(self.cfg.rewards.all_feet_box_hip_allowance)
+        thigh = float(self.cfg.rewards.all_feet_box_thigh_allowance)
+        allowance = torch.tensor(
+            [hip, hip, thigh, thigh, hip, hip, thigh, thigh],
+            dtype=offsets.dtype,
+            device=offsets.device,
+        )
+        normalization = max(
+            float(self.cfg.rewards.all_feet_box_excursion_normalization),
+            1e-6,
+        )
+        excess = torch.relu(offsets - allowance) / normalization
+        return (
+            torch.square(excess).mean(dim=1).clamp(max=1.0)
+            * LeggedRobotBox._all_feet_box_motion_gate(self).float()
         )
 
     def _reward_rear_post_contact_velocity(self):
@@ -3388,6 +3494,10 @@ class LeggedRobotBox(LeggedRobot):
     def _reward_rear_foot_clearance_progress(self):
         """Reward rear-foot edge crossing after valid front contact."""
         return self.rear_foot_clearance_delta
+
+    def _reward_box_exit_progress(self):
+        """Reward non-repeatable body progress from box center to its rear edge."""
+        return self.box_exit_delta
 
     def _reward_termination(self):
         """Penalize ordinary failures without double-counting severe impact."""
