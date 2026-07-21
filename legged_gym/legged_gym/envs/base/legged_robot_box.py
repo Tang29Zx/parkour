@@ -96,6 +96,14 @@ class LeggedRobotBox(LeggedRobot):
         )
         self._bind_progress_buffers()
         self._refresh_box_course_data()
+        self.landing_command_ramp_steps = int(
+            getattr(progress_cfg, "landing_command_ramp_steps", 20)
+        )
+        if self.landing_command_ramp_steps <= 0:
+            raise ValueError("landing_command_ramp_steps must be positive.")
+        self.episode_command_x = torch.zeros(
+            self.num_envs, dtype=torch.float, device=self.device
+        )
         self.forward_speed_sum = torch.zeros(
             self.num_envs, dtype=torch.float, device=self.device
         )
@@ -1183,6 +1191,12 @@ class LeggedRobotBox(LeggedRobot):
         stats["rear_upper_joint_excursion_raw_max"] = torch.max(
             self.rear_excursion_raw_max[env_ids]
         )
+        # Report the hypothetical episode cost at scale -1.0 while Stage A
+        # keeps the actual reward scale at zero.
+        potential_penalty = -self.rear_excursion_raw_sum[env_ids] * self.dt
+        stats["rear_upper_joint_excursion_potential_penalty_mean"] = (
+            potential_penalty.mean()
+        )
         return stats
 
     def _get_landing_statistics(self, env_ids):
@@ -1346,11 +1360,32 @@ class LeggedRobotBox(LeggedRobot):
         )
 
     def _apply_landing_commands(self):
-        """Command a full stop immediately after the required final box."""
+        """Ramp the episode command to zero during the landing phase."""
         landing_phase = (
             self.next_box_idx >= self.box_progress.required_boxes
         )
-        self.commands[landing_phase, :3] = 0.0
+        ramp = torch.clamp(
+            1.0
+            - self.steps_in_landing_phase.float()
+            / float(self.landing_command_ramp_steps),
+            min=0.0,
+            max=1.0,
+        )
+        self.commands[landing_phase, 0] = (
+            self.episode_command_x[landing_phase] * ramp[landing_phase]
+        )
+        self.commands[landing_phase, 1] = 0.0
+        self.commands[landing_phase, 2] = 0.0
+
+    def reset_idx(self, env_ids):
+        """Reset environments and preserve their newly sampled commands."""
+        super().reset_idx(env_ids)
+        if hasattr(self, "episode_command_x"):
+            self._store_episode_commands(env_ids)
+
+    def _store_episode_commands(self, env_ids):
+        """Store the original forward command before landing modifies it."""
+        self.episode_command_x[env_ids] = self.commands[env_ids, 0]
 
     def _fill_extras(self, env_ids):
         raw_reward_sums = {
@@ -1487,8 +1522,7 @@ class LeggedRobotBox(LeggedRobot):
             "exceed_dof_pos_limits",
             "exceed_torque_limits_l1norm",
         )
-        for result_name in ("success", "landing_overrun", "early_failure"):
-            result_mask = result_masks[result_name]
+        for result_name, result_mask in result_masks.items():
             result_count = result_mask.sum().clamp_min(1)
             for metric_name, reward_names in continuous_groups.items():
                 values = sum(
@@ -1662,7 +1696,7 @@ class LeggedRobotBox(LeggedRobot):
         )
 
     def _reward_forward_speed_tracking(self):
-        """Reward forward motion near the command without rewarding waiting."""
+        """Track course speed, but leave landing deceleration to its score."""
         speed_error = self.base_lin_vel[:, 0] - self.commands[:, 0]
         tracking = torch.exp(
             -torch.square(speed_error)
@@ -1674,12 +1708,10 @@ class LeggedRobotBox(LeggedRobot):
             min=0.0,
             max=1.0,
         )
-        command_gate = torch.where(
-            self.commands[:, 0].abs() > 1e-4,
-            forward_fraction,
-            torch.ones_like(forward_fraction),
+        course_phase = (
+            self.next_box_idx < self.box_progress.required_boxes
         )
-        return tracking * command_gate
+        return tracking * forward_fraction * course_phase.float()
 
     def _reward_tracking_ang_vel(self):
         """Zero-centered yaw tracking; a zero yaw error gives zero."""
@@ -1741,7 +1773,7 @@ class LeggedRobotBox(LeggedRobot):
         return self.landing_overrun_buf.float()
 
     def _reward_landing_timeout(self):
-        """Penalize spending two seconds in the landing phase unsuccessfully."""
+        """Penalize exhausting the configured landing-attempt window."""
         return self.landing_timeout_buf.float()
 
     def _reward_landing_quality_progress(self):
@@ -1913,7 +1945,7 @@ class LeggedRobotBox(LeggedRobot):
         normalized_excess = torch.relu(
             torch.abs(self.substep_torques) - soft_limit
         ) / soft_limit
-        return normalized_excess.mean(dim=(1, 2)).clamp(max=1.0)
+        return normalized_excess.mean(dim=(1, 2)).clamp(max=0.25)
 
     def _reward_lin_pos_y(self):
         """Penalize lateral displacement from the course centerline."""

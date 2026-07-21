@@ -245,11 +245,11 @@ class BoxProgressTrackerTest(unittest.TestCase):
         self.feet_positions[0, :, 2] = 0.0
         self.base_positions[0, 0] = 10.5
         self.contact_forces[0, [0, 2], 2] = 2.0
-        self.base_forward_velocity[0] = 0.26
+        self.base_forward_velocity[0] = 0.36
         self.update()
         self.assertEqual(self.tracker.landing_counter[0].item(), 0)
 
-        self.base_forward_velocity[0] = 0.25
+        self.base_forward_velocity[0] = 0.35
         self.update()
         self.assertEqual(self.tracker.landing_counter[0].item(), 1)
 

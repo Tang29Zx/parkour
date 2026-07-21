@@ -231,8 +231,12 @@ class OnPolicyRunner:
         if key.startswith("raw/"):
             for result_name in (
                 "success",
+                "fall_failure",
+                "missed_box_failure",
+                "out_of_track_failure",
                 "landing_overrun",
                 "landing_timeout",
+                "incomplete",
                 "late_failure",
                 "early_failure",
             ):
@@ -292,33 +296,63 @@ class OnPolicyRunner:
         overrun_count = self._scalar(
             summary.get("raw/landing_overrun_episode_count", 0.0)
         )
+        landing_timeout_count = self._scalar(
+            summary.get("raw/landing_timeout_episode_count", 0.0)
+        )
+        late_count = self._scalar(
+            summary.get("raw/late_failure_episode_count", 0.0)
+        )
         early_count = self._scalar(
             summary.get("raw/early_failure_episode_count", 0.0)
         )
         reward_order_valid = min(
-            success_count, overrun_count, early_count
+            success_count,
+            landing_timeout_count,
+            overrun_count,
+            late_count,
+            early_count,
         ) >= 32.0
         if reward_order_valid:
             success_return = self._scalar(
                 summary["raw/success_mean_return"]
             )
+            landing_timeout_return = self._scalar(
+                summary["raw/landing_timeout_mean_return"]
+            )
             overrun_return = self._scalar(
                 summary["raw/landing_overrun_mean_return"]
+            )
+            late_return = self._scalar(
+                summary["raw/late_failure_mean_return"]
             )
             early_return = self._scalar(
                 summary["raw/early_failure_mean_return"]
             )
-            margin = success_return - overrun_return
+            margin = success_return - landing_timeout_return
             summary["raw/success_minus_best_failure_return"] = torch.tensor(
                 margin, device=self.device
+            )
+            summary["raw/landing_timeout_minus_overrun_return"] = (
+                torch.tensor(
+                    landing_timeout_return - overrun_return,
+                    device=self.device,
+                )
+            )
+            summary["raw/landing_overrun_minus_late_failure_return"] = (
+                torch.tensor(overrun_return - late_return, device=self.device)
             )
             summary["raw/landing_overrun_minus_early_failure_return"] = (
                 torch.tensor(overrun_return - early_return, device=self.device)
             )
+            summary["raw/late_minus_early_failure_return"] = torch.tensor(
+                late_return - early_return, device=self.device
+            )
             summary["reward_order_ok"] = torch.tensor(
                 float(
-                    success_return > overrun_return + 15.0
-                    and overrun_return > early_return + 10.0
+                    success_return > landing_timeout_return
+                    and landing_timeout_return > overrun_return
+                    and overrun_return > late_return
+                    and late_return > early_return
                 ),
                 device=self.device,
             )

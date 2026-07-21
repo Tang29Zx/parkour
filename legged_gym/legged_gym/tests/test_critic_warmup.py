@@ -498,6 +498,10 @@ class CriticWarmupTest(unittest.TestCase):
                 "raw/fall_failure_episode_count": torch.tensor(0.0),
                 "raw/landing_overrun_mean_return": torch.tensor(-5.0),
                 "raw/landing_overrun_episode_count": torch.tensor(20.0),
+                "raw/landing_timeout_mean_return": torch.tensor(5.0),
+                "raw/landing_timeout_episode_count": torch.tensor(40.0),
+                "raw/late_failure_mean_return": torch.tensor(-15.0),
+                "raw/late_failure_episode_count": torch.tensor(40.0),
                 "raw/early_failure_mean_return": torch.tensor(-30.0),
                 "raw/early_failure_episode_count": torch.tensor(20.0),
                 "layout_1_success_rate": torch.tensor(1.0),
@@ -512,6 +516,10 @@ class CriticWarmupTest(unittest.TestCase):
                 "raw/fall_failure_episode_count": torch.tensor(40.0),
                 "raw/landing_overrun_mean_return": torch.tensor(-7.0),
                 "raw/landing_overrun_episode_count": torch.tensor(20.0),
+                "raw/landing_timeout_mean_return": torch.tensor(5.0),
+                "raw/landing_timeout_episode_count": torch.tensor(40.0),
+                "raw/late_failure_mean_return": torch.tensor(-15.0),
+                "raw/late_failure_episode_count": torch.tensor(40.0),
                 "raw/early_failure_mean_return": torch.tensor(-35.0),
                 "raw/early_failure_episode_count": torch.tensor(20.0),
                 "layout_1_success_rate": torch.tensor(1.0 / 3.0),
@@ -538,11 +546,11 @@ class CriticWarmupTest(unittest.TestCase):
         )
         self.assertAlmostEqual(
             summary["raw/success_minus_best_failure_return"].item(),
-            (40.0 * 10.0 + 20.0 * 6.0) / 60.0 + 6.0,
+            (40.0 * 10.0 + 20.0 * 6.0) / 60.0 - 5.0,
             places=5,
         )
         self.assertEqual(summary["reward_order_valid"].item(), 1.0)
-        self.assertEqual(summary["reward_order_ok"].item(), 0.0)
+        self.assertEqual(summary["reward_order_ok"].item(), 1.0)
 
     def test_runner_saves_unique_warmup_boundary_checkpoint(self):
         runner = OnPolicyRunner.__new__(OnPolicyRunner)

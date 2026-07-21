@@ -58,38 +58,35 @@ class Go2BoxParkourCfg(DebugGo2BoxCfg):
     class rewards(DebugGo2BoxCfg.rewards):
         class scales:
             tracking_ang_vel = 0.2
-            forward_speed_tracking = 0.5
+            forward_speed_tracking = 0.3
             course_progress = 1000.0
-            landing_quality_progress = 300.0
-            landing_hold_progress = 200.0
+            landing_quality_progress = 150.0
+            landing_hold_progress = 350.0
             # V17 prioritizes clean landing and four-leg motion over exact speed.
             speed_error_square = 0.0
-            overspeed = -0.5
-            action_rate = -0.01
-            flat_orientation = -0.3
-            flat_base_height = -0.5
-            dof_vel = -1e-4
+            overspeed = -0.2
+            action_rate = -0.005
+            flat_orientation = -0.2
+            flat_base_height = 0.0
+            dof_vel = -5e-5
             lin_pos_y = -0.1
             yaw_abs = -0.1
-            energy_substeps = -2e-7
-            torques = -1e-7
-            dof_error_named = -0.5
-            dof_error = -0.0025
+            dof_error_named = -0.2
+            dof_error = -0.001
             body_collision = -5.0
-            thigh_collision = -0.5
-            calf_collision = -0.5
-            rear_support_missing = -0.3
-            flat_airborne = -0.2
+            thigh_collision = -0.2
+            calf_collision = -0.2
+            rear_support_missing = -0.2
+            flat_airborne = -0.1
             rear_upper_joint_excursion = 0.0
-            exceed_dof_pos_limits = -0.1
-            exceed_torque_limits_l1norm = -1.5
+            exceed_torque_limits_l1norm = -1.0
             box_front_foot_contact = 5.0
             box_rear_foot_contact = 10.0
             box_passed = 25.0
-            success = 1000.0
+            success = 1250.0
             termination = -2000.0
-            landing_overrun = -1500.0
-            landing_timeout = -1250.0
+            landing_overrun = -1000.0
+            landing_timeout = -750.0
             incomplete = -2000.0
 
         only_positive_rewards = False
@@ -146,8 +143,9 @@ class Go2BoxParkourCfg(DebugGo2BoxCfg):
         landing_pitch_threshold = 0.45
         landing_base_height_threshold = 0.22
         landing_vertical_speed_threshold = 0.5
-        landing_forward_speed_threshold = 0.25
-        landing_deadline_steps = 100
+        landing_forward_speed_threshold = 0.35
+        landing_deadline_steps = 150
+        landing_command_ramp_steps = 20
         body_contact_window_steps = 25
         body_contact_failure_steps = 8
         severe_body_impact_force = 80.0
@@ -238,7 +236,7 @@ class Go2BoxParkourCfgPPO(Go2RoughCfgPPO):
         # Select Critic reset explicitly on the first CLI launch. Later V17
         # resumes must not reset the learned Critic again.
         ckpt_manipulator = None
-        max_iterations = 300
+        max_iterations = 200
         save_interval = 50
         log_interval = 10
 
