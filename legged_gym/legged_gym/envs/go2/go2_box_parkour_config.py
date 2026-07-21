@@ -91,6 +91,9 @@ class Go2BoxParkourCfg(DebugGo2BoxCfg):
             rear_upper_joint_excursion = 0.0
             exceed_torque_limits_l1norm = -1.0
             box_front_foot_contact = 5.0
+            # Disabled on the five-box task. The dedicated one-box stage uses
+            # a non-repeatable approach-window lift signal.
+            front_foot_lift_progress = 0.0
             box_rear_foot_contact = 10.0
             box_passed = 25.0
             success = 1250.0
@@ -138,6 +141,9 @@ class Go2BoxParkourCfg(DebugGo2BoxCfg):
         body_collision_force_threshold = 1.0
         dof_near_limit_fraction = 0.15
         action_saturation_threshold = 0.95
+        front_foot_lift_approach_distance = 0.5
+        front_foot_lift_clearance = 0.03
+        front_foot_lift_lateral_margin = 0.2
 
     class box_progress:
         required_boxes = 5
@@ -279,8 +285,8 @@ class Go2BoxParkour1BoxCfg(Go2BoxParkourCfg):
                     gap=1.2,
                     length=1.2,
                     width=1.2,
-                    height=0.20,
-                    height_choices=(0.15, 0.20, 0.25, 0.30),
+                    height=0.15,
+                    height_choices=(0.15,),
                     lateral_offset=0.0,
                 ),
             ],
@@ -308,6 +314,9 @@ class Go2BoxParkour1BoxCfg(Go2BoxParkourCfg):
             thigh_collision = -0.5
             calf_collision = -0.5
             rear_support_missing = -0.5
+            # A normalized high-water reward: at dt=0.02 its maximum episode
+            # contribution is +1.0, and it cannot be farmed by repeated lifts.
+            front_foot_lift_progress = 50.0
             box_front_foot_contact = 5.0
             box_rear_foot_contact = 10.0
             box_passed = 25.0
@@ -337,24 +346,26 @@ class Go2BoxParkour1BoxCfgPPO(Go2BoxParkourCfgPPO):
         actor_finetune_learning_rate = 2e-5
         actor_finetune_clip_param = 0.1
         actor_finetune_entropy_coef = 0.001
-        reference_kl_min_coef = 0.01
-        reference_kl_max_coef = 0.20
-        reference_kl_start_coef = 0.05
+        # The rough reference policy does not lift for a vertical box. Keep
+        # only a light gait anchor while the first traversal is discovered.
+        reference_kl_min_coef = 0.0
+        reference_kl_max_coef = 0.02
+        reference_kl_start_coef = 0.02
         reference_kl_stable_decrease = 0.01
         reference_kl_regression_increase = 0.05
-        reference_kl_regression_floor = 0.10
+        reference_kl_regression_floor = 0.02
 
     class runner(Go2BoxParkourCfgPPO.runner):
-        run_name = "one_box_clean_gait_from_rough2000"
+        run_name = "one_box_front_lift_from2100"
         init_at_random_ep_len = False
         resume = True
         load_run = osp.join(
             osp.dirname(osp.dirname(osp.dirname(osp.dirname(__file__)))),
             "logs",
-            "rough_go2",
-            "Jul19_13-30-09_hold_from_2000_to_10000",
+            "go2_box_parkour",
+            "Jul21_15-00-03_one_box_clean_gait_from_rough2000",
         )
-        checkpoint = 2000
+        checkpoint = 2100
         ckpt_manipulator = None
         max_iterations = 1000
         save_interval = 100

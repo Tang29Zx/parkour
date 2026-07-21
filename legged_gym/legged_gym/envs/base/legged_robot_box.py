@@ -302,6 +302,15 @@ class LeggedRobotBox(LeggedRobot):
         self.course_progress_delta_buf = torch.zeros_like(
             self.forward_speed_sum
         )
+        self.front_foot_lift_best = torch.zeros_like(
+            self.forward_speed_sum
+        )
+        self.front_foot_lift_delta = torch.zeros_like(
+            self.forward_speed_sum
+        )
+        self.front_foot_lift_target_idx = torch.full(
+            (self.num_envs,), -1, dtype=torch.long, device=self.device
+        )
         self.progress_reward_initialized = torch.zeros(
             self.num_envs, dtype=torch.bool, device=self.device
         )
@@ -462,6 +471,86 @@ class LeggedRobotBox(LeggedRobot):
         ).clamp_min(0.0)
         self.course_progress_delta_buf[uninitialized] = 0.0
         self.rewarded_progress_ratio[:] = new_high_water_mark
+
+    def _update_front_foot_lift_progress(
+        self, feet_positions, feet_contact_forces
+    ):
+        """Reward a new front-foot clearance high-water mark near the box."""
+        self.front_foot_lift_delta.zero_()
+        scale = float(
+            getattr(
+                self.cfg.rewards.scales,
+                "front_foot_lift_progress",
+                0.0,
+            )
+        )
+        if scale == 0.0:
+            return
+
+        cfg = self.cfg.rewards
+        approach_distance = float(cfg.front_foot_lift_approach_distance)
+        clearance = float(cfg.front_foot_lift_clearance)
+        lateral_margin = float(cfg.front_foot_lift_lateral_margin)
+        if approach_distance <= 0.0 or clearance < 0.0:
+            raise ValueError(
+                "Front-foot lift distances must be positive/non-negative."
+            )
+        if lateral_margin < 0.0:
+            raise ValueError(
+                "front_foot_lift_lateral_margin must be non-negative."
+            )
+
+        active = self.next_box_idx < self.box_progress.required_boxes
+        target_indices = self.next_box_idx.clamp(
+            max=self.box_progress.required_boxes - 1
+        )
+        target_changed = (
+            self.front_foot_lift_target_idx != target_indices
+        )
+        self.front_foot_lift_best[target_changed] = 0.0
+        self.front_foot_lift_target_idx[:] = target_indices
+
+        env_ids = torch.arange(self.num_envs, device=self.device)
+        target_bounds = self.env_box_bounds[env_ids, target_indices]
+        base_x = self.root_states[:, 0]
+        base_y = self.root_states[:, 1]
+        in_approach_window = (
+            (base_x >= target_bounds[:, 0] - approach_distance)
+            & (base_x <= target_bounds[:, 0])
+            & (base_y >= target_bounds[:, 2] - lateral_margin)
+            & (base_y <= target_bounds[:, 3] + lateral_margin)
+        )
+        needs_front_contact = (
+            self.front_contact_counter
+            < self.box_progress.front_contact_required_steps
+        )
+
+        front_positions = feet_positions[:, self.front_foot_local_indices]
+        front_forces = feet_contact_forces[
+            :, self.front_foot_local_indices
+        ]
+        swing_feet = (
+            torch.linalg.vector_norm(front_forces, dim=-1)
+            <= self.cfg.box_progress.contact_force_threshold
+        )
+        ground_height = self.env_origins[:, 2].unsqueeze(1)
+        target_height = target_bounds[:, 4].unsqueeze(1) + clearance
+        height_range = (target_height - ground_height).clamp_min(1e-6)
+        lift_progress = (
+            (front_positions[:, :, 2] - ground_height) / height_range
+        ).clamp(0.0, 1.0)
+        lift_progress = torch.where(
+            swing_feet, lift_progress, torch.zeros_like(lift_progress)
+        ).max(dim=1).values
+        valid = active & in_approach_window & needs_front_contact
+        lift_progress = torch.where(
+            valid, lift_progress, torch.zeros_like(lift_progress)
+        )
+        new_best = torch.maximum(self.front_foot_lift_best, lift_progress)
+        self.front_foot_lift_delta[:] = (
+            new_best - self.front_foot_lift_best
+        ).clamp_min(0.0)
+        self.front_foot_lift_best[:] = new_best
 
     def _refresh_box_course_data(self):
         track_indices = torch.stack(
@@ -1412,6 +1501,10 @@ class LeggedRobotBox(LeggedRobot):
             > self.cfg.box_progress.contact_force_threshold
         )
 
+        self._update_front_foot_lift_progress(
+            feet_positions, feet_contact_forces
+        )
+
         self.box_progress.update(
             box_bounds=self.env_box_bounds,
             env_origins=self.env_origins,
@@ -1612,6 +1705,12 @@ class LeggedRobotBox(LeggedRobot):
         episode["rewarded_progress_ratio"] = self.rewarded_progress_ratio[
             env_ids
         ].mean()
+        episode["front_foot_lift_progress_mean"] = (
+            self.front_foot_lift_best[env_ids].mean()
+        )
+        episode["front_foot_lift_target_rate"] = (
+            self.front_foot_lift_best[env_ids] >= 1.0 - 1e-6
+        ).float().mean()
         episode.update(self._get_speed_statistics(env_ids))
         episode.update(self._get_motion_quality_statistics(env_ids))
         episode.update(self._get_flat_gait_statistics(env_ids))
@@ -1770,6 +1869,10 @@ class LeggedRobotBox(LeggedRobot):
             self.rewarded_progress_ratio[env_ids] = 0.0
             self.course_progress_delta_buf[env_ids] = 0.0
             self.progress_reward_initialized[env_ids] = False
+        if hasattr(self, "front_foot_lift_best"):
+            self.front_foot_lift_best[env_ids] = 0.0
+            self.front_foot_lift_delta[env_ids] = 0.0
+            self.front_foot_lift_target_idx[env_ids] = -1
         if hasattr(self, "landing_entry_horizontal_speed"):
             self.landing_entry_horizontal_speed[env_ids] = 0.0
             self.landing_deceleration_best[env_ids] = 0.0
@@ -2164,6 +2267,10 @@ class LeggedRobotBox(LeggedRobot):
     def _reward_box_front_foot_contact(self):
         """Emit once after enough front-foot contact steps on the box top."""
         return self.front_foot_contact_buf.float()
+
+    def _reward_front_foot_lift_progress(self):
+        """Emit non-repeatable front-foot clearance progress near the box."""
+        return self.front_foot_lift_delta
 
     def _reward_box_rear_foot_contact(self):
         """Emit once after enough rear-foot contact steps on the box top."""

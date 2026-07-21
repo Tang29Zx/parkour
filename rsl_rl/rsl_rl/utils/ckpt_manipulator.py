@@ -193,6 +193,62 @@ def initialize_one_box_from_rough2000(
     )
 
 
+def initialize_one_box_lift_from_warmup2100(
+    source_state_dict, algo_state_dict
+):
+    """Keep the one-box warmup model while applying the light lift-stage KL."""
+    if int(source_state_dict.get("iter", -1)) != 2100:
+        raise ValueError(
+            "One-box lift initialization requires model_2100.pt from the "
+            "completed Critic warmup."
+        )
+    source_algorithm = source_state_dict.get("algorithm_state_dict", {})
+    if source_algorithm.get("critic_warmup_until_iteration") != 2100:
+        raise ValueError(
+            "The source checkpoint is not the completed one-box warmup."
+        )
+    if source_algorithm.get("actor_finetune_active", False):
+        raise ValueError(
+            "The source checkpoint already contains Actor fine-tuning."
+        )
+    if source_state_dict.get("reference_model_state_dict") is None:
+        raise ValueError("The one-box warmup has no frozen reference Actor.")
+
+    source_model = source_state_dict["model_state_dict"]
+    target_model = algo_state_dict["model_state_dict"]
+    if source_model.keys() != target_model.keys():
+        raise KeyError("One-box warmup and lift model keys do not match.")
+    for name, source_value in source_model.items():
+        if source_value.shape != target_model[name].shape:
+            raise ValueError(
+                f"Parameter {name!r} has incompatible shapes: "
+                f"{tuple(source_value.shape)} versus "
+                f"{tuple(target_model[name].shape)}."
+            )
+
+    target_algorithm = algo_state_dict["algorithm_state_dict"]
+    migrated = copy.deepcopy(source_state_dict)
+    migrated_algorithm = migrated["algorithm_state_dict"]
+    for name in (
+        "reference_kl_min_coef",
+        "reference_kl_max_coef",
+        "current_reference_kl_coef",
+    ):
+        migrated_algorithm[name] = copy.deepcopy(target_algorithm[name])
+    migrated_algorithm["reference_kl_stable_window_count"] = 0
+    migrated_algorithm["curriculum_stable_windows"] = 0
+    migrated_algorithm["curriculum_regression_windows"] = 0
+    migrated_algorithm["collapse_windows"] = 0
+    migrated_algorithm["collapse_warning"] = False
+    migrated_algorithm["quality_stage_start_iteration"] = 2100
+    print(
+        "\033[1;36m Preserved the one-box warmup Actor, Critic, reference "
+        "Actor, and optimizer; capped lift-stage reference KL at "
+        f"{migrated_algorithm['reference_kl_max_coef']}. \033[0m"
+    )
+    return migrated
+
+
 def initialize_v11_from_v10_warmup(source_state_dict, algo_state_dict):
     """Initialize v11 curriculum state from the verified v10 warmup boundary."""
     if int(source_state_dict.get("iter", -1)) != 11800:

@@ -143,13 +143,61 @@ class HeightEncoderMigrationTest(unittest.TestCase):
                 source,
                 dict(model_state_dict=target_model),
             )
-
         del target_model["actor.weight"]
         with self.assertRaises(KeyError):
             self.module.reset_optimizer_state(
                 source,
                 dict(model_state_dict=target_model),
             )
+
+    def test_one_box_lift_initializer_preserves_warmup_and_caps_kl(self):
+        model = OrderedDict(actor=torch.tensor([1.0]))
+        source = {
+            "model_state_dict": model,
+            "optimizer_state_dict": {"warmup": True},
+            "reference_model_state_dict": OrderedDict(
+                actor=torch.tensor([1.0])
+            ),
+            "algorithm_state_dict": {
+                "critic_warmup_until_iteration": 2100,
+                "actor_finetune_active": False,
+                "reference_kl_min_coef": 0.01,
+                "reference_kl_max_coef": 0.20,
+                "current_reference_kl_coef": 0.05,
+                "reference_kl_stable_window_count": 3,
+                "curriculum_stable_windows": 2,
+                "curriculum_regression_windows": 2,
+                "collapse_windows": 1,
+                "collapse_warning": True,
+                "quality_stage_start_iteration": 2000,
+            },
+            "iter": 2100,
+        }
+        target = {
+            "model_state_dict": OrderedDict(actor=torch.tensor([9.0])),
+            "algorithm_state_dict": {
+                "reference_kl_min_coef": 0.0,
+                "reference_kl_max_coef": 0.02,
+                "current_reference_kl_coef": 0.02,
+            },
+        }
+
+        migrated = self.module.initialize_one_box_lift_from_warmup2100(
+            source, target
+        )
+
+        torch.testing.assert_close(
+            migrated["model_state_dict"]["actor"], torch.tensor([1.0])
+        )
+        self.assertEqual(
+            migrated["optimizer_state_dict"], {"warmup": True}
+        )
+        state = migrated["algorithm_state_dict"]
+        self.assertEqual(state["reference_kl_min_coef"], 0.0)
+        self.assertEqual(state["reference_kl_max_coef"], 0.02)
+        self.assertEqual(state["current_reference_kl_coef"], 0.02)
+        self.assertEqual(state["collapse_windows"], 0)
+        self.assertFalse(state["collapse_warning"])
 
     def test_reset_critic_keeps_actor_side_and_discards_training_state(self):
         names = (
@@ -1367,6 +1415,67 @@ class BoxRewardTest(unittest.TestCase):
         )
         self.assertAlmostEqual(actual_total, 20.0)
 
+    def test_front_foot_lift_progress_is_local_and_non_repeatable(self):
+        env = SimpleNamespace(
+            num_envs=1,
+            device="cpu",
+            cfg=SimpleNamespace(
+                rewards=SimpleNamespace(
+                    scales=SimpleNamespace(front_foot_lift_progress=50.0),
+                    front_foot_lift_approach_distance=0.5,
+                    front_foot_lift_clearance=0.03,
+                    front_foot_lift_lateral_margin=0.2,
+                ),
+                box_progress=SimpleNamespace(contact_force_threshold=1.0),
+            ),
+            box_progress=SimpleNamespace(
+                required_boxes=1,
+                front_contact_required_steps=2,
+            ),
+            next_box_idx=torch.zeros(1, dtype=torch.long),
+            front_contact_counter=torch.zeros(1, dtype=torch.long),
+            front_foot_local_indices=torch.tensor([0, 1]),
+            env_box_bounds=torch.tensor(
+                [[[1.2, 2.4, -0.6, 0.6, 0.15]]]
+            ),
+            env_origins=torch.zeros(1, 3),
+            root_states=torch.zeros(1, 13),
+            front_foot_lift_best=torch.zeros(1),
+            front_foot_lift_delta=torch.zeros(1),
+            front_foot_lift_target_idx=torch.full(
+                (1,), -1, dtype=torch.long
+            ),
+        )
+        env.root_states[:, 0] = 0.8
+        feet_positions = torch.zeros(1, 4, 3)
+        feet_positions[:, :2, 2] = 0.09
+        feet_forces = torch.zeros(1, 4, 3)
+        update = self.LeggedRobotBox._update_front_foot_lift_progress
+
+        update(env, feet_positions, feet_forces)
+        self.assertAlmostEqual(env.front_foot_lift_delta.item(), 0.5)
+        update(env, feet_positions, feet_forces)
+        self.assertEqual(env.front_foot_lift_delta.item(), 0.0)
+
+        feet_positions[:, 0, 2] = 0.18
+        update(env, feet_positions, feet_forces)
+        self.assertAlmostEqual(env.front_foot_lift_delta.item(), 0.5)
+        self.assertAlmostEqual(
+            env.front_foot_lift_best.item()
+            * self.one_box_cfg.rewards.scales.front_foot_lift_progress
+            * 0.02,
+            1.0,
+        )
+
+        env.front_foot_lift_best.zero_()
+        env.root_states[:, 0] = 0.6
+        update(env, feet_positions, feet_forces)
+        self.assertEqual(env.front_foot_lift_delta.item(), 0.0)
+        env.root_states[:, 0] = 0.8
+        feet_forces[:, :2, 2] = 2.0
+        update(env, feet_positions, feet_forces)
+        self.assertEqual(env.front_foot_lift_delta.item(), 0.0)
+
     def test_forward_speed_tracking_peaks_only_at_the_command(self):
         env = self.make_speed_reward_env()
         env.base_lin_vel[:, 0] = torch.tensor(
@@ -1824,7 +1933,7 @@ class BoxRewardTest(unittest.TestCase):
         self.assertEqual(len(terrain["boxes"]), 1)
         self.assertEqual(
             terrain["boxes"][0]["height_choices"],
-            (0.15, 0.20, 0.25, 0.30),
+            (0.15,),
         )
         self.assertEqual(env_cfg.box_progress.min_landing_zone_length, 2.0)
         self.assertEqual(
@@ -1844,6 +1953,9 @@ class BoxRewardTest(unittest.TestCase):
         self.assertEqual(scales.course_progress, 1000.0)
         self.assertEqual(scales.speed_error_square, 0.0)
         self.assertEqual(scales.overspeed, 0.0)
+        self.assertAlmostEqual(
+            scales.front_foot_lift_progress * 0.02, 1.0
+        )
         for name in (
             "landing_quality_progress",
             "landing_hold_progress",
@@ -1869,22 +1981,22 @@ class BoxRewardTest(unittest.TestCase):
         runner = train_cfg.runner
         algorithm = train_cfg.algorithm
         self.assertTrue(runner.resume)
-        self.assertEqual(runner.checkpoint, 2000)
+        self.assertEqual(runner.checkpoint, 2100)
         self.assertTrue(
             runner.load_run.endswith(
-                "Jul19_13-30-09_hold_from_2000_to_10000"
+                "Jul21_15-00-03_one_box_clean_gait_from_rough2000"
             )
         )
-        self.assertEqual(runner.run_name, "one_box_clean_gait_from_rough2000")
+        self.assertEqual(runner.run_name, "one_box_front_lift_from2100")
         self.assertIsNone(runner.ckpt_manipulator)
         self.assertEqual(runner.max_iterations, 1000)
         self.assertEqual(runner.save_interval, 100)
         self.assertEqual(runner.log_interval, 10)
         self.assertEqual(algorithm.freeze_actor_encoder_iterations, 100)
         self.assertEqual(algorithm.actor_finetune_learning_rate, 2e-5)
-        self.assertEqual(algorithm.reference_kl_min_coef, 0.01)
-        self.assertEqual(algorithm.reference_kl_start_coef, 0.05)
-        self.assertEqual(algorithm.reference_kl_max_coef, 0.20)
+        self.assertEqual(algorithm.reference_kl_min_coef, 0.0)
+        self.assertEqual(algorithm.reference_kl_start_coef, 0.02)
+        self.assertEqual(algorithm.reference_kl_max_coef, 0.02)
 
     def test_three_and_five_box_tasks_keep_the_five_box_geometry(self):
         stages = (
