@@ -130,6 +130,29 @@ class CriticWarmupTest(unittest.TestCase):
         self.assertEqual(stats["actor_update_enabled"].item(), 0.0)
         self.assertEqual(stats["critic_warmup_remaining"].item(), 100.0)
 
+    def test_actor_encoder_stays_frozen_for_first_two_hundred_iterations(self):
+        ppo = LossControlledPPO(
+            DummyActorCritic(),
+            num_learning_epochs=1,
+            num_mini_batches=1,
+            learning_rate=1e-2,
+            optimizer_class_name="AdamW",
+            critic_warmup_iterations=100,
+            freeze_actor_encoder_iterations=200,
+        )
+        ppo.storage = OneBatchStorage()
+        ppo.start_critic_warmup(11300)
+        encoder = ppo.actor_critic.encoders[0].weight
+        initial = encoder.detach().clone()
+
+        ppo.update(11400)
+        self.assertTrue(torch.equal(initial, encoder.detach()))
+        self.assertFalse(encoder.requires_grad)
+
+        ppo.update(11500)
+        self.assertTrue(encoder.requires_grad)
+        self.assertFalse(torch.equal(initial, encoder.detach()))
+
     def test_actor_updates_at_the_exact_warmup_boundary(self):
         ppo = self.make_ppo()
         ppo.start_critic_warmup(11700)
@@ -147,6 +170,23 @@ class CriticWarmupTest(unittest.TestCase):
         )
         self.assertEqual(stats["actor_update_enabled"].item(), 1.0)
         self.assertEqual(stats["critic_warmup_remaining"].item(), 0.0)
+
+    def test_reward_order_warning_requires_two_valid_bad_windows(self):
+        ppo = LossControlledPPO(
+            DummyActorCritic(), quality_min_episodes=1
+        )
+        window = dict(
+            success_rate=0.9,
+            box_pass_rate=0.95,
+            fall_rate=0.05,
+            episode_count=256,
+            reward_order_valid=True,
+            reward_order_ok=False,
+        )
+        ppo.update_quality_curriculum(**window)
+        self.assertFalse(ppo.reward_order_warning)
+        ppo.update_quality_curriculum(**window)
+        self.assertTrue(ppo.reward_order_warning)
 
     def test_checkpoint_restores_warmup_without_restarting_it(self):
         source = self.make_ppo()
@@ -456,6 +496,10 @@ class CriticWarmupTest(unittest.TestCase):
                 "raw/success_episode_count": torch.tensor(40.0),
                 "raw/fall_failure_mean_return": torch.tensor(0.0),
                 "raw/fall_failure_episode_count": torch.tensor(0.0),
+                "raw/landing_overrun_mean_return": torch.tensor(-5.0),
+                "raw/landing_overrun_episode_count": torch.tensor(20.0),
+                "raw/early_failure_mean_return": torch.tensor(-30.0),
+                "raw/early_failure_episode_count": torch.tensor(20.0),
                 "layout_1_success_rate": torch.tensor(1.0),
                 "layout_1_episode_count": torch.tensor(40.0),
             },
@@ -466,6 +510,10 @@ class CriticWarmupTest(unittest.TestCase):
                 "raw/success_episode_count": torch.tensor(20.0),
                 "raw/fall_failure_mean_return": torch.tensor(-30.0),
                 "raw/fall_failure_episode_count": torch.tensor(40.0),
+                "raw/landing_overrun_mean_return": torch.tensor(-7.0),
+                "raw/landing_overrun_episode_count": torch.tensor(20.0),
+                "raw/early_failure_mean_return": torch.tensor(-35.0),
+                "raw/early_failure_episode_count": torch.tensor(20.0),
                 "layout_1_success_rate": torch.tensor(1.0 / 3.0),
                 "layout_1_episode_count": torch.tensor(60.0),
             },
@@ -490,9 +538,11 @@ class CriticWarmupTest(unittest.TestCase):
         )
         self.assertAlmostEqual(
             summary["raw/success_minus_best_failure_return"].item(),
-            (40.0 * 10.0 + 20.0 * 6.0) / 60.0 + 30.0,
+            (40.0 * 10.0 + 20.0 * 6.0) / 60.0 + 6.0,
             places=5,
         )
+        self.assertEqual(summary["reward_order_valid"].item(), 1.0)
+        self.assertEqual(summary["reward_order_ok"].item(), 0.0)
 
     def test_runner_saves_unique_warmup_boundary_checkpoint(self):
         runner = OnPolicyRunner.__new__(OnPolicyRunner)

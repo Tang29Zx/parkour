@@ -228,6 +228,16 @@ class OnPolicyRunner:
         if key.startswith("raw/") and key.endswith("_mean_return"):
             result_name = key[len("raw/") : -len("_mean_return")]
             return f"raw/{result_name}_episode_count"
+        if key.startswith("raw/"):
+            for result_name in (
+                "success",
+                "landing_overrun",
+                "landing_timeout",
+                "late_failure",
+                "early_failure",
+            ):
+                if key.startswith(f"raw/{result_name}_"):
+                    return f"raw/{result_name}_episode_count"
         if key.startswith("layout_") and key.endswith("_success_rate"):
             return key[: -len("_success_rate")] + "_episode_count"
         return "num_terminated"
@@ -279,34 +289,60 @@ class OnPolicyRunner:
         success_count = self._scalar(
             summary.get("raw/success_episode_count", 0.0)
         )
-        eligible_failures = []
-        for result_name in (
-            "fall_failure",
-            "missed_box_failure",
-            "out_of_track_failure",
-            "incomplete",
-            "early_failure",
-        ):
-            count = self._scalar(
-                summary.get(f"raw/{result_name}_episode_count", 0.0)
-            )
-            if count < 32.0:
-                continue
-            eligible_failures.append(
-                self._scalar(
-                    summary[f"raw/{result_name}_mean_return"]
-                )
-            )
-        reward_order_valid = success_count >= 32.0 and bool(eligible_failures)
+        overrun_count = self._scalar(
+            summary.get("raw/landing_overrun_episode_count", 0.0)
+        )
+        early_count = self._scalar(
+            summary.get("raw/early_failure_episode_count", 0.0)
+        )
+        reward_order_valid = min(
+            success_count, overrun_count, early_count
+        ) >= 32.0
         if reward_order_valid:
-            margin = self._scalar(
+            success_return = self._scalar(
                 summary["raw/success_mean_return"]
-            ) - max(eligible_failures)
+            )
+            overrun_return = self._scalar(
+                summary["raw/landing_overrun_mean_return"]
+            )
+            early_return = self._scalar(
+                summary["raw/early_failure_mean_return"]
+            )
+            margin = success_return - overrun_return
             summary["raw/success_minus_best_failure_return"] = torch.tensor(
                 margin, device=self.device
             )
+            summary["raw/landing_overrun_minus_early_failure_return"] = (
+                torch.tensor(overrun_return - early_return, device=self.device)
+            )
+            summary["reward_order_ok"] = torch.tensor(
+                float(
+                    success_return > overrun_return + 15.0
+                    and overrun_return > early_return + 10.0
+                ),
+                device=self.device,
+            )
+        else:
+            summary["reward_order_ok"] = torch.tensor(1.0, device=self.device)
         summary["reward_order_valid"] = torch.tensor(
             float(reward_order_valid), device=self.device
+        )
+        continuous_warning = False
+        for key, value in summary.items():
+            if not key.startswith("raw/"):
+                continue
+            scalar = self._scalar(value)
+            if (
+                key.endswith("_continuous_penalty_total")
+                and scalar < -10.0
+            ) or (
+                key.endswith("_penalty")
+                and not key.endswith("_continuous_penalty_total")
+                and scalar < -3.0
+            ):
+                continuous_warning = True
+        summary["continuous_penalty_warning"] = torch.tensor(
+            float(continuous_warning), device=self.device
         )
         return summary
 
@@ -330,11 +366,6 @@ class OnPolicyRunner:
         reward_order_valid = bool(
             self._scalar(episode_summary.get("reward_order_valid", 0.0))
         )
-        reward_margin = self._scalar(
-            episode_summary.get(
-                "raw/success_minus_best_failure_return", 0.0
-            )
-        )
         return dict(
             episode_count=episode_count,
             success_rate=self._scalar(episode_summary["success_rate"]),
@@ -357,7 +388,10 @@ class OnPolicyRunner:
             dof_near_limit_ratio=self._scalar(
                 episode_summary["dof_near_limit_ratio"]
             ),
-            reward_order_ok=(not reward_order_valid or reward_margin > 0.0),
+            reward_order_valid=reward_order_valid,
+            reward_order_ok=bool(
+                self._scalar(episode_summary.get("reward_order_ok", 1.0))
+            ),
         )
 
     def _update_quality_curriculum(self, episode_summary, stats):
@@ -481,7 +515,7 @@ class OnPolicyRunner:
         cur_episode_length = torch.zeros(self.env.num_envs, dtype=torch.float, device=self.device)
 
         print("Initialization done, start learning.")
-        print("NOTE: you may see a bunch of `NaN or Inf found in input tensor` once and appears in the log. Just ignore it if it does not affect the performance.")
+        print("Non-finite rewards or PPO losses stop this run immediately.")
         start_iter = self.current_learning_iteration
         tot_iter = self.current_learning_iteration + num_learning_iterations
         tot_start_time = time.time()
@@ -523,6 +557,20 @@ class OnPolicyRunner:
                 self._update_quality_curriculum(episode_summary, stats)
                 self.log(locals())
                 ep_infos.clear()
+                if self.alg.reward_order_warning:
+                    self.save(
+                        os.path.join(
+                            self.log_dir,
+                            "model_{}_reward_order_stop.pt".format(
+                                self.current_learning_iteration
+                            ),
+                        )
+                    )
+                    raise RuntimeError(
+                        "Reward ordering failed for two consecutive valid "
+                        "log windows; training stopped before further PPO "
+                        "updates."
+                    )
             is_warmup_boundary = (
                 self.alg.critic_warmup_until_iteration is not None
                 and self.current_learning_iteration

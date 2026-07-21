@@ -29,6 +29,8 @@ class BoxProgressTracker:
         landing_pitch_threshold=0.45,
         landing_base_height_threshold=0.22,
         landing_vertical_speed_threshold=0.5,
+        landing_forward_speed_threshold=0.25,
+        landing_deadline_steps=100,
         body_contact_window_steps=25,
         body_contact_failure_steps=8,
         severe_body_impact_force=80.0,
@@ -99,6 +101,16 @@ class BoxProgressTracker:
         self.landing_vertical_speed_threshold = float(
             landing_vertical_speed_threshold
         )
+        self.landing_forward_speed_threshold = float(
+            landing_forward_speed_threshold
+        )
+        self.landing_deadline_steps = int(landing_deadline_steps)
+        if self.landing_forward_speed_threshold <= 0.0:
+            raise ValueError(
+                "landing_forward_speed_threshold must be positive."
+            )
+        if self.landing_deadline_steps <= 0:
+            raise ValueError("landing_deadline_steps must be positive.")
         self.body_contact_window_steps = int(body_contact_window_steps)
         self.body_contact_failure_steps = int(body_contact_failure_steps)
         self.severe_body_impact_force = float(severe_body_impact_force)
@@ -116,6 +128,12 @@ class BoxProgressTracker:
         )
         self.front_contact_counter = torch.zeros_like(self.next_box_idx)
         self.rear_contact_counter = torch.zeros_like(self.next_box_idx)
+        self.rear_contacted_boxes = torch.zeros(
+            self.num_envs,
+            self.num_boxes,
+            dtype=torch.bool,
+            device=device,
+        )
         self.body_contact_history = torch.zeros(
             self.num_envs,
             self.body_contact_window_steps,
@@ -127,7 +145,26 @@ class BoxProgressTracker:
         self.max_body_contact_window_count = torch.zeros_like(
             self.next_box_idx
         )
+        self.body_contact_step_count = torch.zeros_like(self.next_box_idx)
         self.landing_counter = torch.zeros_like(self.next_box_idx)
+        self.best_landing_hold_steps = torch.zeros_like(self.next_box_idx)
+        self.landing_phase_start_step = torch.full_like(
+            self.next_box_idx, -1
+        )
+        self.steps_in_landing_phase = torch.zeros_like(self.next_box_idx)
+        self.best_landing_score = torch.zeros(
+            self.num_envs, dtype=torch.float, device=device
+        )
+        self.landing_score = torch.zeros_like(self.best_landing_score)
+        self.landing_quality_delta = torch.zeros_like(
+            self.best_landing_score
+        )
+        self.landing_hold_delta = torch.zeros_like(self.best_landing_score)
+        self.landing_score_sum = torch.zeros_like(self.best_landing_score)
+        self.landing_phase_step_count = torch.zeros_like(self.next_box_idx)
+        self.max_consecutive_valid_landing_steps = torch.zeros_like(
+            self.next_box_idx
+        )
 
         self.box_passed_buf = torch.zeros(
             self.num_envs, dtype=torch.bool, device=device
@@ -142,12 +179,33 @@ class BoxProgressTracker:
         self.missed_box_buf = torch.zeros_like(self.box_passed_buf)
         self.out_of_track_buf = torch.zeros_like(self.box_passed_buf)
         self.landing_overrun_buf = torch.zeros_like(self.box_passed_buf)
+        self.landing_timeout_buf = torch.zeros_like(self.box_passed_buf)
+        self.landing_phase_entry_buf = torch.zeros_like(self.box_passed_buf)
+        self.lateral_out_of_track_buf = torch.zeros_like(self.box_passed_buf)
+        self.backward_out_of_track_buf = torch.zeros_like(self.box_passed_buf)
+        self.generic_failure_buf = torch.zeros_like(self.box_passed_buf)
         self.fall_buf = torch.zeros_like(self.box_passed_buf)
         self.incomplete_buf = torch.zeros_like(self.box_passed_buf)
         self.episode_timeout_buf = torch.zeros_like(self.box_passed_buf)
         self.task_progress_buf = torch.zeros(
             self.num_envs, dtype=torch.float, device=device
         )
+        for name in (
+            "landing_zone",
+            "landing_forward_speed",
+            "landing_vertical_speed",
+            "landing_roll",
+            "landing_pitch",
+            "landing_height",
+            "landing_two_feet",
+            "landing_rear_support",
+            "landing_no_body_contact",
+        ):
+            setattr(
+                self,
+                f"{name}_pass_count",
+                torch.zeros_like(self.next_box_idx),
+            )
 
     def reset(self, env_ids):
         """Clear all episode state for selected environments."""
@@ -156,10 +214,34 @@ class BoxProgressTracker:
         self.foot_contact_mask[env_ids] = False
         self.front_contact_counter[env_ids] = 0
         self.rear_contact_counter[env_ids] = 0
+        self.rear_contacted_boxes[env_ids] = False
         self.body_contact_history[env_ids] = False
         self.body_contact_window_count[env_ids] = 0
         self.max_body_contact_window_count[env_ids] = 0
+        self.body_contact_step_count[env_ids] = 0
         self.landing_counter[env_ids] = 0
+        self.best_landing_hold_steps[env_ids] = 0
+        self.landing_phase_start_step[env_ids] = -1
+        self.steps_in_landing_phase[env_ids] = 0
+        self.best_landing_score[env_ids] = 0.0
+        self.landing_score[env_ids] = 0.0
+        self.landing_quality_delta[env_ids] = 0.0
+        self.landing_hold_delta[env_ids] = 0.0
+        self.landing_score_sum[env_ids] = 0.0
+        self.landing_phase_step_count[env_ids] = 0
+        self.max_consecutive_valid_landing_steps[env_ids] = 0
+        for name in (
+            "landing_zone",
+            "landing_forward_speed",
+            "landing_vertical_speed",
+            "landing_roll",
+            "landing_pitch",
+            "landing_height",
+            "landing_two_feet",
+            "landing_rear_support",
+            "landing_no_body_contact",
+        ):
+            getattr(self, f"{name}_pass_count")[env_ids] = 0
         self._clear_events(env_ids)
 
     def _clear_events(self, env_ids=None):
@@ -174,6 +256,11 @@ class BoxProgressTracker:
         self.missed_box_buf[env_ids] = False
         self.out_of_track_buf[env_ids] = False
         self.landing_overrun_buf[env_ids] = False
+        self.landing_timeout_buf[env_ids] = False
+        self.landing_phase_entry_buf[env_ids] = False
+        self.lateral_out_of_track_buf[env_ids] = False
+        self.backward_out_of_track_buf[env_ids] = False
+        self.generic_failure_buf[env_ids] = False
         self.fall_buf[env_ids] = False
         self.incomplete_buf[env_ids] = False
         self.episode_timeout_buf[env_ids] = False
@@ -195,12 +282,16 @@ class BoxProgressTracker:
         body_contact_force,
         base_vertical_velocity,
         natural_timeout,
+        base_forward_velocity=None,
+        episode_step=None,
         landing_end_x=None,
         external_timeout=None,
         external_fall=None,
     ):
         """Advance progress by one control step and update event buffers."""
         self._clear_events()
+        self.landing_quality_delta.zero_()
+        self.landing_hold_delta.zero_()
         if landing_end_x is None:
             landing_end_x = track_end_x
         env_ids = torch.arange(self.num_envs, device=self.device)
@@ -236,6 +327,12 @@ class BoxProgressTracker:
             & (previous_rear_count < self.rear_contact_required_steps)
             & (self.rear_contact_counter >= self.rear_contact_required_steps)
         )
+        rear_event_envs = self.rear_foot_contact_buf.nonzero(
+            as_tuple=False
+        ).flatten()
+        self.rear_contacted_boxes[
+            rear_event_envs, target_indices[rear_event_envs]
+        ] = True
         contact_requirements_met = (
             self.front_contact_counter >= self.front_contact_required_steps
         ) & (self.rear_contact_counter >= self.rear_contact_required_steps)
@@ -269,12 +366,34 @@ class BoxProgressTracker:
             & force_contact
         )
         course_complete = self.next_box_idx == self.required_boxes
+        newly_entered_landing = course_complete & (
+            self.landing_phase_start_step < 0
+        )
+        if episode_step is None:
+            episode_step = torch.zeros_like(self.next_box_idx)
+            already_landing = course_complete & ~newly_entered_landing
+            episode_step[already_landing] = (
+                self.landing_phase_start_step[already_landing]
+                + self.steps_in_landing_phase[already_landing]
+                + 1
+            )
+        self.landing_phase_start_step[newly_entered_landing] = episode_step[
+            newly_entered_landing
+        ]
+        self.steps_in_landing_phase[:] = torch.where(
+            course_complete,
+            (episode_step - self.landing_phase_start_step).clamp_min(0),
+            torch.zeros_like(self.steps_in_landing_phase),
+        )
+        self.landing_phase_entry_buf[:] = newly_entered_landing
         current_landing_feet = post_box_ground.sum(dim=1)
         rear_foot_support = post_box_ground[:, self.rear_foot_indices].any(
             dim=1
         )
         base_height = base_positions[:, 2] - env_origins[:, 2]
-        stable_landing = (
+        if base_forward_velocity is None:
+            base_forward_velocity = torch.zeros_like(base_vertical_velocity)
+        in_landing_zone = (
             course_complete
             & (base_positions[:, 0] > course_rear)
             & (base_positions[:, 0] < landing_end_x)
@@ -282,20 +401,37 @@ class BoxProgressTracker:
                 torch.abs(base_positions[:, 1] - env_origins[:, 1])
                 <= self.lateral_limit
             )
-            & (current_landing_feet >= self.landing_min_current_feet)
-            & (
-                rear_foot_support
-                if self.landing_require_rear_foot
-                else torch.ones_like(rear_foot_support)
-            )
-            & ~body_contact
-            & (roll.abs() <= self.landing_roll_threshold)
-            & (pitch.abs() <= self.landing_pitch_threshold)
-            & (base_height >= self.landing_base_height_threshold)
-            & (
-                base_vertical_velocity.abs()
-                <= self.landing_vertical_speed_threshold
-            )
+        )
+        forward_speed_valid = (
+            base_forward_velocity.abs()
+            <= self.landing_forward_speed_threshold
+        )
+        vertical_speed_valid = (
+            base_vertical_velocity.abs()
+            <= self.landing_vertical_speed_threshold
+        )
+        roll_valid = roll.abs() <= self.landing_roll_threshold
+        pitch_valid = pitch.abs() <= self.landing_pitch_threshold
+        height_valid = base_height >= self.landing_base_height_threshold
+        two_feet_valid = (
+            current_landing_feet >= self.landing_min_current_feet
+        )
+        rear_support_valid = (
+            rear_foot_support
+            if self.landing_require_rear_foot
+            else torch.ones_like(rear_foot_support)
+        )
+        no_body_contact = ~body_contact
+        stable_landing = (
+            in_landing_zone
+            & two_feet_valid
+            & rear_support_valid
+            & no_body_contact
+            & roll_valid
+            & pitch_valid
+            & height_valid
+            & vertical_speed_valid
+            & forward_speed_valid
         )
         self.landing_counter[:] = torch.where(
             stable_landing,
@@ -303,10 +439,95 @@ class BoxProgressTracker:
             torch.zeros_like(self.landing_counter),
         )
         landing_success = self.landing_counter >= self.landing_steps
+        self.max_consecutive_valid_landing_steps[:] = torch.maximum(
+            self.max_consecutive_valid_landing_steps,
+            self.landing_counter,
+        )
+
+        score_gate = in_landing_zone & no_body_contact
+        speed_score = torch.clamp(
+            1.0 - torch.square(base_forward_velocity.abs() / 0.5),
+            0.0,
+            1.0,
+        )
+        vertical_speed_score = torch.clamp(
+            1.0 - torch.square(base_vertical_velocity.abs() / 0.5),
+            0.0,
+            1.0,
+        )
+        roll_score = torch.clamp(
+            1.0
+            - torch.square(roll.abs() / self.landing_roll_threshold),
+            0.0,
+            1.0,
+        )
+        pitch_score = torch.clamp(
+            1.0
+            - torch.square(pitch.abs() / self.landing_pitch_threshold),
+            0.0,
+            1.0,
+        )
+        height_score = torch.clamp(
+            (base_height - self.base_height_threshold)
+            / (
+                self.landing_base_height_threshold
+                - self.base_height_threshold
+            ),
+            0.0,
+            1.0,
+        )
+        feet_score = torch.clamp(
+            current_landing_feet.float() / 2.0, 0.0, 1.0
+        )
+        self.landing_score[:] = (
+            (
+                2.0 * speed_score
+                + vertical_speed_score
+                + roll_score
+                + pitch_score
+                + height_score
+                + 2.0 * feet_score
+                + 2.0 * rear_foot_support.float()
+            )
+            / 10.0
+            * score_gate.float()
+        )
+        new_best_score = torch.maximum(
+            self.best_landing_score, self.landing_score
+        )
+        self.landing_quality_delta[:] = (
+            new_best_score - self.best_landing_score
+        ).clamp_min(0.0)
+        self.best_landing_score[:] = new_best_score
+        new_best_hold = torch.maximum(
+            self.best_landing_hold_steps, self.landing_counter
+        )
+        self.landing_hold_delta[:] = (
+            new_best_hold - self.best_landing_hold_steps
+        ).float() / float(self.landing_steps)
+        self.best_landing_hold_steps[:] = new_best_hold
+        self.landing_score_sum += self.landing_score
+        self.landing_phase_step_count += course_complete
+        condition_values = {
+            "landing_zone": in_landing_zone,
+            "landing_forward_speed": forward_speed_valid,
+            "landing_vertical_speed": vertical_speed_valid,
+            "landing_roll": roll_valid,
+            "landing_pitch": pitch_valid,
+            "landing_height": height_valid,
+            "landing_two_feet": two_feet_valid,
+            "landing_rear_support": rear_support_valid,
+            "landing_no_body_contact": no_body_contact,
+        }
+        for name, condition in condition_values.items():
+            getattr(self, f"{name}_pass_count")[:] += (
+                course_complete & condition
+            )
 
         self.body_contact_history[:, self.body_contact_history_index] = (
             body_contact
         )
+        self.body_contact_step_count += body_contact
         self.body_contact_history_index = (
             self.body_contact_history_index + 1
         ) % self.body_contact_window_steps
@@ -333,35 +554,51 @@ class BoxProgressTracker:
         )
 
         lateral_offset = (base_positions[:, 1] - env_origins[:, 1]).abs()
-        raw_out_of_track = (
-            (lateral_offset > self.lateral_limit)
-            | (base_positions[:, 0] < track_start_x)
-            | ((base_positions[:, 0] > track_end_x) & ~landing_success)
+        raw_lateral_out = lateral_offset > self.lateral_limit
+        raw_backward_out = base_positions[:, 0] < track_start_x
+        raw_other_out = (
+            ~course_complete
+            & (base_positions[:, 0] > track_end_x)
         )
-        raw_landing_overrun = torch.zeros_like(course_complete)
-        if self.required_boxes < self.num_boxes:
-            raw_landing_overrun = (
-                course_complete
-                & (base_positions[:, 0] >= landing_end_x)
-                & ~landing_success
-            )
+        raw_landing_overrun = (
+            course_complete
+            & (base_positions[:, 0] >= landing_end_x)
+            & ~landing_success
+        )
 
         # Terminal causes are mutually exclusive. Unsafe task failures take
         # precedence over success, and natural timeout is considered only when
         # neither a failure nor success happened on the same control step.
         self.fall_buf[:] = raw_fall & ~self.missed_box_buf
-        self.landing_overrun_buf[:] = (
-            raw_landing_overrun & ~self.missed_box_buf & ~raw_fall
-        )
+        hard_taken = self.missed_box_buf | self.fall_buf
+        self.lateral_out_of_track_buf[:] = raw_lateral_out & ~hard_taken
+        hard_taken |= self.lateral_out_of_track_buf
+        self.backward_out_of_track_buf[:] = raw_backward_out & ~hard_taken
+        hard_taken |= self.backward_out_of_track_buf
+        other_out = raw_other_out & ~hard_taken
+        hard_taken |= other_out
         self.out_of_track_buf[:] = (
-            raw_out_of_track
-            & ~self.missed_box_buf
-            & ~raw_fall
-            & ~raw_landing_overrun
+            self.lateral_out_of_track_buf
+            | self.backward_out_of_track_buf
+            | other_out
         )
-        self.success_buf[:] = landing_success & ~self.failure_buf
+        self.generic_failure_buf[:] = hard_taken
+        self.success_buf[:] = landing_success & ~hard_taken
+        self.landing_overrun_buf[:] = (
+            raw_landing_overrun & ~hard_taken & ~self.success_buf
+        )
+        self.landing_timeout_buf[:] = (
+            course_complete
+            & (self.steps_in_landing_phase >= self.landing_deadline_steps)
+            & ~hard_taken
+            & ~self.success_buf
+            & ~self.landing_overrun_buf
+        )
         self.incomplete_buf[:] = (
-            natural_timeout & ~self.failure_buf & ~self.success_buf
+            natural_timeout
+            & ~self.failure_buf
+            & ~self.success_buf
+            & ~self.landing_timeout_buf
         )
         if external_timeout is None:
             external_timeout = torch.zeros_like(natural_timeout)
@@ -434,10 +671,9 @@ class BoxProgressTracker:
     @property
     def failure_buf(self):
         return (
-            self.missed_box_buf
-            | self.out_of_track_buf
+            self.generic_failure_buf
             | self.landing_overrun_buf
-            | self.fall_buf
+            | self.landing_timeout_buf
         )
 
     def apply_termination(self, reset_buf, time_out_buf):

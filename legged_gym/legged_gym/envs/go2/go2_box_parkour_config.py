@@ -60,32 +60,36 @@ class Go2BoxParkourCfg(DebugGo2BoxCfg):
             tracking_ang_vel = 0.2
             forward_speed_tracking = 0.5
             course_progress = 1000.0
-            # V16 restores valid four-leg motion before precise speed control.
+            landing_quality_progress = 300.0
+            landing_hold_progress = 200.0
+            # V17 prioritizes clean landing and four-leg motion over exact speed.
             speed_error_square = 0.0
-            # This is only a weak safety cap; exact 0.5 m/s tracking remains
-            # disabled during gait repair.
             overspeed = -0.5
-            action_rate = -0.02
-            flat_orientation = -0.5
-            flat_base_height = -10.0
-            dof_vel = -2e-4
+            action_rate = -0.01
+            flat_orientation = -0.3
+            flat_base_height = -0.5
+            dof_vel = -1e-4
             lin_pos_y = -0.1
             yaw_abs = -0.1
             energy_substeps = -2e-7
             torques = -1e-7
-            dof_error_named = -1.0
-            dof_error = -0.005
+            dof_error_named = -0.5
+            dof_error = -0.0025
             body_collision = -5.0
             thigh_collision = -0.5
             calf_collision = -0.5
-            rear_support_missing = -0.5
+            rear_support_missing = -0.3
+            flat_airborne = -0.2
+            rear_upper_joint_excursion = 0.0
             exceed_dof_pos_limits = -0.1
-            exceed_torque_limits_l1norm = -0.1
+            exceed_torque_limits_l1norm = -1.5
             box_front_foot_contact = 5.0
             box_rear_foot_contact = 10.0
             box_passed = 25.0
-            success = 500.0
+            success = 1000.0
             termination = -2000.0
+            landing_overrun = -1500.0
+            landing_timeout = -1250.0
             incomplete = -2000.0
 
         only_positive_rewards = False
@@ -94,16 +98,23 @@ class Go2BoxParkourCfg(DebugGo2BoxCfg):
         motion_quality_initial_level = 0.0
         body_collision_floor = 1.0
         leg_collision_floor = 0.25
-        flat_orientation_floor = 0.50
+        flat_orientation_floor = 0.25
         flat_base_height_floor = 1.0
-        action_rate_floor = 0.50
-        dof_error_floor = 0.25
-        dof_vel_floor = 0.25
+        action_rate_floor = 0.10
+        dof_error_floor = 0.10
+        dof_vel_floor = 0.10
         speed_error_floor = 0.0
         overspeed_floor = 1.0
         rear_support_window_steps = 25
-        rear_support_missing_steps = 8
-        flat_base_height_target = 0.34
+        rear_support_target_ratio = 0.20
+        flat_airborne_free_ratio = 0.40
+        flat_height_min = 0.28
+        flat_height_max = 0.38
+        flat_height_normalization = 0.08
+        flat_hip_allowance = 0.35
+        flat_thigh_allowance = 0.75
+        box_hip_allowance = 0.55
+        box_thigh_allowance = 1.25
         # Track the command closely on flat ground. Near a box, allow a brief
         # positive speed error for jumping or climbing without rewarding it.
         # Smoothly blend the local speed limit over these distances. Only the
@@ -115,9 +126,6 @@ class Go2BoxParkourCfg(DebugGo2BoxCfg):
         flat_speed_limit = 1.2
         flat_severe_speed_limit = 1.5
         box_speed_limit = 1.8
-        # Do not make a late failure cheaper than an early failure. With a
-        # floor of one every unsafe termination is an actual -40 reward.
-        failure_progress_floor = 1.0
         leg_contact_force_threshold = 0.1
         body_collision_force_threshold = 1.0
         dof_near_limit_fraction = 0.15
@@ -138,6 +146,8 @@ class Go2BoxParkourCfg(DebugGo2BoxCfg):
         landing_pitch_threshold = 0.45
         landing_base_height_threshold = 0.22
         landing_vertical_speed_threshold = 0.5
+        landing_forward_speed_threshold = 0.25
+        landing_deadline_steps = 100
         body_contact_window_steps = 25
         body_contact_failure_steps = 8
         severe_body_impact_force = 80.0
@@ -164,10 +174,10 @@ class Go2BoxParkourCfgPPO(Go2RoughCfgPPO):
         gamma = 0.999
         lam = 0.95
         critic_warmup_iterations = 100
-        actor_finetune_learning_rate = 2e-5
+        actor_finetune_learning_rate = 1e-5
         actor_finetune_clip_param = 0.1
         actor_finetune_entropy_coef = 0.001
-        # The 11300 Actor initializes V16 but is not a behavior reference.
+        # The 11300 Actor initializes V17 but is not a behavior reference.
         reference_kl_min_coef = 0.0
         reference_kl_max_coef = 0.0
         reference_kl_start_coef = 0.0
@@ -175,6 +185,7 @@ class Go2BoxParkourCfgPPO(Go2RoughCfgPPO):
         reference_kl_stable_decrease = 0.02
         reference_kl_regression_increase = 0.10
         reference_kl_regression_floor = 0.50
+        freeze_actor_encoder_iterations = 200
         # Keep the checkpoint schema compatible; with KL max set to zero no
         # frozen reference policy is created and these limits remain inactive.
         actor_parameter_equivalence_tolerance = 0.0
@@ -212,7 +223,7 @@ class Go2BoxParkourCfgPPO(Go2RoughCfgPPO):
 
     class runner(Go2RoughCfgPPO.runner):
         experiment_name = "go2_box_parkour"
-        run_name = "five_box_v16_flat_gait_repair_from11300"
+        run_name = "five_box_v17_landing_repair_stageA_from11300"
         # Partial episodes generated at process startup do not represent the
         # checkpoint policy and must not drive the box curriculum or KL state.
         init_at_random_ep_len = False
@@ -224,11 +235,11 @@ class Go2BoxParkourCfgPPO(Go2RoughCfgPPO):
             "Jul19_22-22-00_five_box_v4_from11200",
         )
         checkpoint = 11300
-        # Select Critic reset explicitly on the first CLI launch. Later V16
+        # Select Critic reset explicitly on the first CLI launch. Later V17
         # resumes must not reset the learned Critic again.
         ckpt_manipulator = None
         max_iterations = 300
-        save_interval = 100
+        save_interval = 50
         log_interval = 10
 
 

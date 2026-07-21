@@ -56,6 +56,7 @@ class PPO:
                  schedule="fixed",
                  desired_kl=0.01,
                  critic_warmup_iterations=0,
+                 freeze_actor_encoder_iterations=0,
                  actor_finetune_learning_rate=None,
                  actor_finetune_clip_param=None,
                  actor_finetune_entropy_coef=None,
@@ -142,6 +143,14 @@ class PPO:
         if self.critic_warmup_iterations < 0:
             raise ValueError("critic_warmup_iterations must be non-negative.")
         self.critic_warmup_until_iteration = None
+        self.freeze_actor_encoder_iterations = int(
+            freeze_actor_encoder_iterations
+        )
+        if self.freeze_actor_encoder_iterations < 0:
+            raise ValueError(
+                "freeze_actor_encoder_iterations must be non-negative."
+            )
+        self.actor_encoder_frozen_until_iteration = None
         self.actor_finetune_learning_rate = float(
             learning_rate
             if actor_finetune_learning_rate is None
@@ -261,6 +270,7 @@ class PPO:
         self.curriculum_regressed = False
         self.curriculum_phase_transition = False
         self.reward_order_warning = False
+        self.reward_order_bad_windows = 0
         self.current_reference_kl_coef = min(
             max(self.reference_kl_start_coef, self.reference_kl_min_coef),
             self.reference_kl_max_coef,
@@ -340,6 +350,11 @@ class PPO:
         self.critic_warmup_until_iteration = (
             int(start_iteration) + self.critic_warmup_iterations
         )
+        if self.freeze_actor_encoder_iterations > 0:
+            self.actor_encoder_frozen_until_iteration = (
+                int(start_iteration) + self.freeze_actor_encoder_iterations
+            )
+            self._set_actor_encoder_trainable(False)
         self.actor_finetune_active = False
         self.set_quality_levels(0.0, 0.0)
         self.quality_phase = 0
@@ -349,6 +364,23 @@ class PPO:
             actor_enabled=False,
             learning_rate=self.learning_rate,
         )
+
+    def _set_actor_encoder_trainable(self, trainable):
+        """Freeze only the Actor observation encoders for staged repair."""
+        encoders = getattr(self.actor_critic, "encoders", None)
+        if encoders is None:
+            return
+        for parameter in encoders.parameters():
+            parameter.requires_grad_(bool(trainable))
+
+    def _update_actor_encoder_freeze(self, iteration):
+        """Apply the absolute checkpoint-safe Actor encoder freeze boundary."""
+        frozen = (
+            self.actor_encoder_frozen_until_iteration is not None
+            and int(iteration) < self.actor_encoder_frozen_until_iteration
+        )
+        self._set_actor_encoder_trainable(not frozen)
+        return frozen
 
     @staticmethod
     def _is_actor_side_parameter(name):
@@ -481,13 +513,20 @@ class PPO:
         action_saturation_ratio=1.0,
         dof_near_limit_ratio=1.0,
         reward_order_ok=True,
+        reward_order_valid=False,
     ):
         """Update staged penalties and adaptive reference-policy protection."""
         self.collapse_warning = False
         self.curriculum_promoted = False
         self.curriculum_regressed = False
         self.curriculum_phase_transition = False
-        self.reward_order_warning = reward_order_ok is False
+        if reward_order_valid:
+            self.reward_order_bad_windows = (
+                self.reward_order_bad_windows + 1
+                if reward_order_ok is False
+                else 0
+            )
+        self.reward_order_warning = self.reward_order_bad_windows >= 2
         if (
             self.is_critic_warmup_active()
             or episode_count < self.quality_min_episodes
@@ -732,6 +771,10 @@ class PPO:
         return self.transition.actions
     
     def process_env_step(self, rewards, dones, infos, next_obs, next_critic_obs):
+        if not torch.isfinite(rewards).all():
+            raise FloatingPointError(
+                "Non-finite environment reward detected; training stopped."
+            )
         self.transition.rewards = rewards.clone()
         self.transition.dones = dones
         # Bootstrapping on time outs
@@ -751,6 +794,9 @@ class PPO:
 
     def update(self, current_learning_iteration):
         self.current_learning_iteration = current_learning_iteration
+        actor_encoder_frozen = self._update_actor_encoder_freeze(
+            current_learning_iteration
+        )
         critic_warmup_active = self.is_critic_warmup_active(
             current_learning_iteration
         )
@@ -780,6 +826,12 @@ class PPO:
         for minibatch in generator:
 
                 losses, _, stats = self.compute_losses(minibatch)
+                for name, value in {**losses, **stats}.items():
+                    if not torch.isfinite(value).all():
+                        raise FloatingPointError(
+                            f"Non-finite PPO value detected in {name!r}; "
+                            "training stopped."
+                        )
 
                 loss = 0.
                 for k, v in losses.items():
@@ -826,6 +878,9 @@ class PPO:
             )
         average_stats["actor_update_enabled"] = torch.tensor(
             0.0 if critic_warmup_active else 1.0, device=self.device
+        )
+        average_stats["actor_encoder_frozen"] = torch.tensor(
+            float(actor_encoder_frozen), device=self.device
         )
         average_stats["critic_warmup_remaining"] = torch.tensor(
             float(warmup_remaining), device=self.device
@@ -1078,6 +1133,9 @@ class PPO:
                 "critic_warmup_until_iteration": (
                     self.critic_warmup_until_iteration
                 ),
+                "actor_encoder_frozen_until_iteration": (
+                    self.actor_encoder_frozen_until_iteration
+                ),
                 "quality_phase": self.quality_phase,
                 "speed_penalty_level": self.speed_penalty_level,
                 "motion_quality_level": self.motion_quality_level,
@@ -1098,6 +1156,7 @@ class PPO:
                 "collapse_windows": self.collapse_windows,
                 "collapse_warning": self.collapse_warning,
                 "reward_order_warning": self.reward_order_warning,
+                "reward_order_bad_windows": self.reward_order_bad_windows,
                 "actor_finetune_active": self.actor_finetune_active,
                 "learning_rate": self.learning_rate,
                 "clip_param": self.clip_param,
@@ -1133,6 +1192,9 @@ class PPO:
             )
         self.critic_warmup_until_iteration = algorithm_state.get(
             "critic_warmup_until_iteration"
+        )
+        self.actor_encoder_frozen_until_iteration = algorithm_state.get(
+            "actor_encoder_frozen_until_iteration"
         )
         self.quality_phase = int(algorithm_state.get("quality_phase", 0))
         self.set_quality_levels(
@@ -1175,6 +1237,9 @@ class PPO:
         self.reward_order_warning = bool(
             algorithm_state.get("reward_order_warning", False)
         )
+        self.reward_order_bad_windows = int(
+            algorithm_state.get("reward_order_bad_windows", 0)
+        )
         self.actor_finetune_active = bool(
             algorithm_state.get("actor_finetune_active", False)
         )
@@ -1204,6 +1269,7 @@ class PPO:
             )
         )
         checkpoint_iteration = int(state_dict.get("iter", 0))
+        self._update_actor_encoder_freeze(checkpoint_iteration)
         optimizer_is_critic_only = (
             not self.actor_finetune_active
             and self.critic_warmup_until_iteration is not None

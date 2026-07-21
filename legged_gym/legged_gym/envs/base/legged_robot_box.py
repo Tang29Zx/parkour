@@ -24,6 +24,27 @@ class LeggedRobotBox(LeggedRobot):
         self.rear_foot_local_indices = self._foot_local_indices(
             ("RL", "RR"), "rear"
         )
+        self.rear_upper_joint_names = (
+            "RL_hip_joint",
+            "RR_hip_joint",
+            "RL_thigh_joint",
+            "RR_thigh_joint",
+        )
+        missing_rear_upper_joints = [
+            name
+            for name in self.rear_upper_joint_names
+            if name not in self.dof_names
+        ]
+        if missing_rear_upper_joints:
+            raise ValueError(
+                "The robot asset is missing rear upper-leg joints: "
+                + ", ".join(missing_rear_upper_joints)
+            )
+        self.rear_upper_joint_indices = torch.tensor(
+            [self.dof_names.index(name) for name in self.rear_upper_joint_names],
+            dtype=torch.long,
+            device=self.device,
+        )
         progress_cfg = self.cfg.box_progress
         if progress_cfg.flat_low_base_height_threshold <= 0.0:
             raise ValueError(
@@ -59,6 +80,10 @@ class LeggedRobotBox(LeggedRobot):
             landing_vertical_speed_threshold=(
                 progress_cfg.landing_vertical_speed_threshold
             ),
+            landing_forward_speed_threshold=(
+                progress_cfg.landing_forward_speed_threshold
+            ),
+            landing_deadline_steps=progress_cfg.landing_deadline_steps,
             body_contact_window_steps=progress_cfg.body_contact_window_steps,
             body_contact_failure_steps=(
                 progress_cfg.body_contact_failure_steps
@@ -151,6 +176,7 @@ class LeggedRobotBox(LeggedRobot):
         self.named_joint_error_max = torch.zeros_like(
             self.named_joint_error_sum
         )
+        self._init_rear_upper_joint_statistics()
         self.dof_near_limit_count = torch.zeros(
             self.num_envs, dtype=torch.long, device=self.device
         )
@@ -179,24 +205,24 @@ class LeggedRobotBox(LeggedRobot):
         rear_support_window_steps = int(
             self.cfg.rewards.rear_support_window_steps
         )
-        rear_support_missing_steps = int(
-            self.cfg.rewards.rear_support_missing_steps
-        )
         if rear_support_window_steps <= 0:
             raise ValueError("rear_support_window_steps must be positive.")
-        if not 1 <= rear_support_missing_steps <= rear_support_window_steps:
-            raise ValueError(
-                "rear_support_missing_steps must be within the support window."
-            )
-        self.rear_support_missing_history = torch.zeros(
+        self.rear_support_history = torch.zeros(
             self.num_envs,
             rear_support_window_steps,
             dtype=torch.bool,
             device=self.device,
         )
+        self.airborne_history = torch.zeros_like(self.rear_support_history)
+        self.rear_support_valid_history = torch.zeros_like(
+            self.rear_support_history
+        )
         self.rear_support_history_index = 0
-        self.rear_support_missing_counter = torch.zeros_like(
-            self.dof_near_limit_count
+        self.rear_support_window_ratio = torch.zeros_like(
+            self.forward_speed_sum
+        )
+        self.flat_airborne_window_ratio = torch.zeros_like(
+            self.forward_speed_sum
         )
         self.rear_support_missing_count = torch.zeros_like(
             self.dof_near_limit_count
@@ -229,6 +255,21 @@ class LeggedRobotBox(LeggedRobot):
         )
         self.progress_reward_initialized = torch.zeros(
             self.num_envs, dtype=torch.bool, device=self.device
+        )
+        self.current_ground_contact_feet_sum = torch.zeros_like(
+            self.forward_speed_sum
+        )
+        self.current_rear_support_count = torch.zeros_like(
+            self.dof_near_limit_count
+        )
+        self.flat_airborne_count = torch.zeros_like(
+            self.dof_near_limit_count
+        )
+        self.rear_excursion_raw_sum = torch.zeros_like(
+            self.forward_speed_sum
+        )
+        self.rear_excursion_raw_max = torch.zeros_like(
+            self.forward_speed_sum
         )
 
         rigid_body_names = self.gym.get_actor_rigid_body_names(
@@ -325,6 +366,11 @@ class LeggedRobotBox(LeggedRobot):
         self.missed_box_buf = tracker.missed_box_buf
         self.out_of_track_buf = tracker.out_of_track_buf
         self.landing_overrun_buf = tracker.landing_overrun_buf
+        self.landing_timeout_buf = tracker.landing_timeout_buf
+        self.landing_phase_entry_buf = tracker.landing_phase_entry_buf
+        self.lateral_out_of_track_buf = tracker.lateral_out_of_track_buf
+        self.backward_out_of_track_buf = tracker.backward_out_of_track_buf
+        self.generic_failure_buf = tracker.generic_failure_buf
         self.fall_buf = tracker.fall_buf
         self.incomplete_buf = tracker.incomplete_buf
         self.task_progress_buf = tracker.task_progress_buf
@@ -334,6 +380,12 @@ class LeggedRobotBox(LeggedRobot):
         )
         self.severe_body_impact_buf = tracker.severe_body_impact_buf
         self.landing_counter = tracker.landing_counter
+        self.landing_phase_start_step = tracker.landing_phase_start_step
+        self.steps_in_landing_phase = tracker.steps_in_landing_phase
+        self.best_landing_score = tracker.best_landing_score
+        self.best_landing_hold_steps = tracker.best_landing_hold_steps
+        self.landing_quality_delta = tracker.landing_quality_delta
+        self.landing_hold_delta = tracker.landing_hold_delta
         self.episode_timeout_buf = tracker.episode_timeout_buf
 
     def _update_course_progress_reward(self):
@@ -409,39 +461,188 @@ class LeggedRobotBox(LeggedRobot):
         super()._post_physics_step_callback()
         forward_speed = self.base_lin_vel[:, 0]
         box_mask = self._near_box_for_speed_control()
-        self._update_speed_statistics(forward_speed, box_mask)
-        self._update_flat_gait_statistics(~box_mask)
+        landing_phase = (
+            self.next_box_idx >= self.box_progress.required_boxes
+        )
+        flat_mask = ~box_mask & ~landing_phase
+        self._update_speed_statistics(
+            forward_speed, box_mask, landing_phase
+        )
+        self._update_flat_gait_statistics(flat_mask)
         self._update_motion_quality_statistics()
+        self._update_rear_upper_joint_statistics(box_mask)
         self._update_rear_support_state(box_mask)
 
+    def _init_rear_upper_joint_statistics(self):
+        """Allocate flat/box statistics for the rear hip and thigh joints."""
+        shape = (self.num_envs, len(self.rear_upper_joint_indices))
+        self.rear_upper_flat_sample_count = torch.zeros(
+            self.num_envs, dtype=torch.long, device=self.device
+        )
+        self.rear_upper_box_sample_count = torch.zeros_like(
+            self.rear_upper_flat_sample_count
+        )
+        self.rear_upper_flat_action_sample_count = torch.zeros_like(
+            self.rear_upper_flat_sample_count
+        )
+        self.rear_upper_box_action_sample_count = torch.zeros_like(
+            self.rear_upper_flat_sample_count
+        )
+        self.rear_upper_flat_pos_min = torch.full(
+            shape, 10.0, dtype=torch.float, device=self.device
+        )
+        self.rear_upper_flat_pos_max = torch.full(
+            shape, -10.0, dtype=torch.float, device=self.device
+        )
+        self.rear_upper_box_pos_min = torch.full_like(
+            self.rear_upper_flat_pos_min, 10.0
+        )
+        self.rear_upper_box_pos_max = torch.full_like(
+            self.rear_upper_flat_pos_max, -10.0
+        )
+        self.rear_upper_flat_vel_sq_sum = torch.zeros_like(
+            self.rear_upper_flat_pos_min
+        )
+        self.rear_upper_box_vel_sq_sum = torch.zeros_like(
+            self.rear_upper_flat_pos_min
+        )
+        self.rear_upper_flat_action_delta_sq_sum = torch.zeros_like(
+            self.rear_upper_flat_pos_min
+        )
+        self.rear_upper_box_action_delta_sq_sum = torch.zeros_like(
+            self.rear_upper_flat_pos_min
+        )
+
+    def _update_rear_upper_joint_statistics(self, box_mask):
+        """Track physical rear-joint swing separately on flat and box areas."""
+        joint_indices = self.rear_upper_joint_indices
+        joint_pos = self.dof_pos[:, joint_indices]
+        joint_vel = self.dof_vel[:, joint_indices]
+        action_delta = (
+            self.actions[:, joint_indices]
+            - self.last_actions[:, joint_indices]
+        )
+        action_valid = self.episode_length_buf > 1
+
+        for region, region_mask in (("flat", ~box_mask), ("box", box_mask)):
+            mask = region_mask.unsqueeze(1)
+            sample_count = getattr(
+                self, f"rear_upper_{region}_sample_count"
+            )
+            action_sample_count = getattr(
+                self, f"rear_upper_{region}_action_sample_count"
+            )
+            position_min = getattr(
+                self, f"rear_upper_{region}_pos_min"
+            )
+            position_max = getattr(
+                self, f"rear_upper_{region}_pos_max"
+            )
+            velocity_sum = getattr(
+                self, f"rear_upper_{region}_vel_sq_sum"
+            )
+            action_delta_sum = getattr(
+                self, f"rear_upper_{region}_action_delta_sq_sum"
+            )
+
+            sample_count += region_mask
+            position_min[:] = torch.where(
+                mask, torch.minimum(position_min, joint_pos), position_min
+            )
+            position_max[:] = torch.where(
+                mask, torch.maximum(position_max, joint_pos), position_max
+            )
+            velocity_sum += joint_vel.square() * mask
+
+            valid_action_mask = region_mask & action_valid
+            action_sample_count += valid_action_mask
+            action_delta_sum += (
+                action_delta.square() * valid_action_mask.unsqueeze(1)
+            )
+
     def _update_rear_support_state(self, box_mask):
-        """Detect prolonged front-only support outside obstacle maneuvers."""
+        """Track rear support and airborne ratios on valid flat-ground steps."""
         foot_contact = (
             torch.norm(self.contact_forces[:, self.feet_indices, :], dim=-1)
             > self.cfg.box_progress.contact_force_threshold
         )
-        front_support = foot_contact[:, self.front_foot_local_indices].any(
-            dim=1
-        )
         rear_support = foot_contact[:, self.rear_foot_local_indices].any(dim=1)
-        missing_rear_support = ~box_mask & front_support & ~rear_support
-        self.rear_support_missing_history[
-            :, self.rear_support_history_index
-        ] = missing_rear_support
+        airborne = ~foot_contact.any(dim=1)
+        landing_phase = self.next_box_idx >= self.box_progress.required_boxes
+        valid_flat = ~box_mask & ~landing_phase
+        history_index = self.rear_support_history_index
+        self.rear_support_history[:, history_index] = (
+            rear_support & valid_flat
+        )
+        self.airborne_history[:, history_index] = airborne & valid_flat
+        self.rear_support_valid_history[:, history_index] = valid_flat
         self.rear_support_history_index = (
             self.rear_support_history_index + 1
-        ) % self.rear_support_missing_history.shape[1]
-        self.rear_support_missing_counter[:] = (
-            self.rear_support_missing_history.sum(dim=1)
+        ) % self.rear_support_history.shape[1]
+        valid_count = self.rear_support_valid_history.sum(dim=1)
+        denominator = valid_count.clamp_min(1).float()
+        self.rear_support_window_ratio[:] = (
+            self.rear_support_history.sum(dim=1).float() / denominator
+        )
+        self.flat_airborne_window_ratio[:] = (
+            self.airborne_history.sum(dim=1).float() / denominator
+        )
+        target_ratio = float(self.cfg.rewards.rear_support_target_ratio)
+        rear_deficit = torch.relu(
+            (target_ratio - self.rear_support_window_ratio)
+            / max(target_ratio, 1e-6)
         )
         self.max_rear_support_missing_steps[:] = torch.maximum(
             self.max_rear_support_missing_steps,
-            self.rear_support_missing_counter,
+            (rear_deficit * valid_count.float()).to(torch.long),
         )
-        missing_steps = int(self.cfg.rewards.rear_support_missing_steps)
         self.rear_support_missing_count += (
-            self.rear_support_missing_counter >= missing_steps
+            valid_flat
+            & (self.episode_length_buf > self.rear_support_history.shape[1])
+            & (rear_deficit > 0.0)
         )
+        self.current_ground_contact_feet_sum += foot_contact.sum(dim=1)
+        self.current_rear_support_count += rear_support
+        self.flat_airborne_count += valid_flat & airborne
+
+        rear_excursion = self._rear_upper_joint_excursion_raw(box_mask)
+        self.rear_excursion_raw_sum += rear_excursion
+        self.rear_excursion_raw_max[:] = torch.maximum(
+            self.rear_excursion_raw_max, rear_excursion
+        )
+
+    def _rear_upper_joint_excursion_raw(self, box_mask):
+        """Return the mean squared excess of the four rear upper joints."""
+        offsets = torch.abs(
+            self.dof_pos[:, self.rear_upper_joint_indices]
+            - self.default_dof_pos[:, self.rear_upper_joint_indices]
+        )
+        flat_allowance = torch.tensor(
+            [
+                self.cfg.rewards.flat_hip_allowance,
+                self.cfg.rewards.flat_hip_allowance,
+                self.cfg.rewards.flat_thigh_allowance,
+                self.cfg.rewards.flat_thigh_allowance,
+            ],
+            dtype=offsets.dtype,
+            device=offsets.device,
+        )
+        box_allowance = torch.tensor(
+            [
+                self.cfg.rewards.box_hip_allowance,
+                self.cfg.rewards.box_hip_allowance,
+                self.cfg.rewards.box_thigh_allowance,
+                self.cfg.rewards.box_thigh_allowance,
+            ],
+            dtype=offsets.dtype,
+            device=offsets.device,
+        )
+        allowance = torch.where(
+            box_mask.unsqueeze(1), box_allowance, flat_allowance
+        )
+        return torch.square(torch.relu(offsets - allowance)).mean(
+            dim=1
+        ).clamp(max=1.0)
 
     def _base_height_above_terrain(self):
         """Return base height above the surface directly below the base."""
@@ -601,9 +802,13 @@ class LeggedRobotBox(LeggedRobot):
             dim=1,
         )
 
-    def _update_speed_statistics(self, forward_speed, box_mask):
+    def _update_speed_statistics(
+        self, forward_speed, box_mask, landing_mask=None
+    ):
         """Accumulate finite whole-course and mutually exclusive region stats."""
-        flat_mask = ~box_mask
+        if landing_mask is None:
+            landing_mask = torch.zeros_like(box_mask)
+        flat_mask = ~box_mask & ~landing_mask
         self.forward_speed_sum += forward_speed
         self.max_forward_speed = torch.maximum(
             self.max_forward_speed, forward_speed
@@ -794,6 +999,25 @@ class LeggedRobotBox(LeggedRobot):
             "body_collision_rate": (
                 self.body_collision_count[env_ids].sum() / step_count
             ),
+            "body_contact_ratio": (
+                self.box_progress.body_contact_step_count[env_ids].sum()
+                / step_count
+            ),
+            "current_ground_contact_feet_mean": (
+                self.current_ground_contact_feet_sum[env_ids].sum()
+                / step_count
+            ),
+            "current_rear_support_ratio": (
+                self.current_rear_support_count[env_ids].sum()
+                / step_count
+            ),
+            "rear_support_window_ratio": self.rear_support_window_ratio[
+                env_ids
+            ].mean(),
+            "flat_airborne_ratio": (
+                self.flat_airborne_count[env_ids].sum()
+                / self.flat_base_height_count[env_ids].sum().clamp_min(1)
+            ),
             "rear_support_missing_rate": (
                 self.rear_support_missing_count[env_ids].sum() / step_count
             ),
@@ -891,6 +1115,120 @@ class LeggedRobotBox(LeggedRobot):
             )
         return stats
 
+    def _get_rear_upper_joint_statistics(self, env_ids):
+        """Summarize rear hip/thigh swing without affecting training."""
+        stats = {}
+        for region in ("flat", "box"):
+            sample_count = getattr(
+                self, f"rear_upper_{region}_sample_count"
+            )[env_ids]
+            action_sample_count = getattr(
+                self, f"rear_upper_{region}_action_sample_count"
+            )[env_ids]
+            position_min = getattr(
+                self, f"rear_upper_{region}_pos_min"
+            )[env_ids]
+            position_max = getattr(
+                self, f"rear_upper_{region}_pos_max"
+            )[env_ids]
+            velocity_sum = getattr(
+                self, f"rear_upper_{region}_vel_sq_sum"
+            )[env_ids]
+            action_delta_sum = getattr(
+                self, f"rear_upper_{region}_action_delta_sq_sum"
+            )[env_ids]
+
+            valid_episode = sample_count > 0
+            valid_count = valid_episode.sum().clamp_min(1)
+            episode_range = torch.where(
+                valid_episode.unsqueeze(1),
+                (position_max - position_min).clamp_min(0.0),
+                torch.zeros_like(position_min),
+            )
+            total_samples = sample_count.sum().clamp_min(1)
+            total_action_samples = action_sample_count.sum().clamp_min(1)
+            stats[f"{region}_rear_upper_joint_sample_count"] = (
+                sample_count.sum().float()
+            )
+            stats[f"{region}_rear_upper_joint_action_sample_count"] = (
+                action_sample_count.sum().float()
+            )
+            for joint_idx, joint_name in enumerate(
+                self.rear_upper_joint_names
+            ):
+                prefix = f"{region}_{joint_name}"
+                stats[f"{prefix}_mean_range_rad"] = (
+                    episode_range[:, joint_idx].sum() / valid_count
+                )
+                stats[f"{prefix}_max_range_rad"] = torch.max(
+                    episode_range[:, joint_idx]
+                )
+                stats[f"{prefix}_velocity_rms_rad_s"] = torch.sqrt(
+                    velocity_sum[:, joint_idx].sum() / total_samples
+                )
+                stats[f"{prefix}_action_delta_rms"] = torch.sqrt(
+                    action_delta_sum[:, joint_idx].sum()
+                    / total_action_samples
+                )
+        episode_lengths = self.episode_length_buf[env_ids].clamp_min(1)
+        episode_excursion_mean = (
+            self.rear_excursion_raw_sum[env_ids] / episode_lengths
+        )
+        stats["rear_upper_joint_excursion_raw_mean"] = (
+            episode_excursion_mean.mean()
+        )
+        stats["rear_upper_joint_excursion_raw_p95"] = torch.quantile(
+            episode_excursion_mean.float(), 0.95
+        )
+        stats["rear_upper_joint_excursion_raw_max"] = torch.max(
+            self.rear_excursion_raw_max[env_ids]
+        )
+        return stats
+
+    def _get_landing_statistics(self, env_ids):
+        """Summarize landing-phase progress and individual pass conditions."""
+        tracker = self.box_progress
+        landing_steps = tracker.landing_phase_step_count[env_ids].sum()
+        denominator = landing_steps.clamp_min(1)
+        stats = {
+            "landing_phase_entry_rate": (
+                (tracker.landing_phase_start_step[env_ids] >= 0)
+                .float()
+                .mean()
+            ),
+            "landing_score_mean": (
+                tracker.landing_score_sum[env_ids].sum() / denominator
+            ),
+            "landing_score_max": torch.max(
+                tracker.best_landing_score[env_ids]
+            ),
+            "best_landing_score_mean": tracker.best_landing_score[
+                env_ids
+            ].mean(),
+            "max_consecutive_valid_landing_steps": torch.max(
+                tracker.max_consecutive_valid_landing_steps[env_ids]
+            ).float(),
+            "mean_best_landing_hold_steps": tracker.best_landing_hold_steps[
+                env_ids
+            ].float().mean(),
+        }
+        for name in (
+            "landing_zone",
+            "landing_forward_speed",
+            "landing_vertical_speed",
+            "landing_roll",
+            "landing_pitch",
+            "landing_height",
+            "landing_two_feet",
+            "landing_rear_support",
+            "landing_no_body_contact",
+        ):
+            stats[f"{name}_pass_rate"] = (
+                getattr(tracker, f"{name}_pass_count")[env_ids].sum()
+                / denominator
+            )
+        return stats
+
     def _reset_motion_quality_statistics(self, env_ids):
         """Clear posture and action-change accumulators."""
         self.abs_roll_sum[env_ids] = 0.0
@@ -912,10 +1250,18 @@ class LeggedRobotBox(LeggedRobot):
         self.thigh_collision_count[env_ids] = 0
         self.calf_collision_count[env_ids] = 0
         self.body_collision_count[env_ids] = 0
-        self.rear_support_missing_history[env_ids] = False
-        self.rear_support_missing_counter[env_ids] = 0
+        self.rear_support_history[env_ids] = False
+        self.airborne_history[env_ids] = False
+        self.rear_support_valid_history[env_ids] = False
+        self.rear_support_window_ratio[env_ids] = 0.0
+        self.flat_airborne_window_ratio[env_ids] = 0.0
         self.rear_support_missing_count[env_ids] = 0
         self.max_rear_support_missing_steps[env_ids] = 0
+        self.current_ground_contact_feet_sum[env_ids] = 0.0
+        self.current_rear_support_count[env_ids] = 0
+        self.flat_airborne_count[env_ids] = 0
+        self.rear_excursion_raw_sum[env_ids] = 0.0
+        self.rear_excursion_raw_max[env_ids] = 0.0
 
     def _reset_flat_gait_statistics(self, env_ids):
         """Clear flat-ground posture and contact statistics."""
@@ -930,6 +1276,22 @@ class LeggedRobotBox(LeggedRobot):
         self.flat_foot_contact_transition_count[env_ids] = 0
         self.previous_flat_foot_contact[env_ids] = False
         self.previous_flat_contact_valid[env_ids] = False
+
+    def _reset_rear_upper_joint_statistics(self, env_ids):
+        """Clear rear hip/thigh swing statistics for selected environments."""
+        for region in ("flat", "box"):
+            getattr(self, f"rear_upper_{region}_sample_count")[env_ids] = 0
+            getattr(
+                self, f"rear_upper_{region}_action_sample_count"
+            )[env_ids] = 0
+            getattr(self, f"rear_upper_{region}_pos_min")[env_ids] = 10.0
+            getattr(self, f"rear_upper_{region}_pos_max")[env_ids] = -10.0
+            getattr(
+                self, f"rear_upper_{region}_vel_sq_sum"
+            )[env_ids] = 0.0
+            getattr(
+                self, f"rear_upper_{region}_action_delta_sq_sum"
+            )[env_ids] = 0.0
 
     def check_termination(self):
         super().check_termination()
@@ -971,14 +1333,24 @@ class LeggedRobotBox(LeggedRobot):
             body_contact=body_contact,
             body_contact_force=body_contact_force,
             base_vertical_velocity=self.root_states[:, 9],
+            base_forward_velocity=self.base_lin_vel[:, 0],
             natural_timeout=natural_timeout,
+            episode_step=self.episode_length_buf,
             landing_end_x=self.course_landing_end_x,
             external_fall=self.flat_low_base_height_failure_buf,
         )
+        self._apply_landing_commands()
         self._update_course_progress_reward()
         self.box_progress.apply_termination(
             self.reset_buf, self.time_out_buf
         )
+
+    def _apply_landing_commands(self):
+        """Command a full stop immediately after the required final box."""
+        landing_phase = (
+            self.next_box_idx >= self.box_progress.required_boxes
+        )
+        self.commands[landing_phase, :3] = 0.0
 
     def _fill_extras(self, env_ids):
         raw_reward_sums = {
@@ -1011,6 +1383,15 @@ class LeggedRobotBox(LeggedRobot):
         episode["landing_overrun_rate"] = (
             self.landing_overrun_buf[env_ids].float().mean()
         )
+        episode["landing_timeout_rate"] = (
+            self.landing_timeout_buf[env_ids].float().mean()
+        )
+        episode["lateral_out_of_track_rate"] = (
+            self.lateral_out_of_track_buf[env_ids].float().mean()
+        )
+        episode["backward_out_of_track_rate"] = (
+            self.backward_out_of_track_buf[env_ids].float().mean()
+        )
         episode["fall_rate"] = self.fall_buf[env_ids].float().mean()
         episode["body_contact_window_failure_rate"] = (
             self.body_contact_window_failure_buf[env_ids].float().mean()
@@ -1031,6 +1412,8 @@ class LeggedRobotBox(LeggedRobot):
         episode.update(self._get_speed_statistics(env_ids))
         episode.update(self._get_motion_quality_statistics(env_ids))
         episode.update(self._get_flat_gait_statistics(env_ids))
+        episode.update(self._get_rear_upper_joint_statistics(env_ids))
+        episode.update(self._get_landing_statistics(env_ids))
         for name, values in raw_reward_sums.items():
             episode[f"raw/rew_{name}"] = values.mean()
         collision_parts = (
@@ -1050,14 +1433,17 @@ class LeggedRobotBox(LeggedRobot):
             "missed_box_failure": self.missed_box_buf[env_ids],
             "out_of_track_failure": (
                 self.out_of_track_buf[env_ids]
-                | self.landing_overrun_buf[env_ids]
             ),
+            "landing_overrun": self.landing_overrun_buf[env_ids],
+            "landing_timeout": self.landing_timeout_buf[env_ids],
             "incomplete": self.incomplete_buf[env_ids],
             "early_failure": self.box_progress.failure_buf[env_ids]
             & (
                 self.episode_length_buf[env_ids]
                 <= int(np.ceil(1.0 / self.dt))
             ),
+            "late_failure": self.generic_failure_buf[env_ids]
+            & (self.task_progress_buf[env_ids] >= 0.75),
         }
         for result_name, result_mask in result_masks.items():
             result_count = result_mask.sum()
@@ -1072,9 +1458,79 @@ class LeggedRobotBox(LeggedRobot):
             episode[f"raw/{result_name}_episode_count"] = (
                 result_count.float()
             )
+        continuous_groups = {
+            "torque_penalty": ("exceed_torque_limits_l1norm",),
+            "action_rate_penalty": ("action_rate",),
+            "dof_vel_penalty": ("dof_vel",),
+            "height_penalty": ("flat_base_height",),
+            "collision_penalty": (
+                "body_collision",
+                "thigh_collision",
+                "calf_collision",
+            ),
+        }
+        continuous_names = (
+            "energy_substeps",
+            "torques",
+            "dof_error_named",
+            "dof_error",
+            "action_rate",
+            "dof_vel",
+            "flat_orientation",
+            "flat_base_height",
+            "body_collision",
+            "thigh_collision",
+            "calf_collision",
+            "rear_support_missing",
+            "flat_airborne",
+            "rear_upper_joint_excursion",
+            "exceed_dof_pos_limits",
+            "exceed_torque_limits_l1norm",
+        )
+        for result_name in ("success", "landing_overrun", "early_failure"):
+            result_mask = result_masks[result_name]
+            result_count = result_mask.sum().clamp_min(1)
+            for metric_name, reward_names in continuous_groups.items():
+                values = sum(
+                    (
+                        raw_reward_sums[name]
+                        for name in reward_names
+                        if name in raw_reward_sums
+                    ),
+                    torch.zeros_like(raw_total_return),
+                )
+                episode[f"raw/{result_name}_{metric_name}"] = (
+                    torch.where(
+                        result_mask,
+                        values,
+                        torch.zeros_like(values),
+                    ).sum()
+                    / result_count
+                )
+            continuous_values = sum(
+                (
+                    raw_reward_sums[name]
+                    for name in continuous_names
+                    if name in raw_reward_sums
+                ),
+                torch.zeros_like(raw_total_return),
+            )
+            episode[f"raw/{result_name}_continuous_penalty_total"] = (
+                torch.where(
+                    result_mask,
+                    continuous_values,
+                    torch.zeros_like(continuous_values),
+                ).sum()
+                / result_count
+            )
         for box_idx in range(self.box_progress.required_boxes):
             episode[f"box_{box_idx + 1}_pass_rate"] = (
                 (self.passed_box_count[env_ids] > box_idx).float().mean()
+            )
+            episode[f"box_{box_idx + 1}_rear_contact_rate"] = (
+                self.box_progress.rear_contacted_boxes[
+                    env_ids, box_idx
+                ].float().mean()
             )
         for layout_idx in range(self.terrain.num_unique_layouts):
             layout_mask = self.layout_indices[env_ids] == layout_idx
@@ -1103,6 +1559,8 @@ class LeggedRobotBox(LeggedRobot):
             self._reset_motion_quality_statistics(env_ids)
         if hasattr(self, "flat_base_height_sum"):
             self._reset_flat_gait_statistics(env_ids)
+        if hasattr(self, "rear_upper_flat_sample_count"):
+            self._reset_rear_upper_joint_statistics(env_ids)
         if hasattr(self, "progress_reward_initialized"):
             self.progress_reward_start[env_ids] = 0.0
             self.rewarded_progress_ratio[env_ids] = 0.0
@@ -1123,9 +1581,9 @@ class LeggedRobotBox(LeggedRobot):
         cfg = self.cfg.rewards
         num_envs = self.root_states.shape[0]
         env_ids = torch.arange(num_envs, device=self.root_states.device)
-        # Keep only the last target's exit ramp after course completion so the
-        # fifth-box landing does not see an instantaneous 1.2 -> 0.7 m/s jump.
-        active = self.next_box_idx <= self.box_progress.required_boxes
+        # Landing is a dedicated stop phase and must not inherit the final
+        # obstacle's acceleration allowance.
+        active = self.next_box_idx < self.box_progress.required_boxes
         target_indices = self.next_box_idx.clamp(
             max=self.box_progress.required_boxes - 1
         )
@@ -1216,7 +1674,12 @@ class LeggedRobotBox(LeggedRobot):
             min=0.0,
             max=1.0,
         )
-        return tracking * forward_fraction
+        command_gate = torch.where(
+            self.commands[:, 0].abs() > 1e-4,
+            forward_fraction,
+            torch.ones_like(forward_fraction),
+        )
+        return tracking * command_gate
 
     def _reward_tracking_ang_vel(self):
         """Zero-centered yaw tracking; a zero yaw error gives zero."""
@@ -1264,20 +1727,30 @@ class LeggedRobotBox(LeggedRobot):
         return self.course_progress_delta_buf
 
     def _reward_termination(self):
-        """Penalize failure by spatial task progress, never by elapsed time."""
-        floor = float(self.cfg.rewards.failure_progress_floor)
-        progress_multiplier = (
-            floor + (1.0 - floor) * (1.0 - self.task_progress_buf)
-        )
-        return self.box_progress.failure_buf.float() * progress_multiplier
+        """Penalize ordinary failure from -40 to -25 by spatial progress."""
+        progress_multiplier = 1.0 - 0.375 * self.task_progress_buf
+        return self.generic_failure_buf.float() * progress_multiplier
 
     def _reward_incomplete(self):
-        """Penalize reaching the task deadline without PPO bootstrapping."""
-        floor = float(self.cfg.rewards.failure_progress_floor)
-        progress_multiplier = (
-            floor + (1.0 - floor) * (1.0 - self.task_progress_buf)
-        )
+        """Penalize the 45-second deadline from -40 to -30 by progress."""
+        progress_multiplier = 1.0 - 0.25 * self.task_progress_buf
         return self.incomplete_buf.float() * progress_multiplier
+
+    def _reward_landing_overrun(self):
+        """Penalize crossing the landing-zone end before stabilizing."""
+        return self.landing_overrun_buf.float()
+
+    def _reward_landing_timeout(self):
+        """Penalize spending two seconds in the landing phase unsuccessfully."""
+        return self.landing_timeout_buf.float()
+
+    def _reward_landing_quality_progress(self):
+        """Reward only a new high-water mark in landing quality."""
+        return self.landing_quality_delta
+
+    def _reward_landing_hold_progress(self):
+        """Reward only a new high-water mark in stable landing duration."""
+        return self.landing_hold_delta
 
     def _reward_flat_orientation(self):
         """Penalize base tilt only outside the active box maneuver window."""
@@ -1287,25 +1760,49 @@ class LeggedRobotBox(LeggedRobot):
         return (
             tilt_square
             * (1.0 - self._box_speed_blend())
+            * (self.next_box_idx < self.box_progress.required_boxes).float()
             * LeggedRobotBox._effective_motion_quality_level(
                 self, "flat_orientation_floor"
             )
         )
 
     def _reward_flat_base_height(self):
-        """Penalize a crouched base only outside obstacle maneuvers."""
-        height_error = (
-            self._base_height_above_terrain()
-            - self.cfg.rewards.flat_base_height_target
+        """Penalize height only outside a support-aware neutral band."""
+        base_height = self._base_height_above_terrain()
+        low_error = torch.relu(
+            (self.cfg.rewards.flat_height_min - base_height)
+            / self.cfg.rewards.flat_height_normalization
         )
-        finite_error = torch.where(
-            torch.isfinite(height_error),
-            height_error,
-            torch.zeros_like(height_error),
+        high_error = torch.relu(
+            (base_height - self.cfg.rewards.flat_height_max)
+            / self.cfg.rewards.flat_height_normalization
         )
+        height_penalty = torch.square(low_error) + torch.square(high_error)
+        foot_contact = (
+            torch.norm(
+                self.contact_forces[:, self.feet_indices, :], dim=-1
+            )
+            > self.cfg.box_progress.contact_force_threshold
+        )
+        enough_feet = foot_contact.sum(dim=1) >= 2
+        rear_support = foot_contact[:, self.rear_foot_local_indices].any(
+            dim=1
+        )
+        flat_mask = self._box_speed_blend() <= 0.0
+        before_landing = (
+            self.next_box_idx < self.box_progress.required_boxes
+        )
+        finite_height = torch.isfinite(base_height)
         return (
-            torch.square(finite_error)
-            * (1.0 - self._box_speed_blend())
+            torch.where(
+                finite_height,
+                height_penalty,
+                torch.zeros_like(height_penalty),
+            )
+            * flat_mask.float()
+            * before_landing.float()
+            * enough_feet.float()
+            * rear_support.float()
             * LeggedRobotBox._effective_motion_quality_level(
                 self, "flat_base_height_floor"
             )
@@ -1370,9 +1867,53 @@ class LeggedRobotBox(LeggedRobot):
         )
 
     def _reward_rear_support_missing(self):
-        """Penalize frequent front-only support inside a sliding window."""
-        missing_steps = int(self.cfg.rewards.rear_support_missing_steps)
-        return (self.rear_support_missing_counter >= missing_steps).float()
+        """Penalize a rear-support ratio below the configured flat target."""
+        target = float(self.cfg.rewards.rear_support_target_ratio)
+        deficit = torch.relu(
+            (target - self.rear_support_window_ratio) / max(target, 1e-6)
+        )
+        valid = (
+            (self._box_speed_blend() <= 0.0)
+            & (self.next_box_idx < self.box_progress.required_boxes)
+            & (
+                self.episode_length_buf
+                > int(self.cfg.rewards.rear_support_window_steps)
+            )
+        )
+        return torch.square(deficit) * valid.float()
+
+    def _reward_flat_airborne(self):
+        """Penalize excessive flat-ground flight without suppressing running."""
+        free_ratio = float(self.cfg.rewards.flat_airborne_free_ratio)
+        excess = torch.relu(
+            (self.flat_airborne_window_ratio - free_ratio)
+            / max(1.0 - free_ratio, 1e-6)
+        )
+        valid = (
+            (self._box_speed_blend() <= 0.0)
+            & (self.next_box_idx < self.box_progress.required_boxes)
+            & (
+                self.episode_length_buf
+                > int(self.cfg.rewards.rear_support_window_steps)
+            )
+        )
+        return torch.square(excess) * valid.float()
+
+    def _reward_rear_upper_joint_excursion(self):
+        """Return monitored rear-joint excess; Stage A gives it zero weight."""
+        return self._rear_upper_joint_excursion_raw(
+            self._near_box_for_speed_control()
+        )
+
+    def _reward_exceed_torque_limits_l1norm(self):
+        """Average normalized torque excess across substeps and joints."""
+        soft_limit = (
+            self.torque_limits * self.cfg.rewards.soft_torque_limit
+        ).clamp_min(1e-6)
+        normalized_excess = torch.relu(
+            torch.abs(self.substep_torques) - soft_limit
+        ) / soft_limit
+        return normalized_excess.mean(dim=(1, 2)).clamp(max=1.0)
 
     def _reward_lin_pos_y(self):
         """Penalize lateral displacement from the course centerline."""
