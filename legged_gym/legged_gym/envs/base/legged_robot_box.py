@@ -25,6 +25,12 @@ class LeggedRobotBox(LeggedRobot):
             ("RL", "RR"), "rear"
         )
         progress_cfg = self.cfg.box_progress
+        if progress_cfg.flat_low_base_height_threshold <= 0.0:
+            raise ValueError(
+                "flat_low_base_height_threshold must be positive."
+            )
+        if progress_cfg.flat_low_base_height_steps <= 0:
+            raise ValueError("flat_low_base_height_steps must be positive.")
         self.box_progress = BoxProgressTracker(
             num_envs=self.num_envs,
             num_feet=len(self.feet_indices),
@@ -90,6 +96,44 @@ class LeggedRobotBox(LeggedRobot):
         self.box_overspeed_count = torch.zeros_like(
             self.flat_forward_speed_count
         )
+        self.flat_base_height_sum = torch.zeros_like(self.forward_speed_sum)
+        self.flat_base_height_count = torch.zeros_like(
+            self.flat_forward_speed_count
+        )
+        self.min_flat_base_height = torch.full_like(
+            self.forward_speed_sum,
+            10.0,
+        )
+        self.flat_low_base_height_count = torch.zeros_like(
+            self.flat_forward_speed_count
+        )
+        self.flat_low_base_height_counter = torch.zeros_like(
+            self.flat_forward_speed_count
+        )
+        self.max_flat_low_base_height_steps = torch.zeros_like(
+            self.flat_forward_speed_count
+        )
+        self.flat_low_base_height_failure_buf = torch.zeros(
+            self.num_envs, dtype=torch.bool, device=self.device
+        )
+        self.flat_foot_contact_count = torch.zeros(
+            self.num_envs,
+            len(self.feet_indices),
+            dtype=torch.long,
+            device=self.device,
+        )
+        self.flat_foot_contact_transition_count = torch.zeros_like(
+            self.flat_foot_contact_count
+        )
+        self.previous_flat_foot_contact = torch.zeros(
+            self.num_envs,
+            len(self.feet_indices),
+            dtype=torch.bool,
+            device=self.device,
+        )
+        self.previous_flat_contact_valid = torch.zeros(
+            self.num_envs, dtype=torch.bool, device=self.device
+        )
         self.abs_roll_sum = torch.zeros_like(self.forward_speed_sum)
         self.max_abs_roll = torch.zeros_like(self.forward_speed_sum)
         self.abs_pitch_sum = torch.zeros_like(self.forward_speed_sum)
@@ -132,6 +176,25 @@ class LeggedRobotBox(LeggedRobot):
         self.body_collision_count = torch.zeros_like(
             self.dof_near_limit_count
         )
+        rear_support_window_steps = int(
+            self.cfg.rewards.rear_support_window_steps
+        )
+        rear_support_missing_steps = int(
+            self.cfg.rewards.rear_support_missing_steps
+        )
+        if rear_support_window_steps <= 0:
+            raise ValueError("rear_support_window_steps must be positive.")
+        if not 1 <= rear_support_missing_steps <= rear_support_window_steps:
+            raise ValueError(
+                "rear_support_missing_steps must be within the support window."
+            )
+        self.rear_support_missing_history = torch.zeros(
+            self.num_envs,
+            rear_support_window_steps,
+            dtype=torch.bool,
+            device=self.device,
+        )
+        self.rear_support_history_index = 0
         self.rear_support_missing_counter = torch.zeros_like(
             self.dof_near_limit_count
         )
@@ -347,6 +410,7 @@ class LeggedRobotBox(LeggedRobot):
         forward_speed = self.base_lin_vel[:, 0]
         box_mask = self._near_box_for_speed_control()
         self._update_speed_statistics(forward_speed, box_mask)
+        self._update_flat_gait_statistics(~box_mask)
         self._update_motion_quality_statistics()
         self._update_rear_support_state(box_mask)
 
@@ -361,19 +425,95 @@ class LeggedRobotBox(LeggedRobot):
         )
         rear_support = foot_contact[:, self.rear_foot_local_indices].any(dim=1)
         missing_rear_support = ~box_mask & front_support & ~rear_support
-        self.rear_support_missing_counter[:] = torch.where(
-            missing_rear_support,
-            self.rear_support_missing_counter + 1,
-            torch.zeros_like(self.rear_support_missing_counter),
+        self.rear_support_missing_history[
+            :, self.rear_support_history_index
+        ] = missing_rear_support
+        self.rear_support_history_index = (
+            self.rear_support_history_index + 1
+        ) % self.rear_support_missing_history.shape[1]
+        self.rear_support_missing_counter[:] = (
+            self.rear_support_missing_history.sum(dim=1)
         )
         self.max_rear_support_missing_steps[:] = torch.maximum(
             self.max_rear_support_missing_steps,
             self.rear_support_missing_counter,
         )
-        grace_steps = int(self.cfg.rewards.rear_support_grace_steps)
+        missing_steps = int(self.cfg.rewards.rear_support_missing_steps)
         self.rear_support_missing_count += (
-            self.rear_support_missing_counter >= grace_steps
+            self.rear_support_missing_counter >= missing_steps
         )
+
+    def _base_height_above_terrain(self):
+        """Return base height above the surface directly below the base."""
+        terrain_height = self.terrain.get_terrain_heights(
+            self.root_states[:, :3]
+        )
+        return self.root_states[:, 2] - terrain_height
+
+    def _filtered_foot_contacts(self):
+        """Filter one-frame mesh contact dropouts for gait statistics."""
+        threshold = self.cfg.box_progress.contact_force_threshold
+        current = (
+            torch.norm(
+                self.contact_forces[:, self.feet_indices, :], dim=-1
+            )
+            > threshold
+        )
+        previous = (
+            torch.norm(
+                self.last_contact_forces[:, self.feet_indices, :], dim=-1
+            )
+            > threshold
+        )
+        return current | previous
+
+    def _update_flat_gait_statistics(self, flat_mask):
+        """Track low-body posture, support duty, and flat-ground cadence."""
+        base_height = self._base_height_above_terrain()
+        valid_flat = flat_mask & torch.isfinite(base_height)
+        safe_height = torch.where(
+            valid_flat, base_height, torch.zeros_like(base_height)
+        )
+        self.flat_base_height_sum += safe_height
+        self.flat_base_height_count += valid_flat
+        self.min_flat_base_height[:] = torch.where(
+            valid_flat,
+            torch.minimum(self.min_flat_base_height, base_height),
+            self.min_flat_base_height,
+        )
+
+        low_height = valid_flat & (
+            base_height
+            < self.cfg.box_progress.flat_low_base_height_threshold
+        )
+        self.flat_low_base_height_counter[:] = torch.where(
+            low_height,
+            self.flat_low_base_height_counter + 1,
+            torch.zeros_like(self.flat_low_base_height_counter),
+        )
+        self.max_flat_low_base_height_steps[:] = torch.maximum(
+            self.max_flat_low_base_height_steps,
+            self.flat_low_base_height_counter,
+        )
+        self.flat_low_base_height_count += low_height
+        self.flat_low_base_height_failure_buf[:] = (
+            self.flat_low_base_height_counter
+            >= int(self.cfg.box_progress.flat_low_base_height_steps)
+        )
+
+        foot_contact = self._filtered_foot_contacts()
+        self.flat_foot_contact_count += (
+            foot_contact & valid_flat.unsqueeze(1)
+        )
+        transition_valid = (
+            valid_flat & self.previous_flat_contact_valid
+        ).unsqueeze(1)
+        self.flat_foot_contact_transition_count += (
+            (foot_contact != self.previous_flat_foot_contact)
+            & transition_valid
+        )
+        self.previous_flat_foot_contact[:] = foot_contact
+        self.previous_flat_contact_valid[:] = valid_flat
 
     def _update_motion_quality_statistics(self):
         """Accumulate posture and action-change metrics for each episode."""
@@ -686,6 +826,71 @@ class LeggedRobotBox(LeggedRobot):
             )
         return stats
 
+    def _get_flat_gait_statistics(self, env_ids):
+        """Summarize flat-ground body height, support duty, and cadence."""
+        flat_count = self.flat_base_height_count[env_ids].sum()
+        denominator = flat_count.clamp_min(1)
+        valid_envs = self.flat_base_height_count[env_ids] > 0
+        fallback_height = torch.full_like(
+            self.min_flat_base_height[env_ids],
+            10.0,
+        )
+        valid_minima = torch.where(
+            valid_envs,
+            self.min_flat_base_height[env_ids],
+            fallback_height,
+        )
+        minimum_height = torch.where(
+            valid_envs.any(),
+            valid_minima.min(),
+            torch.zeros((), device=self.device),
+        )
+        contact_counts = self.flat_foot_contact_count[env_ids].sum(dim=0)
+        transition_count = self.flat_foot_contact_transition_count[
+            env_ids
+        ].sum()
+        num_feet = len(self.feet_indices)
+        stats = {
+            "flat_base_height_mean_m": (
+                self.flat_base_height_sum[env_ids].sum() / denominator
+            ),
+            "flat_base_height_min_m": minimum_height,
+            "flat_low_base_height_ratio": (
+                self.flat_low_base_height_count[env_ids].sum()
+                / denominator
+            ),
+            "flat_low_base_height_failure_rate": (
+                self.flat_low_base_height_failure_buf[env_ids]
+                .float()
+                .mean()
+            ),
+            "max_flat_low_base_height_steps": torch.max(
+                self.max_flat_low_base_height_steps[env_ids]
+            ).float(),
+            "flat_mean_support_feet": contact_counts.sum() / denominator,
+            # A complete stance cycle has approximately one contact-on and
+            # one contact-off transition per foot.
+            "flat_step_frequency_hz": (
+                transition_count
+                / (2.0 * num_feet * denominator * self.dt)
+            ),
+        }
+        front_count = contact_counts[self.front_foot_local_indices].sum()
+        rear_count = contact_counts[self.rear_foot_local_indices].sum()
+        stats["flat_front_contact_duty_ratio"] = (
+            front_count
+            / (denominator * len(self.front_foot_local_indices))
+        )
+        stats["flat_rear_contact_duty_ratio"] = (
+            rear_count
+            / (denominator * len(self.rear_foot_local_indices))
+        )
+        for foot_idx, foot_name in enumerate(self.feet_names):
+            stats[f"flat_{foot_name}_contact_duty_ratio"] = (
+                contact_counts[foot_idx] / denominator
+            )
+        return stats
+
     def _reset_motion_quality_statistics(self, env_ids):
         """Clear posture and action-change accumulators."""
         self.abs_roll_sum[env_ids] = 0.0
@@ -707,9 +912,24 @@ class LeggedRobotBox(LeggedRobot):
         self.thigh_collision_count[env_ids] = 0
         self.calf_collision_count[env_ids] = 0
         self.body_collision_count[env_ids] = 0
+        self.rear_support_missing_history[env_ids] = False
         self.rear_support_missing_counter[env_ids] = 0
         self.rear_support_missing_count[env_ids] = 0
         self.max_rear_support_missing_steps[env_ids] = 0
+
+    def _reset_flat_gait_statistics(self, env_ids):
+        """Clear flat-ground posture and contact statistics."""
+        self.flat_base_height_sum[env_ids] = 0.0
+        self.flat_base_height_count[env_ids] = 0
+        self.min_flat_base_height[env_ids] = 10.0
+        self.flat_low_base_height_count[env_ids] = 0
+        self.flat_low_base_height_counter[env_ids] = 0
+        self.max_flat_low_base_height_steps[env_ids] = 0
+        self.flat_low_base_height_failure_buf[env_ids] = False
+        self.flat_foot_contact_count[env_ids] = 0
+        self.flat_foot_contact_transition_count[env_ids] = 0
+        self.previous_flat_foot_contact[env_ids] = False
+        self.previous_flat_contact_valid[env_ids] = False
 
     def check_termination(self):
         super().check_termination()
@@ -753,6 +973,7 @@ class LeggedRobotBox(LeggedRobot):
             base_vertical_velocity=self.root_states[:, 9],
             natural_timeout=natural_timeout,
             landing_end_x=self.course_landing_end_x,
+            external_fall=self.flat_low_base_height_failure_buf,
         )
         self._update_course_progress_reward()
         self.box_progress.apply_termination(
@@ -809,6 +1030,7 @@ class LeggedRobotBox(LeggedRobot):
         ].mean()
         episode.update(self._get_speed_statistics(env_ids))
         episode.update(self._get_motion_quality_statistics(env_ids))
+        episode.update(self._get_flat_gait_statistics(env_ids))
         for name, values in raw_reward_sums.items():
             episode[f"raw/rew_{name}"] = values.mean()
         collision_parts = (
@@ -879,6 +1101,8 @@ class LeggedRobotBox(LeggedRobot):
             self._reset_speed_statistics(env_ids)
         if hasattr(self, "abs_roll_sum"):
             self._reset_motion_quality_statistics(env_ids)
+        if hasattr(self, "flat_base_height_sum"):
+            self._reset_flat_gait_statistics(env_ids)
         if hasattr(self, "progress_reward_initialized"):
             self.progress_reward_start[env_ids] = 0.0
             self.rewarded_progress_ratio[env_ids] = 0.0
@@ -957,6 +1181,13 @@ class LeggedRobotBox(LeggedRobot):
         level = float(getattr(self, "motion_quality_level", 1.0))
         return floor + (1.0 - floor) * level
 
+    def _effective_speed_penalty_level(self, floor_name):
+        """Blend an always-on speed safety floor with the speed curriculum."""
+        rewards_cfg = getattr(getattr(self, "cfg", None), "rewards", None)
+        floor = float(getattr(rewards_cfg, floor_name, 0.0))
+        level = float(getattr(self, "speed_penalty_level", 1.0))
+        return floor + (1.0 - floor) * level
+
     def _reward_speed_error_square(self):
         """Penalize command error while preserving a short box-speed allowance."""
         speed_error = self.base_lin_vel[:, 0] - self.commands[:, 0]
@@ -966,8 +1197,10 @@ class LeggedRobotBox(LeggedRobot):
             torch.relu(speed_error - allowance),
             speed_error,
         )
-        return torch.square(adjusted_error) * float(
-            getattr(self, "speed_penalty_level", 1.0)
+        return torch.square(adjusted_error) * (
+            LeggedRobotBox._effective_speed_penalty_level(
+                self, "speed_error_floor"
+            )
         )
 
     def _reward_forward_speed_tracking(self):
@@ -1020,8 +1253,10 @@ class LeggedRobotBox(LeggedRobot):
             )
         )
         excess_speed = torch.relu(self.base_lin_vel[:, 0] - speed_limit)
-        return torch.square(excess_speed) * float(
-            getattr(self, "speed_penalty_level", 1.0)
+        return torch.square(excess_speed) * (
+            LeggedRobotBox._effective_speed_penalty_level(
+                self, "overspeed_floor"
+            )
         )
 
     def _reward_course_progress(self):
@@ -1057,6 +1292,25 @@ class LeggedRobotBox(LeggedRobot):
             )
         )
 
+    def _reward_flat_base_height(self):
+        """Penalize a crouched base only outside obstacle maneuvers."""
+        height_error = (
+            self._base_height_above_terrain()
+            - self.cfg.rewards.flat_base_height_target
+        )
+        finite_error = torch.where(
+            torch.isfinite(height_error),
+            height_error,
+            torch.zeros_like(height_error),
+        )
+        return (
+            torch.square(finite_error)
+            * (1.0 - self._box_speed_blend())
+            * LeggedRobotBox._effective_motion_quality_level(
+                self, "flat_base_height_floor"
+            )
+        )
+
     def _reward_dof_error_named(self):
         return super()._reward_dof_error_named() * (
             LeggedRobotBox._effective_motion_quality_level(
@@ -1068,6 +1322,14 @@ class LeggedRobotBox(LeggedRobot):
         return super()._reward_dof_error() * (
             LeggedRobotBox._effective_motion_quality_level(
                 self, "dof_error_floor"
+            )
+        )
+
+    def _reward_dof_vel(self):
+        """Lightly suppress high-frequency joint motion at every stage."""
+        return super()._reward_dof_vel() * (
+            LeggedRobotBox._effective_motion_quality_level(
+                self, "dof_vel_floor"
             )
         )
 
@@ -1108,9 +1370,9 @@ class LeggedRobotBox(LeggedRobot):
         )
 
     def _reward_rear_support_missing(self):
-        """Penalize prolonged front-only support outside box maneuvers."""
-        grace_steps = int(self.cfg.rewards.rear_support_grace_steps)
-        return (self.rear_support_missing_counter >= grace_steps).float()
+        """Penalize frequent front-only support inside a sliding window."""
+        missing_steps = int(self.cfg.rewards.rear_support_missing_steps)
+        return (self.rear_support_missing_counter >= missing_steps).float()
 
     def _reward_lin_pos_y(self):
         """Penalize lateral displacement from the course centerline."""

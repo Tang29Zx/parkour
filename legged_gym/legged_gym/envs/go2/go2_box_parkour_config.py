@@ -60,11 +60,15 @@ class Go2BoxParkourCfg(DebugGo2BoxCfg):
             tracking_ang_vel = 0.2
             forward_speed_tracking = 0.5
             course_progress = 1000.0
-            # V15 restores valid four-leg motion before precise speed control.
+            # V16 restores valid four-leg motion before precise speed control.
             speed_error_square = 0.0
-            overspeed = 0.0
-            action_rate = -0.01
+            # This is only a weak safety cap; exact 0.5 m/s tracking remains
+            # disabled during gait repair.
+            overspeed = -0.5
+            action_rate = -0.02
             flat_orientation = -0.5
+            flat_base_height = -10.0
+            dof_vel = -2e-4
             lin_pos_y = -0.1
             yaw_abs = -0.1
             energy_substeps = -2e-7
@@ -90,10 +94,16 @@ class Go2BoxParkourCfg(DebugGo2BoxCfg):
         motion_quality_initial_level = 0.0
         body_collision_floor = 1.0
         leg_collision_floor = 0.25
-        flat_orientation_floor = 0.25
-        action_rate_floor = 0.10
-        dof_error_floor = 0.10
-        rear_support_grace_steps = 15
+        flat_orientation_floor = 0.50
+        flat_base_height_floor = 1.0
+        action_rate_floor = 0.50
+        dof_error_floor = 0.25
+        dof_vel_floor = 0.25
+        speed_error_floor = 0.0
+        overspeed_floor = 1.0
+        rear_support_window_steps = 25
+        rear_support_missing_steps = 8
+        flat_base_height_target = 0.34
         # Track the command closely on flat ground. Near a box, allow a brief
         # positive speed error for jumping or climbing without rewarding it.
         # Smoothly blend the local speed limit over these distances. Only the
@@ -102,12 +112,12 @@ class Go2BoxParkourCfg(DebugGo2BoxCfg):
         box_speed_ramp_down_distance = 0.5
         box_lateral_margin = 0.2
         box_speed_allowance = 0.5
-        flat_speed_limit = 0.7
-        flat_severe_speed_limit = 0.8
-        box_speed_limit = 1.2
-        # Task failure remains costly even after all boxes are passed but the
-        # landing has not been completed.
-        failure_progress_floor = 0.5
+        flat_speed_limit = 1.2
+        flat_severe_speed_limit = 1.5
+        box_speed_limit = 1.8
+        # Do not make a late failure cheaper than an early failure. With a
+        # floor of one every unsafe termination is an actual -40 reward.
+        failure_progress_floor = 1.0
         leg_contact_force_threshold = 0.1
         body_collision_force_threshold = 1.0
         dof_near_limit_fraction = 0.15
@@ -134,6 +144,8 @@ class Go2BoxParkourCfg(DebugGo2BoxCfg):
         roll_threshold = 1.4
         pitch_threshold = 1.6
         base_height_threshold = 0.15
+        flat_low_base_height_threshold = 0.20
+        flat_low_base_height_steps = 25
         lateral_limit = 0.8
 
 
@@ -155,7 +167,7 @@ class Go2BoxParkourCfgPPO(Go2RoughCfgPPO):
         actor_finetune_learning_rate = 2e-5
         actor_finetune_clip_param = 0.1
         actor_finetune_entropy_coef = 0.001
-        # The 11300 Actor initializes V15 but is not a behavior reference.
+        # The 11300 Actor initializes V16 but is not a behavior reference.
         reference_kl_min_coef = 0.0
         reference_kl_max_coef = 0.0
         reference_kl_start_coef = 0.0
@@ -200,7 +212,7 @@ class Go2BoxParkourCfgPPO(Go2RoughCfgPPO):
 
     class runner(Go2RoughCfgPPO.runner):
         experiment_name = "go2_box_parkour"
-        run_name = "five_box_v15_gait_repair_from11300"
+        run_name = "five_box_v16_flat_gait_repair_from11300"
         # Partial episodes generated at process startup do not represent the
         # checkpoint policy and must not drive the box curriculum or KL state.
         init_at_random_ep_len = False
@@ -212,7 +224,7 @@ class Go2BoxParkourCfgPPO(Go2RoughCfgPPO):
             "Jul19_22-22-00_five_box_v4_from11200",
         )
         checkpoint = 11300
-        # Select Critic reset explicitly on the first CLI launch. Later V15
+        # Select Critic reset explicitly on the first CLI launch. Later V16
         # resumes must not reset the learned Critic again.
         ckpt_manipulator = None
         max_iterations = 300

@@ -604,9 +604,11 @@ class BoxRewardTest(unittest.TestCase):
             "tracking_ang_vel": 0.2,
             "forward_speed_tracking": 0.5,
             "speed_error_square": 0.0,
-            "overspeed": 0.0,
-            "action_rate": -0.01,
+            "overspeed": -0.5,
+            "action_rate": -0.02,
             "flat_orientation": -0.5,
+            "flat_base_height": -10.0,
+            "dof_vel": -2e-4,
             "lin_pos_y": -0.1,
             "yaw_abs": -0.1,
             "energy_substeps": -2e-7,
@@ -637,9 +639,15 @@ class BoxRewardTest(unittest.TestCase):
         )
         self.assertEqual(self.env_cfg.rewards.body_collision_floor, 1.0)
         self.assertEqual(self.env_cfg.rewards.leg_collision_floor, 0.25)
-        self.assertEqual(self.env_cfg.rewards.flat_orientation_floor, 0.25)
-        self.assertEqual(self.env_cfg.rewards.action_rate_floor, 0.10)
-        self.assertEqual(self.env_cfg.rewards.dof_error_floor, 0.10)
+        self.assertEqual(self.env_cfg.rewards.flat_orientation_floor, 0.50)
+        self.assertEqual(self.env_cfg.rewards.flat_base_height_floor, 1.0)
+        self.assertEqual(self.env_cfg.rewards.action_rate_floor, 0.50)
+        self.assertEqual(self.env_cfg.rewards.dof_error_floor, 0.25)
+        self.assertEqual(self.env_cfg.rewards.dof_vel_floor, 0.25)
+        self.assertEqual(self.env_cfg.rewards.overspeed_floor, 1.0)
+        self.assertEqual(self.env_cfg.rewards.flat_base_height_target, 0.34)
+        self.assertEqual(self.env_cfg.rewards.rear_support_window_steps, 25)
+        self.assertEqual(self.env_cfg.rewards.rear_support_missing_steps, 8)
         progress = self.env_cfg.box_progress
         self.assertEqual(progress.front_contact_required_steps, 2)
         self.assertEqual(progress.rear_contact_required_steps, 2)
@@ -652,6 +660,8 @@ class BoxRewardTest(unittest.TestCase):
         self.assertEqual(progress.landing_pitch_threshold, 0.45)
         self.assertEqual(progress.landing_base_height_threshold, 0.22)
         self.assertEqual(progress.landing_vertical_speed_threshold, 0.5)
+        self.assertEqual(progress.flat_low_base_height_threshold, 0.20)
+        self.assertEqual(progress.flat_low_base_height_steps, 25)
         self.assertFalse(self.env_cfg.rewards.only_positive_rewards)
         self.assertFalse(hasattr(scales, "lazy_stop"))
 
@@ -669,7 +679,7 @@ class BoxRewardTest(unittest.TestCase):
             ),
             task_progress_buf=torch.tensor([1.0, 0.5, 0.25]),
             cfg=SimpleNamespace(
-                rewards=SimpleNamespace(failure_progress_floor=0.5)
+                rewards=SimpleNamespace(failure_progress_floor=1.0)
             ),
         )
         front_foot = self.LeggedRobotBox._reward_box_front_foot_contact(env)
@@ -683,27 +693,27 @@ class BoxRewardTest(unittest.TestCase):
         self.assertEqual(rear_foot.tolist(), [0.0, 1.0, 0.0])
         self.assertEqual(passed.tolist(), [1.0, 0.0, 0.0])
         self.assertEqual(success.tolist(), [1.0, 0.0, 0.0])
-        self.assertEqual(incomplete.tolist(), [0.0, 0.75, 0.0])
-        self.assertEqual(termination.tolist(), [0.0, 0.0, 0.875])
+        self.assertEqual(incomplete.tolist(), [0.0, 1.0, 0.0])
+        self.assertEqual(termination.tolist(), [0.0, 0.0, 1.0])
 
-    def test_failure_cost_depends_on_progress_not_elapsed_time(self):
+    def test_failure_cost_is_constant_across_progress(self):
         env = SimpleNamespace(
             box_progress=SimpleNamespace(
                 failure_buf=torch.tensor([True, True, True])
             ),
             task_progress_buf=torch.tensor([0.0, 0.0, 0.8]),
             cfg=SimpleNamespace(
-                rewards=SimpleNamespace(failure_progress_floor=0.5)
+                rewards=SimpleNamespace(failure_progress_floor=1.0)
             ),
         )
         multiplier = self.LeggedRobotBox._reward_termination(env)
         actual = multiplier * self.env_cfg.rewards.scales.termination * 0.02
 
         torch.testing.assert_close(
-            actual, torch.tensor([-40.0, -40.0, -24.0])
+            actual, torch.tensor([-40.0, -40.0, -40.0])
         )
         self.assertEqual(actual[0].item(), actual[1].item())
-        self.assertLess(actual[0].item(), actual[2].item())
+        self.assertEqual(actual[0].item(), actual[2].item())
 
     def make_speed_reward_env(self):
         rewards = SimpleNamespace(
@@ -711,16 +721,22 @@ class BoxRewardTest(unittest.TestCase):
             box_speed_ramp_down_distance=0.5,
             box_lateral_margin=0.2,
             box_speed_allowance=0.5,
-            flat_speed_limit=0.7,
-            flat_severe_speed_limit=0.8,
-            box_speed_limit=1.2,
+            flat_speed_limit=1.2,
+            flat_severe_speed_limit=1.5,
+            box_speed_limit=1.8,
             forward_speed_tracking_sigma=0.25,
             body_collision_floor=1.0,
             leg_collision_floor=0.25,
-            flat_orientation_floor=0.25,
-            action_rate_floor=0.10,
-            dof_error_floor=0.10,
-            rear_support_grace_steps=15,
+            flat_orientation_floor=0.50,
+            flat_base_height_floor=1.0,
+            action_rate_floor=0.50,
+            dof_error_floor=0.25,
+            dof_vel_floor=0.25,
+            speed_error_floor=0.0,
+            overspeed_floor=1.0,
+            rear_support_window_steps=25,
+            rear_support_missing_steps=8,
+            flat_base_height_target=0.34,
         )
         single_bounds = torch.tensor(
             [
@@ -783,11 +799,13 @@ class BoxRewardTest(unittest.TestCase):
 
     def test_overspeed_is_square_with_flat_and_box_margins(self):
         env = self.make_speed_reward_env()
+        env.speed_penalty_level = 0.0
+        env.base_lin_vel[:, 0] = 2.0
         reward = self.LeggedRobotBox._reward_overspeed(env)
 
         blend = self.LeggedRobotBox._box_speed_blend(env)
-        limits = 0.7 + blend * 0.5
-        torch.testing.assert_close(reward, torch.square(torch.relu(1.0 - limits)))
+        limits = 1.2 + blend * 0.6
+        torch.testing.assert_close(reward, torch.square(torch.relu(2.0 - limits)))
 
     def test_speed_and_motion_levels_scale_separate_penalties(self):
         env = self.make_speed_reward_env()
@@ -799,7 +817,15 @@ class BoxRewardTest(unittest.TestCase):
         )
         torch.testing.assert_close(
             self.LeggedRobotBox._reward_overspeed(env),
-            torch.zeros(6),
+            torch.square(
+                torch.relu(
+                    1.0
+                    - (
+                        1.2
+                        + 0.6 * self.LeggedRobotBox._box_speed_blend(env)
+                    )
+                )
+            ),
         )
 
         env.speed_penalty_level = 0.5
@@ -821,12 +847,12 @@ class BoxRewardTest(unittest.TestCase):
         env.motion_quality_level = 0.0
         torch.testing.assert_close(
             self.LeggedRobotBox._reward_action_rate(env),
-            torch.full((6,), 0.2),
+            torch.full((6,), 1.0),
         )
         env.motion_quality_level = 0.5
         torch.testing.assert_close(
             self.LeggedRobotBox._reward_action_rate(env),
-            torch.full((6,), 1.1),
+            torch.full((6,), 1.5),
         )
 
     def test_motion_quality_floors_remain_enabled_at_level_zero(self):
@@ -835,9 +861,11 @@ class BoxRewardTest(unittest.TestCase):
         expected = {
             "body_collision_floor": 1.0,
             "leg_collision_floor": 0.25,
-            "flat_orientation_floor": 0.25,
-            "action_rate_floor": 0.10,
-            "dof_error_floor": 0.10,
+            "flat_orientation_floor": 0.50,
+            "flat_base_height_floor": 1.0,
+            "action_rate_floor": 0.50,
+            "dof_error_floor": 0.25,
+            "dof_vel_floor": 0.25,
         }
         for floor_name, expected_level in expected.items():
             self.assertAlmostEqual(
@@ -865,15 +893,22 @@ class BoxRewardTest(unittest.TestCase):
         env.rear_support_missing_counter = torch.zeros(3, dtype=torch.long)
         env.rear_support_missing_count = torch.zeros(3, dtype=torch.long)
         env.max_rear_support_missing_steps = torch.zeros(3, dtype=torch.long)
+        env.rear_support_missing_history = torch.zeros(
+            3, 25, dtype=torch.bool
+        )
+        env.rear_support_history_index = 0
         env.cfg = SimpleNamespace(
             box_progress=SimpleNamespace(contact_force_threshold=1.0),
-            rewards=SimpleNamespace(rear_support_grace_steps=15),
+            rewards=SimpleNamespace(
+                rear_support_window_steps=25,
+                rear_support_missing_steps=8,
+            ),
         )
         # Environment 0 is front-only, environment 1 is inside a box window,
         # and environment 2 is airborne with no supporting feet.
         env.contact_forces[:2, 0, 2] = 2.0
         box_mask = torch.tensor([False, True, False])
-        for _ in range(15):
+        for _ in range(8):
             self.LeggedRobotBox._update_rear_support_state(env, box_mask)
 
         penalty = self.LeggedRobotBox._reward_rear_support_missing(env)
@@ -881,7 +916,12 @@ class BoxRewardTest(unittest.TestCase):
 
         env.contact_forces[0, 2, 2] = 2.0
         self.LeggedRobotBox._update_rear_support_state(env, box_mask)
-        self.assertEqual(env.rear_support_missing_counter[0].item(), 0)
+        self.assertEqual(env.rear_support_missing_counter[0].item(), 8)
+        # One rear-foot tap no longer erases the recent front-only history.
+        self.assertEqual(
+            self.LeggedRobotBox._reward_rear_support_missing(env)[0].item(),
+            1.0,
+        )
 
     def test_course_progress_reward_is_monotonic_and_non_repeatable(self):
         env = SimpleNamespace(
@@ -951,6 +991,22 @@ class BoxRewardTest(unittest.TestCase):
         blend = self.LeggedRobotBox._box_speed_blend(env)
         torch.testing.assert_close(reward, 0.25 * (1.0 - blend))
 
+    def test_flat_base_height_target_is_disabled_in_box_window(self):
+        env = self.make_speed_reward_env()
+        env.root_states[:, 2] = torch.tensor(
+            [0.20, 0.25, 0.30, 0.34, 0.40, 0.50]
+        )
+        env.terrain = SimpleNamespace(
+            get_terrain_heights=lambda points: torch.zeros(points.shape[0])
+        )
+
+        reward = self.LeggedRobotBox._reward_flat_base_height(env)
+        blend = self.LeggedRobotBox._box_speed_blend(env)
+        expected = torch.square(env.root_states[:, 2] - 0.34) * (
+            1.0 - blend
+        )
+        torch.testing.assert_close(reward, expected)
+
     def test_action_rate_is_zero_for_unchanged_actions(self):
         env = SimpleNamespace(
             actions=torch.tensor([[1.0, -1.0], [0.5, 0.5]]),
@@ -965,7 +1021,7 @@ class BoxRewardTest(unittest.TestCase):
         reward = self.LeggedRobotBox._reward_action_rate(env)
         torch.testing.assert_close(reward, torch.zeros(2))
 
-    def test_v15_valid_completion_beats_waiting_and_immediate_failure(self):
+    def test_v16_valid_completion_beats_waiting_and_immediate_failure(self):
         scales = self.env_cfg.rewards.scales
         dt = 0.02
         command = 0.5
@@ -993,7 +1049,7 @@ class BoxRewardTest(unittest.TestCase):
         self.assertGreater(target_return, immediate_failure_return)
         self.assertLessEqual(waiting_return, immediate_failure_return)
         self.assertEqual(scales.speed_error_square, 0.0)
-        self.assertEqual(scales.overspeed, 0.0)
+        self.assertEqual(scales.overspeed, -0.5)
 
     def test_speed_statistics_are_finite_and_reset_to_zero(self):
         env = self.make_speed_reward_env()
@@ -1045,6 +1101,9 @@ class BoxRewardTest(unittest.TestCase):
             max_body_contact_window_count=torch.zeros(
                 num_envs, dtype=torch.long
             ),
+        )
+        env.rear_support_missing_history = torch.zeros(
+            num_envs, 25, dtype=torch.bool
         )
         for name in (
             "abs_roll_sum",
@@ -1109,6 +1168,97 @@ class BoxRewardTest(unittest.TestCase):
         ):
             self.assertEqual(reset_stats[name].item(), 0.0)
 
+    def test_flat_gait_statistics_detect_persistent_low_body(self):
+        env = object.__new__(self.LeggedRobotBox)
+        num_envs = 2
+        num_feet = 4
+        env.device = "cpu"
+        env.dt = 0.02
+        env.cfg = SimpleNamespace(
+            rewards=SimpleNamespace(flat_base_height_target=0.34),
+            box_progress=SimpleNamespace(
+                contact_force_threshold=1.0,
+                flat_low_base_height_threshold=0.22,
+                flat_low_base_height_steps=3,
+            ),
+        )
+        env.root_states = torch.zeros(num_envs, 13)
+        env.root_states[:, 2] = torch.tensor([0.20, 0.34])
+        env.terrain = SimpleNamespace(
+            get_terrain_heights=lambda points: torch.zeros(points.shape[0])
+        )
+        env.feet_indices = torch.arange(num_feet)
+        env.feet_names = ["FL_foot", "FR_foot", "RL_foot", "RR_foot"]
+        env.front_foot_local_indices = torch.tensor([0, 1])
+        env.rear_foot_local_indices = torch.tensor([2, 3])
+        env.contact_forces = torch.zeros(num_envs, num_feet, 3)
+        env.last_contact_forces = torch.zeros_like(env.contact_forces)
+        env.contact_forces[:, :, 2] = 2.0
+        env.last_contact_forces[:, :, 2] = 2.0
+        env.flat_base_height_sum = torch.zeros(num_envs)
+        env.flat_base_height_count = torch.zeros(num_envs, dtype=torch.long)
+        env.min_flat_base_height = torch.full((num_envs,), 0.34)
+        env.flat_low_base_height_count = torch.zeros(
+            num_envs, dtype=torch.long
+        )
+        env.flat_low_base_height_counter = torch.zeros(
+            num_envs, dtype=torch.long
+        )
+        env.max_flat_low_base_height_steps = torch.zeros(
+            num_envs, dtype=torch.long
+        )
+        env.flat_low_base_height_failure_buf = torch.zeros(
+            num_envs, dtype=torch.bool
+        )
+        env.flat_foot_contact_count = torch.zeros(
+            num_envs, num_feet, dtype=torch.long
+        )
+        env.flat_foot_contact_transition_count = torch.zeros_like(
+            env.flat_foot_contact_count
+        )
+        env.previous_flat_foot_contact = torch.zeros(
+            num_envs, num_feet, dtype=torch.bool
+        )
+        env.previous_flat_contact_valid = torch.zeros(
+            num_envs, dtype=torch.bool
+        )
+
+        flat_mask = torch.ones(num_envs, dtype=torch.bool)
+        for _ in range(3):
+            self.LeggedRobotBox._update_flat_gait_statistics(env, flat_mask)
+
+        self.assertEqual(
+            env.flat_low_base_height_failure_buf.tolist(), [True, False]
+        )
+        stats = self.LeggedRobotBox._get_flat_gait_statistics(
+            env, torch.arange(num_envs)
+        )
+        self.assertTrue(all(torch.isfinite(value) for value in stats.values()))
+        self.assertAlmostEqual(stats["flat_base_height_mean_m"].item(), 0.27)
+        self.assertAlmostEqual(stats["flat_base_height_min_m"].item(), 0.20)
+        self.assertAlmostEqual(
+            stats["flat_low_base_height_ratio"].item(), 0.5
+        )
+        self.assertAlmostEqual(
+            stats["flat_low_base_height_failure_rate"].item(), 0.5
+        )
+        self.assertAlmostEqual(
+            stats["flat_rear_contact_duty_ratio"].item(), 1.0
+        )
+
+        self.LeggedRobotBox._reset_flat_gait_statistics(
+            env, torch.arange(num_envs)
+        )
+        reset_stats = self.LeggedRobotBox._get_flat_gait_statistics(
+            env, torch.arange(num_envs)
+        )
+        self.assertTrue(
+            all(torch.isfinite(value) for value in reset_stats.values())
+        )
+        self.assertTrue(
+            all(value.item() == 0.0 for value in reset_stats.values())
+        )
+
     def test_4096_event_reward_shapes(self):
         env = SimpleNamespace(
             front_foot_contact_buf=torch.zeros(4096, dtype=torch.bool),
@@ -1118,7 +1268,7 @@ class BoxRewardTest(unittest.TestCase):
             incomplete_buf=torch.zeros(4096, dtype=torch.bool),
             task_progress_buf=torch.zeros(4096),
             cfg=SimpleNamespace(
-                rewards=SimpleNamespace(failure_progress_floor=0.5)
+                rewards=SimpleNamespace(failure_progress_floor=1.0)
             ),
         )
         self.assertEqual(
@@ -1247,7 +1397,7 @@ class BoxRewardTest(unittest.TestCase):
         self.assertEqual(runner.checkpoint, 11300)
         self.assertEqual(
             runner.run_name,
-            "five_box_v15_gait_repair_from11300",
+            "five_box_v16_flat_gait_repair_from11300",
         )
         self.assertIsNone(runner.ckpt_manipulator)
         self.assertTrue(

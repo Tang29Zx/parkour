@@ -197,6 +197,7 @@ class BoxProgressTracker:
         natural_timeout,
         landing_end_x=None,
         external_timeout=None,
+        external_fall=None,
     ):
         """Advance progress by one control step and update event buffers."""
         self._clear_events()
@@ -320,12 +321,15 @@ class BoxProgressTracker:
         self.severe_body_impact_buf[:] = (
             body_contact_force >= self.severe_body_impact_force
         )
+        if external_fall is None:
+            external_fall = torch.zeros_like(natural_timeout)
         raw_fall = (
             (roll.abs() > self.roll_threshold)
             | (pitch.abs() > self.pitch_threshold)
             | (base_height < self.base_height_threshold)
             | self.body_contact_window_failure_buf
             | self.severe_body_impact_buf
+            | external_fall
         )
 
         lateral_offset = (base_positions[:, 1] - env_origins[:, 1]).abs()

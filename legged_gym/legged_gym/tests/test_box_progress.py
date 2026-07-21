@@ -61,6 +61,7 @@ class BoxProgressTrackerTest(unittest.TestCase):
         self.body_contact_force = torch.zeros(2)
         self.base_vertical_velocity = torch.zeros(2)
         self.natural_timeout = torch.zeros(2, dtype=torch.bool)
+        self.external_fall = torch.zeros(2, dtype=torch.bool)
 
     def update(self):
         self.tracker.update(
@@ -79,6 +80,7 @@ class BoxProgressTrackerTest(unittest.TestCase):
             base_vertical_velocity=self.base_vertical_velocity,
             natural_timeout=self.natural_timeout,
             landing_end_x=self.landing_end_x,
+            external_fall=self.external_fall,
         )
 
     def put_foot_on_box(self, env_idx, foot_idx, box_idx):
@@ -298,6 +300,17 @@ class BoxProgressTrackerTest(unittest.TestCase):
 
         self.assertTrue(self.tracker.severe_body_impact_buf[0])
         self.assertTrue(self.tracker.fall_buf[0])
+
+    def test_external_low_body_failure_has_fall_priority(self):
+        self.external_fall[0] = True
+        self.natural_timeout[0] = True
+        self.update()
+
+        self.assertTrue(self.tracker.fall_buf[0])
+        self.assertTrue(self.tracker.failure_buf[0])
+        self.assertFalse(self.tracker.success_buf[0])
+        self.assertFalse(self.tracker.incomplete_buf[0])
+        self.assertFalse(self.tracker.episode_timeout_buf[0])
 
     def test_task_deadline_is_incomplete_without_timeout_bootstrap(self):
         self.natural_timeout[0] = True
