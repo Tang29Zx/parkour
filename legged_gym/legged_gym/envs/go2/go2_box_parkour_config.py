@@ -355,6 +355,7 @@ class Go2BoxParkour1BoxCfg(Go2BoxParkourCfg):
             box_joint_action_rate = -0.1
             box_joint_excursion = -0.2
             box_foot_crossing = -0.5
+            excessive_box_foot_height = -1.0
             front_box_velocity = 0.0
             front_box_action_rate = 0.0
             front_box_excursion = 0.0
@@ -416,6 +417,10 @@ class Go2BoxParkour1BoxCfg(Go2BoxParkourCfg):
         box_joint_excursion_normalization = 0.40
         box_foot_side_margin = 0.03
         box_foot_crossing_normalization = 0.10
+        # Allow enough clearance to cross the edge, then softly discourage
+        # unnecessarily high leg swings relative to the current box top.
+        box_foot_max_clearance = 0.16
+        box_foot_height_normalization = 0.08
         front_box_velocity_threshold = 7.0
         front_box_velocity_normalization = 4.0
         front_box_action_delta_threshold = 0.50
@@ -476,8 +481,12 @@ class Go2BoxParkour1BoxCfg(Go2BoxParkourCfg):
         # Stage 3 begins exactly at the Stage-2 recovery contract, then
         # tightens one level at a time toward the final landing contract.
         landing_blend_step = 0.1
-        # The accepted model_4000 already operates at 0.4. Treat that contract
-        # as the final landing difficulty instead of tightening toward 1.0.
+        # Keep the recovery-style landing contract fixed for this run. This
+        # overrides a nonzero blend restored from an older checkpoint and
+        # disables automatic landing-difficulty promotion/regression.
+        fixed_landing_blend = 0.0
+        # Retain the historical ceiling for checkpoint compatibility. It is
+        # inactive while fixed_landing_blend is configured.
         landing_blend_maximum = 0.4
         # Once the final landing level is reached, train all configured final
         # heights in parallel. Torch RNG keeps sampling reproducible by seed.
@@ -500,6 +509,22 @@ class Go2BoxParkour1BoxCfg(Go2BoxParkourCfg):
         landing_blend_recovery_down = 0.70
         landing_blend_fall_down = 0.15
         landing_blend_stagnation_down = 0.12
+        # After the task and height curricula are complete, tighten the
+        # obstacle-window joint constraints one dimension at a time. There is
+        # intentionally no automatic regression; every 50-iteration boundary
+        # is already checkpointed for manual inspection and rollback.
+        joint_constraint_enabled = True
+        joint_constraint_tightening_factor = 0.95
+        joint_constraint_minimum_iterations = 50
+        joint_constraint_minimum_episodes = 256
+        joint_constraint_success_rate = 0.90
+        joint_constraint_box_pass_rate = 0.95
+        joint_constraint_fall_rate = 0.05
+        joint_constraint_body_contact_rate = 0.03
+        joint_constraint_layout_success_rate = 0.85
+        joint_constraint_layout_minimum_episodes = 32
+        joint_velocity_max_level = 10
+        joint_excursion_max_level = 10
 
 
 class Go2BoxParkour1BoxCfgPPO(Go2BoxParkourCfgPPO):
@@ -515,7 +540,7 @@ class Go2BoxParkour1BoxCfgPPO(Go2BoxParkourCfgPPO):
         reference_kl_start_coef = 0.02
 
     class runner(Go2BoxParkourCfgPPO.runner):
-        run_name = "one_box_v1812_final04_random_heights_from4000"
+        run_name = "one_box_v1814_fixed_landing0_from2950"
         init_at_random_ep_len = False
         resume = True
         load_run = osp.join(
@@ -529,8 +554,9 @@ class Go2BoxParkour1BoxCfgPPO(Go2BoxParkourCfgPPO):
             "Jul21_18-05-59_one_box_v183_from_rough2000",
             "model_2100_warmup.pt",
         )
-        checkpoint = 4000
+        checkpoint = 2950
         # Resume the V18.7 curriculum, Critic, optimizer, and reference policy.
+        # The task config intentionally overrides its landing blend to zero.
         ckpt_manipulator = None
         max_iterations = 2000
         save_interval = 50

@@ -2083,7 +2083,7 @@ class BoxRewardTest(unittest.TestCase):
         self.assertEqual(restored.one_box_stable_windows, 0)
         self.assertEqual(restored.get_task_curriculum_state()["version"], 3)
 
-    def test_one_box_final_difficulty_unlocks_seeded_random_heights(self):
+    def test_fixed_zero_landing_unlocks_seeded_random_heights(self):
         env = object.__new__(self.LeggedRobotBox)
         env.uses_task_curriculum = True
         env.cfg = SimpleNamespace(
@@ -2117,7 +2117,7 @@ class BoxRewardTest(unittest.TestCase):
         }
         env.load_task_curriculum_state(state)
 
-        self.assertEqual(env.landing_blend, 0.4)
+        self.assertEqual(env.landing_blend, 0.0)
         self.assertEqual(env.one_box_height_level, 4)
         self.assertEqual(env._allowed_one_box_layouts(), (2, 3, 4, 5, 6))
         self.assertTrue(env._randomize_one_box_heights())
@@ -2163,7 +2163,106 @@ class BoxRewardTest(unittest.TestCase):
         }
         self.assertFalse(env.update_task_curriculum(stable_summary, 3900))
         self.assertFalse(env.update_task_curriculum(stable_summary, 3950))
-        self.assertEqual(env.landing_blend, 0.4)
+        self.assertEqual(env.landing_blend, 0.0)
+
+    def test_joint_constraints_tighten_sequentially_without_regression(self):
+        env = object.__new__(self.LeggedRobotBox)
+        env.uses_task_curriculum = True
+        env.cfg = SimpleNamespace(
+            one_box_curriculum=self.one_box_cfg.one_box_curriculum,
+            rewards=self.one_box_cfg.rewards,
+        )
+        env.one_box_curriculum_stage = 3
+        env.one_box_height_level = 4
+        env.one_box_stage_start_iteration = 3000
+        env.one_box_stable_windows = 0
+        env.landing_blend = 0.4
+        env.landing_blend_start_iteration = 3800
+        env.landing_blend_stable_windows = 0
+        env.landing_blend_regression_windows = 0
+        env.landing_blend_resume_pending = False
+        env.joint_constraint_phase = 0
+        env.joint_velocity_level = 0
+        env.joint_excursion_level = 0
+        env.joint_constraint_level_start_iteration = 4000
+        env.joint_constraint_resume_pending = True
+        env.joint_constraint_promoted = False
+        env.joint_constraint_criteria_passed = False
+        env.base_box_joint_velocity_thresholds = torch.tensor(
+            [6.0, 9.0, 11.0]
+        )
+        env.base_box_joint_excursion_allowances = torch.tensor(
+            [0.55, 1.20, 1.00]
+        )
+        env.box_joint_velocity_thresholds = (
+            env.base_box_joint_velocity_thresholds.clone()
+        )
+        env.box_joint_excursion_allowances = (
+            env.base_box_joint_excursion_allowances.clone()
+        )
+        summary = {
+            "num_terminated": torch.tensor(1000.0),
+            "success_rate": torch.tensor(0.92),
+            "box_1_pass_rate": torch.tensor(0.97),
+            "fall_rate": torch.tensor(0.02),
+            "body_contact_window_failure_rate": torch.tensor(0.01),
+        }
+        for layout in (2, 3, 4, 5, 6):
+            summary[f"layout_{layout + 1}_success_rate"] = torch.tensor(
+                0.91
+            )
+            summary[f"layout_{layout + 1}_episode_count"] = torch.tensor(
+                100.0
+            )
+
+        self.assertFalse(
+            env._update_joint_constraint_curriculum(summary, 4000)
+        )
+        self.assertTrue(
+            env._update_joint_constraint_curriculum(summary, 4050)
+        )
+        self.assertEqual(env.joint_velocity_level, 1)
+        self.assertEqual(env.joint_excursion_level, 0)
+        torch.testing.assert_close(
+            env.box_joint_velocity_thresholds,
+            env.base_box_joint_velocity_thresholds * 0.95,
+        )
+        torch.testing.assert_close(
+            env.box_joint_excursion_allowances,
+            env.base_box_joint_excursion_allowances,
+        )
+
+        weak_summary = dict(summary)
+        weak_summary["success_rate"] = torch.tensor(0.89)
+        self.assertFalse(
+            env._update_joint_constraint_curriculum(weak_summary, 4100)
+        )
+        self.assertEqual(env.joint_velocity_level, 1)
+
+        iteration = 4100
+        while env.joint_constraint_phase == 0:
+            iteration += 50
+            self.assertTrue(
+                env._update_joint_constraint_curriculum(summary, iteration)
+            )
+        self.assertEqual(env.joint_velocity_level, 10)
+        self.assertEqual(env.joint_excursion_level, 0)
+        self.assertEqual(env.joint_constraint_phase, 1)
+
+        iteration += 50
+        self.assertTrue(
+            env._update_joint_constraint_curriculum(summary, iteration)
+        )
+        self.assertEqual(env.joint_velocity_level, 10)
+        self.assertEqual(env.joint_excursion_level, 1)
+        self.assertEqual(env.joint_constraint_phase, 1)
+        state = env.get_task_curriculum_state()
+        self.assertEqual(state["joint_constraint_phase"], 1)
+        self.assertEqual(state["joint_velocity_level"], 10)
+        self.assertEqual(state["joint_excursion_level"], 1)
+        self.assertEqual(
+            state["joint_constraint_level_start_iteration"], iteration
+        )
 
     def test_forward_speed_tracking_peaks_only_at_the_command(self):
         env = self.make_speed_reward_env()
@@ -2463,6 +2562,48 @@ class BoxRewardTest(unittest.TestCase):
         torch.testing.assert_close(action_rate, torch.tensor([0.0, 1.0, 0.0]))
         torch.testing.assert_close(excursion, torch.tensor([0.0, 1.0, 0.0]))
         torch.testing.assert_close(crossing, torch.tensor([0.0, 1.0, 0.0]))
+
+    def test_excessive_foot_height_is_soft_limited_by_active_stage(self):
+        num_envs = 4
+        body_states = torch.zeros(num_envs, 4, 13)
+        # The box top is 0.20 m and the free clearance is 0.16 m.
+        body_states[0, :, 2] = 0.36
+        body_states[1, 0, 2] = 0.40
+        body_states[2, 2, 2] = 0.44
+        body_states[3, :, 2] = 0.44
+        env = SimpleNamespace(
+            num_envs=num_envs,
+            device="cpu",
+            next_box_idx=torch.zeros(num_envs, dtype=torch.long),
+            box_progress=SimpleNamespace(
+                required_boxes=1,
+                front_contact_required_steps=2,
+                rear_contact_required_steps=2,
+            ),
+            env_box_bounds=torch.tensor(
+                [[[0.0, 1.0, -0.5, 0.5, 0.20]]] * num_envs
+            ),
+            all_rigid_body_states=body_states,
+            feet_indices=torch.arange(4),
+            front_foot_local_indices=torch.tensor([0, 1]),
+            rear_foot_local_indices=torch.tensor([2, 3]),
+            front_contact_counter=torch.tensor([0, 0, 2, 2]),
+            rear_contact_counter=torch.tensor([0, 0, 0, 2]),
+            cfg=SimpleNamespace(
+                rewards=SimpleNamespace(
+                    box_foot_max_clearance=0.16,
+                    box_foot_height_normalization=0.08,
+                )
+            ),
+        )
+        env._box_speed_blend = lambda: torch.tensor([1.0, 1.0, 0.5, 1.0])
+
+        penalty = self.LeggedRobotBox._reward_excessive_box_foot_height(env)
+
+        torch.testing.assert_close(
+            penalty,
+            torch.tensor([0.0, 0.25, 0.5, 0.0]),
+        )
 
     def test_center_and_direction_shaping_stays_below_terminal_costs(self):
         scales = self.one_box_cfg.rewards.scales
@@ -2974,6 +3115,7 @@ class BoxRewardTest(unittest.TestCase):
         self.assertEqual(scales.box_joint_action_rate, -0.1)
         self.assertEqual(scales.box_joint_excursion, -0.2)
         self.assertEqual(scales.box_foot_crossing, -0.5)
+        self.assertEqual(scales.excessive_box_foot_height, -1.0)
         self.assertEqual(scales.front_box_velocity, 0.0)
         self.assertEqual(scales.front_box_action_rate, 0.0)
         self.assertEqual(scales.front_box_excursion, 0.0)
@@ -2985,6 +3127,10 @@ class BoxRewardTest(unittest.TestCase):
         self.assertEqual(env_cfg.rewards.box_joint_hip_allowance, 0.55)
         self.assertEqual(env_cfg.rewards.box_joint_thigh_allowance, 1.2)
         self.assertEqual(env_cfg.rewards.box_joint_calf_allowance, 1.0)
+        self.assertEqual(env_cfg.rewards.box_foot_max_clearance, 0.16)
+        self.assertEqual(
+            env_cfg.rewards.box_foot_height_normalization, 0.08
+        )
         self.assertEqual(scales.front_foot_lift_progress, 0.0)
         self.assertEqual(scales.front_foot_reach_progress, 0.0)
         self.assertEqual(scales.rear_foot_lift_progress, 0.0)
@@ -3049,7 +3195,7 @@ class BoxRewardTest(unittest.TestCase):
         runner = train_cfg.runner
         algorithm = train_cfg.algorithm
         self.assertTrue(runner.resume)
-        self.assertEqual(runner.checkpoint, 4000)
+        self.assertEqual(runner.checkpoint, 2950)
         self.assertTrue(
             runner.load_run.endswith(
                 "Jul21_22-01-16_one_box_v187_from2600"
@@ -3063,7 +3209,7 @@ class BoxRewardTest(unittest.TestCase):
         )
         self.assertEqual(
             runner.run_name,
-            "one_box_v1812_final04_random_heights_from4000",
+            "one_box_v1814_fixed_landing0_from2950",
         )
         self.assertIsNone(runner.ckpt_manipulator)
         self.assertEqual(runner.max_iterations, 2000)
@@ -3092,7 +3238,23 @@ class BoxRewardTest(unittest.TestCase):
         self.assertEqual(curriculum.promotion_success_rate, 0.65)
         self.assertEqual(curriculum.landing_blend_step, 0.1)
         self.assertEqual(curriculum.landing_blend_maximum, 0.4)
+        self.assertEqual(curriculum.fixed_landing_blend, 0.0)
         self.assertTrue(curriculum.randomize_final_height_layouts)
+        self.assertTrue(curriculum.joint_constraint_enabled)
+        self.assertEqual(
+            curriculum.joint_constraint_tightening_factor, 0.95
+        )
+        self.assertEqual(
+            curriculum.joint_constraint_minimum_iterations, 50
+        )
+        self.assertEqual(curriculum.joint_constraint_success_rate, 0.90)
+        self.assertEqual(curriculum.joint_constraint_box_pass_rate, 0.95)
+        self.assertEqual(curriculum.joint_constraint_fall_rate, 0.05)
+        self.assertEqual(
+            curriculum.joint_constraint_body_contact_rate, 0.03
+        )
+        self.assertEqual(curriculum.joint_velocity_max_level, 10)
+        self.assertEqual(curriculum.joint_excursion_max_level, 10)
         self.assertEqual(curriculum.landing_blend_minimum_iterations, 100)
         self.assertEqual(curriculum.landing_blend_start_steps, 3)
         self.assertAlmostEqual(

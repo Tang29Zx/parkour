@@ -376,6 +376,24 @@ class LeggedRobotBox(LeggedRobot):
             dtype=torch.bool,
             device=self.device,
         )
+        self.front_max_box_clearance_m = torch.zeros_like(
+            self.forward_speed_sum
+        )
+        self.rear_max_box_clearance_m = torch.zeros_like(
+            self.forward_speed_sum
+        )
+        self.front_foot_height_sample_count = torch.zeros(
+            self.num_envs, dtype=torch.long, device=self.device
+        )
+        self.rear_foot_height_sample_count = torch.zeros_like(
+            self.front_foot_height_sample_count
+        )
+        self.front_excessive_height_step_count = torch.zeros_like(
+            self.front_foot_height_sample_count
+        )
+        self.rear_excessive_height_step_count = torch.zeros_like(
+            self.front_foot_height_sample_count
+        )
         self.stagnation_counter = torch.zeros(
             self.num_envs, dtype=torch.long, device=self.device
         )
@@ -510,6 +528,12 @@ class LeggedRobotBox(LeggedRobot):
         self.box_joint_excursion_allowances = torch.tensor(
             allowances, dtype=torch.float, device=self.device
         )
+        self.base_box_joint_velocity_thresholds = (
+            self.box_joint_velocity_thresholds.clone()
+        )
+        self.base_box_joint_excursion_allowances = (
+            self.box_joint_excursion_allowances.clone()
+        )
 
     def _body_indices_with_token(self, body_names, token):
         names = [name for name in body_names if token in name]
@@ -586,6 +610,13 @@ class LeggedRobotBox(LeggedRobot):
         self.landing_blend_promoted = False
         self.landing_blend_regressed = False
         self.landing_blend_resume_pending = False
+        self.joint_constraint_phase = 0
+        self.joint_velocity_level = 0
+        self.joint_excursion_level = 0
+        self.joint_constraint_level_start_iteration = 2000
+        self.joint_constraint_resume_pending = True
+        self.joint_constraint_promoted = False
+        self.joint_constraint_criteria_passed = False
         self.episode_curriculum_stage = torch.full(
             (self.num_envs,),
             2,
@@ -631,6 +662,16 @@ class LeggedRobotBox(LeggedRobot):
         )
         if not 0.0 < landing_blend_maximum <= 1.0:
             raise ValueError("landing_blend_maximum must be in (0, 1].")
+        fixed_landing_blend = getattr(cfg, "fixed_landing_blend", None)
+        if fixed_landing_blend is not None:
+            fixed_landing_blend = float(fixed_landing_blend)
+            if not np.isfinite(fixed_landing_blend) or not (
+                0.0 <= fixed_landing_blend <= landing_blend_maximum
+            ):
+                raise ValueError(
+                    "fixed_landing_blend must be within the configured "
+                    "landing blend range."
+                )
         if float(cfg.landing_blend_step) > landing_blend_maximum:
             raise ValueError(
                 "landing_blend_step cannot exceed landing_blend_maximum."
@@ -640,13 +681,65 @@ class LeggedRobotBox(LeggedRobot):
             int(cfg.landing_blend_required_regression_windows),
         ) <= 0:
             raise ValueError("Landing blend window counts must be positive.")
+        if bool(getattr(cfg, "joint_constraint_enabled", False)):
+            tightening_factor = float(
+                cfg.joint_constraint_tightening_factor
+            )
+            if not 0.0 < tightening_factor < 1.0:
+                raise ValueError(
+                    "joint_constraint_tightening_factor must be in (0, 1)."
+                )
+            if min(
+                int(cfg.joint_constraint_minimum_iterations),
+                int(cfg.joint_constraint_minimum_episodes),
+                int(cfg.joint_constraint_layout_minimum_episodes),
+                int(cfg.joint_velocity_max_level),
+                int(cfg.joint_excursion_max_level),
+            ) <= 0:
+                raise ValueError(
+                    "Joint-constraint curriculum counts must be positive."
+                )
+            for name in (
+                "joint_constraint_success_rate",
+                "joint_constraint_box_pass_rate",
+                "joint_constraint_layout_success_rate",
+            ):
+                if not 0.0 < float(getattr(cfg, name)) <= 1.0:
+                    raise ValueError(f"{name} must be in (0, 1].")
+            for name in (
+                "joint_constraint_fall_rate",
+                "joint_constraint_body_contact_rate",
+            ):
+                if not 0.0 <= float(getattr(cfg, name)) < 1.0:
+                    raise ValueError(f"{name} must be in [0, 1).")
+        self._apply_joint_constraint_curriculum()
         self._apply_one_box_landing_blend()
+
+    def _apply_joint_constraint_curriculum(self):
+        """Apply immutable-base, multiplicative soft-constraint levels."""
+        if not hasattr(self, "base_box_joint_velocity_thresholds"):
+            return
+        cfg = getattr(self.cfg, "one_box_curriculum", None)
+        factor = float(
+            getattr(cfg, "joint_constraint_tightening_factor", 1.0)
+        )
+        velocity_factor = factor ** int(self.joint_velocity_level)
+        excursion_factor = factor ** int(self.joint_excursion_level)
+        self.box_joint_velocity_thresholds.copy_(
+            self.base_box_joint_velocity_thresholds * velocity_factor
+        )
+        self.box_joint_excursion_allowances.copy_(
+            self.base_box_joint_excursion_allowances * excursion_factor
+        )
 
     def _apply_one_box_landing_blend(self):
         """Apply the global Stage-3 transition level to landing thresholds."""
         if not self.uses_task_curriculum:
             return
         cfg = self.cfg.one_box_curriculum
+        fixed_blend = getattr(cfg, "fixed_landing_blend", None)
+        if fixed_blend is not None:
+            self.landing_blend = float(fixed_blend)
         self.box_progress.configure_landing_transition(
             blend=self.landing_blend,
             start_steps=cfg.landing_blend_start_steps,
@@ -1024,6 +1117,47 @@ class LeggedRobotBox(LeggedRobot):
             self.rear_contact_counter
             >= self.box_progress.rear_contact_required_steps
         )
+        box_motion_active = (
+            active & (LeggedRobotBox._whole_box_motion_gate(self) > 0.0)
+        )
+        front_height_active = box_motion_active & ~front_done
+        rear_height_active = (
+            box_motion_active & front_will_complete & ~rear_done
+        )
+        relative_clearance = (feet_positions[:, :, 2] - top_height).clamp_min(
+            0.0
+        )
+        front_clearance = relative_clearance[
+            :, self.front_foot_local_indices
+        ].max(dim=1).values
+        rear_clearance = relative_clearance[
+            :, self.rear_foot_local_indices
+        ].max(dim=1).values
+        self.front_max_box_clearance_m[:] = torch.maximum(
+            self.front_max_box_clearance_m,
+            torch.where(
+                front_height_active,
+                front_clearance,
+                torch.zeros_like(front_clearance),
+            ),
+        )
+        self.rear_max_box_clearance_m[:] = torch.maximum(
+            self.rear_max_box_clearance_m,
+            torch.where(
+                rear_height_active,
+                rear_clearance,
+                torch.zeros_like(rear_clearance),
+            ),
+        )
+        self.front_foot_height_sample_count += front_height_active.long()
+        self.rear_foot_height_sample_count += rear_height_active.long()
+        max_clearance = float(cfg.box_foot_max_clearance)
+        self.front_excessive_height_step_count += (
+            front_height_active & (front_clearance > max_clearance)
+        ).long()
+        self.rear_excessive_height_step_count += (
+            rear_height_active & (rear_clearance > max_clearance)
+        ).long()
         self._update_high_water(
             self.front_foot_clearance_best,
             self.front_foot_clearance_delta,
@@ -2469,6 +2603,24 @@ class LeggedRobotBox(LeggedRobot):
         episode["rear_foot_clearance_target_rate"] = (
             self.rear_foot_clearance_best[env_ids] >= 1.0 - 1e-6
         ).float().mean()
+        episode["front_max_box_clearance_m"] = (
+            self.front_max_box_clearance_m[env_ids].mean()
+        )
+        episode["rear_max_box_clearance_m"] = (
+            self.rear_max_box_clearance_m[env_ids].mean()
+        )
+        front_height_samples = self.front_foot_height_sample_count[
+            env_ids
+        ].sum()
+        rear_height_samples = self.rear_foot_height_sample_count[env_ids].sum()
+        episode["front_excessive_height_rate"] = (
+            self.front_excessive_height_step_count[env_ids].sum().float()
+            / front_height_samples.clamp_min(1).float()
+        )
+        episode["rear_excessive_height_rate"] = (
+            self.rear_excessive_height_step_count[env_ids].sum().float()
+            / rear_height_samples.clamp_min(1).float()
+        )
         episode["box_exit_progress_mean"] = self.box_exit_best[
             env_ids
         ].mean()
@@ -2737,6 +2889,12 @@ class LeggedRobotBox(LeggedRobot):
             self.max_stagnation_steps[env_ids] = 0
             self.stagnation_candidate_buf[env_ids] = False
             self.current_box_top_contact_mask[env_ids] = False
+            self.front_max_box_clearance_m[env_ids] = 0.0
+            self.rear_max_box_clearance_m[env_ids] = 0.0
+            self.front_foot_height_sample_count[env_ids] = 0
+            self.rear_foot_height_sample_count[env_ids] = 0
+            self.front_excessive_height_step_count[env_ids] = 0
+            self.rear_excessive_height_step_count[env_ids] = 0
         if hasattr(self, "landing_entry_horizontal_speed"):
             self.landing_entry_horizontal_speed[env_ids] = 0.0
             self.landing_deceleration_best[env_ids] = 0.0
@@ -2858,6 +3016,15 @@ class LeggedRobotBox(LeggedRobot):
             "landing_blend_resume_pending": bool(
                 self.landing_blend_resume_pending
             ),
+            "joint_constraint_phase": int(self.joint_constraint_phase),
+            "joint_velocity_level": int(self.joint_velocity_level),
+            "joint_excursion_level": int(self.joint_excursion_level),
+            "joint_constraint_level_start_iteration": int(
+                self.joint_constraint_level_start_iteration
+            ),
+            "joint_constraint_resume_pending": bool(
+                self.joint_constraint_resume_pending
+            ),
         }
 
     def initialize_task_curriculum(self, start_iteration):
@@ -2876,6 +3043,14 @@ class LeggedRobotBox(LeggedRobot):
         self.landing_blend_promoted = False
         self.landing_blend_regressed = False
         self.landing_blend_resume_pending = False
+        self.joint_constraint_phase = 0
+        self.joint_velocity_level = 0
+        self.joint_excursion_level = 0
+        self.joint_constraint_level_start_iteration = int(start_iteration)
+        self.joint_constraint_resume_pending = True
+        self.joint_constraint_promoted = False
+        self.joint_constraint_criteria_passed = False
+        self._apply_joint_constraint_curriculum()
         self._apply_one_box_landing_blend()
 
     def load_task_curriculum_state(self, state):
@@ -2953,6 +3128,50 @@ class LeggedRobotBox(LeggedRobot):
             self.landing_blend_resume_pending = bool(
                 state.get("landing_blend_resume_pending", False)
             )
+        fixed_landing_blend = getattr(
+            self.cfg.one_box_curriculum, "fixed_landing_blend", None
+        )
+        if fixed_landing_blend is not None:
+            # The task configuration owns this value. In particular, loading
+            # model_2950 must not restore its historical nonzero difficulty.
+            self.landing_blend = float(fixed_landing_blend)
+            self.landing_blend_stable_windows = 0
+            self.landing_blend_regression_windows = 0
+            self.landing_blend_resume_pending = False
+        has_joint_constraint_state = all(
+            key in state
+            for key in (
+                "joint_constraint_phase",
+                "joint_velocity_level",
+                "joint_excursion_level",
+                "joint_constraint_level_start_iteration",
+            )
+        )
+        if has_joint_constraint_state:
+            self.joint_constraint_phase = int(
+                state["joint_constraint_phase"]
+            )
+            self.joint_velocity_level = int(state["joint_velocity_level"])
+            self.joint_excursion_level = int(
+                state["joint_excursion_level"]
+            )
+            self.joint_constraint_level_start_iteration = int(
+                state["joint_constraint_level_start_iteration"]
+            )
+            self.joint_constraint_resume_pending = bool(
+                state.get("joint_constraint_resume_pending", False)
+            )
+        else:
+            # Version-3 model_4000 predates this additive curriculum. Start
+            # its first 50-iteration hold only after the restored Critic
+            # warmup has completed and the first valid window arrives.
+            self.joint_constraint_phase = 0
+            self.joint_velocity_level = 0
+            self.joint_excursion_level = 0
+            self.joint_constraint_level_start_iteration = int(
+                state.get("landing_blend_start_iteration", 0)
+            )
+            self.joint_constraint_resume_pending = True
         landing_blend_maximum = float(
             getattr(
                 self.cfg.one_box_curriculum,
@@ -2980,6 +3199,38 @@ class LeggedRobotBox(LeggedRobot):
             self.landing_blend_regression_windows,
         ) < 0:
             raise RuntimeError("Landing blend window counters cannot be negative.")
+        velocity_max_level = int(
+            getattr(
+                self.cfg.one_box_curriculum,
+                "joint_velocity_max_level",
+                0,
+            )
+        )
+        excursion_max_level = int(
+            getattr(
+                self.cfg.one_box_curriculum,
+                "joint_excursion_max_level",
+                0,
+            )
+        )
+        if not 0 <= self.joint_constraint_phase <= 2:
+            raise RuntimeError("Joint-constraint curriculum phase is invalid.")
+        if not 0 <= self.joint_velocity_level <= velocity_max_level:
+            raise RuntimeError("Joint-velocity curriculum level is invalid.")
+        if not 0 <= self.joint_excursion_level <= excursion_max_level:
+            raise RuntimeError("Joint-excursion curriculum level is invalid.")
+        if self.joint_constraint_phase >= 1 and (
+            self.joint_velocity_level != velocity_max_level
+        ):
+            raise RuntimeError(
+                "Excursion curriculum requires a locked velocity level."
+            )
+        if self.joint_constraint_phase == 2 and (
+            self.joint_excursion_level != excursion_max_level
+        ):
+            raise RuntimeError(
+                "Completed constraint curriculum requires both maxima."
+            )
         final_stage = len(self.cfg.one_box_curriculum.stage_names) - 1
         if (
             bool(
@@ -2990,12 +3241,18 @@ class LeggedRobotBox(LeggedRobot):
                 )
             )
             and stage == final_stage
-            and self.landing_blend >= landing_blend_maximum - 1e-6
+            and (
+                fixed_landing_blend is not None
+                or self.landing_blend >= landing_blend_maximum - 1e-6
+            )
         ):
             self.one_box_height_level = max_height_level
         self.one_box_curriculum_promoted = False
         self.landing_blend_promoted = False
         self.landing_blend_regressed = False
+        self.joint_constraint_promoted = False
+        self.joint_constraint_criteria_passed = False
+        self._apply_joint_constraint_curriculum()
         self._apply_one_box_landing_blend()
 
     @staticmethod
@@ -3005,11 +3262,138 @@ class LeggedRobotBox(LeggedRobot):
             return float(value.detach().float().mean().item())
         return float(value)
 
+    def _joint_constraint_task_ready(self):
+        """Require the final landing contract and all random box heights."""
+        cfg = self.cfg.one_box_curriculum
+        if not bool(getattr(cfg, "joint_constraint_enabled", False)):
+            return False
+        final_stage = len(cfg.stage_names) - 1
+        maximum_blend = float(
+            getattr(cfg, "landing_blend_maximum", 1.0)
+        )
+        landing_contract_ready = (
+            getattr(cfg, "fixed_landing_blend", None) is not None
+            or self.landing_blend >= maximum_blend - 1e-6
+        )
+        maximum_height = len(cfg.full_height_layouts) - 1
+        return bool(
+            self.one_box_curriculum_stage == final_stage
+            and landing_contract_ready
+            and self.one_box_height_level >= maximum_height
+        )
+
+    def _joint_constraint_window_passes(self, episode_summary):
+        """Check task competence before tightening one constraint level."""
+        cfg = self.cfg.one_box_curriculum
+        required = (
+            "num_terminated",
+            "success_rate",
+            "box_1_pass_rate",
+            "fall_rate",
+            "body_contact_window_failure_rate",
+        )
+        if not all(name in episode_summary for name in required):
+            return False
+        values = {
+            name: self._episode_summary_scalar(episode_summary, name)
+            for name in required
+        }
+        if not all(np.isfinite(value) for value in values.values()):
+            return False
+        if (
+            values["num_terminated"]
+            < int(cfg.joint_constraint_minimum_episodes)
+            or values["success_rate"]
+            < float(cfg.joint_constraint_success_rate)
+            or values["box_1_pass_rate"]
+            < float(cfg.joint_constraint_box_pass_rate)
+            or values["fall_rate"] > float(cfg.joint_constraint_fall_rate)
+            or values["body_contact_window_failure_rate"]
+            > float(cfg.joint_constraint_body_contact_rate)
+        ):
+            return False
+
+        for layout in tuple(int(value) for value in cfg.full_height_layouts):
+            rate_key = f"layout_{layout + 1}_success_rate"
+            count_key = f"layout_{layout + 1}_episode_count"
+            if rate_key not in episode_summary or count_key not in episode_summary:
+                return False
+            rate = self._episode_summary_scalar(episode_summary, rate_key)
+            count = self._episode_summary_scalar(episode_summary, count_key)
+            if (
+                not np.isfinite(rate)
+                or not np.isfinite(count)
+                or count < int(cfg.joint_constraint_layout_minimum_episodes)
+                or rate < float(cfg.joint_constraint_layout_success_rate)
+            ):
+                return False
+        return True
+
+    def _update_joint_constraint_curriculum(
+        self, episode_summary, iteration
+    ):
+        """Tighten velocity first, then excursion, without auto-regression."""
+        if not self._joint_constraint_task_ready():
+            self.joint_constraint_resume_pending = True
+            return False
+        if self.joint_constraint_phase >= 2:
+            return False
+        if self.joint_constraint_resume_pending:
+            self.joint_constraint_level_start_iteration = int(iteration)
+            self.joint_constraint_resume_pending = False
+            return False
+        level_age = (
+            int(iteration) - self.joint_constraint_level_start_iteration
+        )
+        if level_age < int(
+            self.cfg.one_box_curriculum.joint_constraint_minimum_iterations
+        ):
+            return False
+
+        self.joint_constraint_criteria_passed = (
+            self._joint_constraint_window_passes(episode_summary)
+        )
+        if not self.joint_constraint_criteria_passed:
+            return False
+
+        cfg = self.cfg.one_box_curriculum
+        if self.joint_constraint_phase == 0:
+            self.joint_velocity_level += 1
+            if self.joint_velocity_level >= int(
+                cfg.joint_velocity_max_level
+            ):
+                self.joint_velocity_level = int(
+                    cfg.joint_velocity_max_level
+                )
+                self.joint_constraint_phase = 1
+        else:
+            self.joint_excursion_level += 1
+            if self.joint_excursion_level >= int(
+                cfg.joint_excursion_max_level
+            ):
+                self.joint_excursion_level = int(
+                    cfg.joint_excursion_max_level
+                )
+                self.joint_constraint_phase = 2
+
+        self.joint_constraint_level_start_iteration = int(iteration)
+        self.joint_constraint_promoted = True
+        self._apply_joint_constraint_curriculum()
+        print(
+            "Joint-constraint curriculum tightened: "
+            f"phase={self.joint_constraint_phase}, "
+            f"velocity_level={self.joint_velocity_level}, "
+            f"excursion_level={self.joint_excursion_level}."
+        )
+        return True
+
     def update_task_curriculum(self, episode_summary, iteration):
         """Promote contacts/recovery, then smoothly tighten final landing."""
         self.one_box_curriculum_promoted = False
         self.landing_blend_promoted = False
         self.landing_blend_regressed = False
+        self.joint_constraint_promoted = False
+        self.joint_constraint_criteria_passed = False
         if not self.uses_task_curriculum:
             return False
         cfg = self.cfg.one_box_curriculum
@@ -3053,8 +3437,43 @@ class LeggedRobotBox(LeggedRobot):
                 self.landing_blend_stable_windows = 0
                 self.landing_blend_regression_windows = 0
                 self._apply_one_box_landing_blend()
+                if (
+                    getattr(cfg, "fixed_landing_blend", None) is not None
+                    and bool(
+                        getattr(
+                            cfg, "randomize_final_height_layouts", False
+                        )
+                    )
+                ):
+                    self.one_box_height_level = (
+                        len(cfg.full_height_layouts) - 1
+                    )
             self.one_box_curriculum_promoted = True
             return True
+
+        if self._joint_constraint_task_ready():
+            return self._update_joint_constraint_curriculum(
+                episode_summary, iteration
+            )
+
+        fixed_landing_blend = getattr(cfg, "fixed_landing_blend", None)
+        if fixed_landing_blend is not None:
+            self.landing_blend = float(fixed_landing_blend)
+            self.landing_blend_stable_windows = 0
+            self.landing_blend_regression_windows = 0
+            self.landing_blend_resume_pending = False
+            self._apply_one_box_landing_blend()
+            if bool(
+                getattr(cfg, "randomize_final_height_layouts", False)
+            ):
+                max_height_level = len(cfg.full_height_layouts) - 1
+                if self.one_box_height_level < max_height_level:
+                    self.one_box_height_level = max_height_level
+                    self.one_box_curriculum_promoted = True
+                    return True
+            return self._update_joint_constraint_curriculum(
+                episode_summary, iteration
+            )
 
         blend_age = int(iteration) - self.landing_blend_start_iteration
         if blend_age < int(cfg.landing_blend_minimum_iterations):
@@ -3146,7 +3565,9 @@ class LeggedRobotBox(LeggedRobot):
             max_height_level = len(cfg.full_height_layouts) - 1
             if self.one_box_height_level >= max_height_level:
                 self.landing_blend_stable_windows = 0
-                return False
+                return self._update_joint_constraint_curriculum(
+                    episode_summary, iteration
+                )
             self.one_box_height_level += 1
             self.one_box_curriculum_promoted = True
         self.landing_blend_start_iteration = int(iteration)
@@ -3159,6 +3580,30 @@ class LeggedRobotBox(LeggedRobot):
         """Return scalar state for terminal and TensorBoard logging."""
         if not self.uses_task_curriculum:
             return {}
+        constraint_cfg = self.cfg.one_box_curriculum
+        tightening_factor = float(
+            getattr(
+                constraint_cfg,
+                "joint_constraint_tightening_factor",
+                1.0,
+            )
+        )
+        velocity_factor = tightening_factor ** int(
+            self.joint_velocity_level
+        )
+        excursion_factor = tightening_factor ** int(
+            self.joint_excursion_level
+        )
+        fixed_landing_blend = getattr(
+            constraint_cfg, "fixed_landing_blend", None
+        )
+        effective_landing_maximum = (
+            float(fixed_landing_blend)
+            if fixed_landing_blend is not None
+            else float(
+                getattr(constraint_cfg, "landing_blend_maximum", 1.0)
+            )
+        )
         return {
             "one_box_curriculum_stage": float(
                 self.one_box_curriculum_stage
@@ -3172,12 +3617,9 @@ class LeggedRobotBox(LeggedRobot):
                 self.one_box_curriculum_promoted
             ),
             "landing_blend": float(self.landing_blend),
-            "landing_blend_maximum": float(
-                getattr(
-                    self.cfg.one_box_curriculum,
-                    "landing_blend_maximum",
-                    1.0,
-                )
+            "landing_blend_maximum": effective_landing_maximum,
+            "landing_blend_fixed": float(
+                fixed_landing_blend is not None
             ),
             "random_height_active": float(
                 self._randomize_one_box_heights()
@@ -3211,6 +3653,48 @@ class LeggedRobotBox(LeggedRobot):
             ),
             "landing_required_yaw": float(
                 self.box_progress.landing_yaw_threshold
+            ),
+            "joint_constraint_phase": float(self.joint_constraint_phase),
+            "joint_velocity_level": float(self.joint_velocity_level),
+            "joint_excursion_level": float(self.joint_excursion_level),
+            "joint_constraint_level_age": float(
+                max(
+                    int(iteration)
+                    - self.joint_constraint_level_start_iteration,
+                    0,
+                )
+            ),
+            "joint_constraint_promoted": float(
+                self.joint_constraint_promoted
+            ),
+            "joint_constraint_criteria_passed": float(
+                self.joint_constraint_criteria_passed
+            ),
+            "joint_velocity_factor": float(velocity_factor),
+            "joint_excursion_factor": float(excursion_factor),
+            "box_hip_velocity_threshold": float(
+                self.cfg.rewards.box_joint_hip_velocity_threshold
+                * velocity_factor
+            ),
+            "box_thigh_velocity_threshold": float(
+                self.cfg.rewards.box_joint_thigh_velocity_threshold
+                * velocity_factor
+            ),
+            "box_calf_velocity_threshold": float(
+                self.cfg.rewards.box_joint_calf_velocity_threshold
+                * velocity_factor
+            ),
+            "box_hip_excursion_allowance": float(
+                self.cfg.rewards.box_joint_hip_allowance
+                * excursion_factor
+            ),
+            "box_thigh_excursion_allowance": float(
+                self.cfg.rewards.box_joint_thigh_allowance
+                * excursion_factor
+            ),
+            "box_calf_excursion_allowance": float(
+                self.cfg.rewards.box_joint_calf_allowance
+                * excursion_factor
             ),
         }
 
@@ -3445,6 +3929,57 @@ class LeggedRobotBox(LeggedRobot):
             torch.square(violation / normalization)
             .mean(dim=1)
             .clamp(max=1.0)
+            * LeggedRobotBox._whole_box_motion_gate(self)
+        )
+
+    def _reward_excessive_box_foot_height(self):
+        """Soft-limit staged foot clearance above the current box top."""
+        active = self.next_box_idx < self.box_progress.required_boxes
+        target_indices = self.next_box_idx.clamp(
+            max=self.box_progress.required_boxes - 1
+        )
+        env_ids = torch.arange(self.num_envs, device=self.device)
+        top_height = self.env_box_bounds[
+            env_ids, target_indices, 4
+        ].unsqueeze(1)
+        body_states = self.all_rigid_body_states.view(
+            self.num_envs, -1, 13
+        )
+        feet_height = body_states[:, self.feet_indices, 2]
+        max_height = top_height + float(
+            self.cfg.rewards.box_foot_max_clearance
+        )
+        normalization = max(
+            float(self.cfg.rewards.box_foot_height_normalization), 1e-6
+        )
+        excess = torch.relu(feet_height - max_height) / normalization
+
+        front_done = (
+            self.front_contact_counter
+            >= self.box_progress.front_contact_required_steps
+        )
+        rear_done = (
+            self.rear_contact_counter
+            >= self.box_progress.rear_contact_required_steps
+        )
+        front_excess = excess[:, self.front_foot_local_indices].max(
+            dim=1
+        ).values
+        rear_excess = excess[:, self.rear_foot_local_indices].max(
+            dim=1
+        ).values
+        staged_excess = torch.where(
+            ~front_done,
+            front_excess,
+            torch.where(
+                ~rear_done,
+                rear_excess,
+                torch.zeros_like(rear_excess),
+            ),
+        )
+        return (
+            torch.square(staged_excess).clamp(max=1.0)
+            * active.float()
             * LeggedRobotBox._whole_box_motion_gate(self)
         )
 
