@@ -2634,6 +2634,141 @@ class BoxRewardTest(unittest.TestCase):
         torch.testing.assert_close(excursion, torch.tensor([0.0, 1.0, 0.0]))
         torch.testing.assert_close(crossing, torch.tensor([0.0, 1.0, 0.0]))
 
+    def test_grouped_box_motion_uses_front_rear_phase_weights(self):
+        num_envs = 5
+        env = SimpleNamespace(
+            next_box_idx=torch.zeros(num_envs, dtype=torch.long),
+            front_contact_counter=torch.tensor([0, 0, 2, 2, 2]),
+            rear_contact_counter=torch.tensor([0, 0, 0, 0, 2]),
+            rear_productive_motion_grace_counter=torch.tensor([0, 0, 2, 0, 0]),
+            rear_propulsive_motion_grace_counter=torch.tensor([0, 2, 0, 0, 0]),
+            box_progress=SimpleNamespace(
+                required_boxes=1,
+                front_contact_required_steps=2,
+                rear_contact_required_steps=2,
+            ),
+            front_leg_joint_indices=torch.arange(6),
+            rear_leg_joint_indices=torch.arange(6, 12),
+            box_joint_velocity_thresholds=torch.zeros(12),
+            dof_vel=torch.ones(num_envs, 12),
+            actions=torch.ones(num_envs, 12),
+            last_actions=torch.zeros(num_envs, 12),
+            episode_length_buf=torch.full((num_envs,), 2),
+            cfg=SimpleNamespace(
+                rewards=SimpleNamespace(
+                    box_joint_velocity_normalization=1.0,
+                    box_joint_action_delta_threshold=0.0,
+                    box_joint_action_delta_normalization=1.0,
+                    group_joint_maximum_weight=0.25,
+                    front_ascent_front_joint_penalty_scale=0.35,
+                    front_ascent_rear_joint_penalty_scale=1.25,
+                    front_ascent_productive_rear_joint_penalty_scale=0.35,
+                    rear_ascent_front_joint_penalty_scale=1.0,
+                    rear_ascent_rear_joint_penalty_scale=1.25,
+                    rear_ascent_productive_joint_penalty_scale=0.50,
+                    traversal_front_joint_penalty_scale=1.0,
+                    traversal_rear_joint_penalty_scale=1.0,
+                )
+            ),
+        )
+        env._box_speed_blend = lambda: torch.ones(num_envs)
+
+        front_velocity = (
+            self.LeggedRobotBox._reward_front_group_box_joint_velocity(env)
+        )
+        rear_velocity = (
+            self.LeggedRobotBox._reward_rear_group_box_joint_velocity(env)
+        )
+        front_action = (
+            self.LeggedRobotBox._reward_front_group_box_joint_action_rate(env)
+        )
+        rear_action = (
+            self.LeggedRobotBox._reward_rear_group_box_joint_action_rate(env)
+        )
+
+        expected_front = torch.tensor([0.35, 0.35, 1.0, 1.0, 1.0])
+        expected_rear = torch.tensor([1.25, 0.35, 0.50, 1.25, 1.0])
+        torch.testing.assert_close(front_velocity, expected_front)
+        torch.testing.assert_close(rear_velocity, expected_rear)
+        torch.testing.assert_close(front_action, expected_front)
+        torch.testing.assert_close(rear_action, expected_rear)
+
+    def test_grouped_joint_penalty_keeps_one_joint_outlier_visible(self):
+        values = torch.zeros(1, 12)
+        values[0, 0] = 1.0
+        raw = self.LeggedRobotBox._grouped_joint_excess_penalty(
+            values,
+            torch.zeros(12),
+            torch.arange(6),
+            normalization=1.0,
+            maximum_weight=0.25,
+        )
+
+        torch.testing.assert_close(raw, torch.tensor([0.375]))
+
+    def test_productive_rear_motion_relaxation_has_short_grace(self):
+        contact_forces = torch.zeros(2, 4, 3)
+        contact_forces[0, 2, 2] = 2.0
+        env = SimpleNamespace(
+            rear_foot_clearance_delta=torch.tensor([0.1, 0.0]),
+            rear_foot_reach_delta=torch.zeros(2),
+            rear_foot_contact_buf=torch.tensor([False, True]),
+            box_approach_delta=torch.tensor([0.1, 0.1]),
+            front_foot_clearance_delta=torch.zeros(2),
+            front_foot_contact_buf=torch.zeros(2, dtype=torch.bool),
+            rear_productive_motion_grace_steps=3,
+            rear_productive_motion_grace_counter=torch.tensor([0, 1]),
+            rear_propulsive_motion_grace_steps=5,
+            rear_propulsive_motion_grace_counter=torch.zeros(2, dtype=torch.long),
+            rear_support_now_buf=torch.zeros(2, dtype=torch.bool),
+            contact_forces=contact_forces,
+            feet_indices=torch.arange(4),
+            rear_foot_local_indices=torch.tensor([2, 3]),
+            cfg=SimpleNamespace(
+                box_progress=SimpleNamespace(contact_force_threshold=1.0)
+            ),
+        )
+
+        self.LeggedRobotBox._update_grouped_box_motion_state(env)
+        torch.testing.assert_close(
+            env.rear_productive_motion_grace_counter,
+            torch.tensor([3, 3]),
+        )
+        torch.testing.assert_close(
+            env.rear_propulsive_motion_grace_counter,
+            torch.tensor([5, 0]),
+        )
+        env.rear_foot_clearance_delta.zero_()
+        env.rear_foot_contact_buf.zero_()
+        env.box_approach_delta.zero_()
+        env.contact_forces.zero_()
+        self.LeggedRobotBox._update_grouped_box_motion_state(env)
+        torch.testing.assert_close(
+            env.rear_productive_motion_grace_counter,
+            torch.tensor([2, 2]),
+        )
+        torch.testing.assert_close(
+            env.rear_propulsive_motion_grace_counter,
+            torch.tensor([4, 0]),
+        )
+
+    def test_takeoff_progress_requires_current_rear_support(self):
+        env = SimpleNamespace(
+            next_box_idx=torch.tensor([0, 0, 0]),
+            front_contact_counter=torch.tensor([0, 0, 2]),
+            front_foot_contact_buf=torch.tensor([False, False, False]),
+            rear_support_now_buf=torch.tensor([True, False, True]),
+            front_foot_clearance_delta=torch.tensor([0.25, 0.25, 0.25]),
+            box_progress=SimpleNamespace(
+                required_boxes=1,
+                front_contact_required_steps=2,
+            ),
+        )
+
+        reward = self.LeggedRobotBox._reward_rear_support_takeoff_progress(env)
+
+        torch.testing.assert_close(reward, torch.tensor([0.25, 0.0, 0.0]))
+
     def test_excessive_foot_height_is_soft_limited_by_active_stage(self):
         num_envs = 4
         body_states = torch.zeros(num_envs, 4, 13)
@@ -3421,6 +3556,51 @@ class BoxRewardTest(unittest.TestCase):
             env_cfg.rewards.box_joint_action_delta_threshold,
             0.40 * 0.95,
         )
+        grouped_scales = env_cfg.rewards.scales
+        self.assertEqual(grouped_scales.box_joint_velocity, 0.0)
+        self.assertEqual(grouped_scales.box_joint_action_rate, 0.0)
+        self.assertEqual(grouped_scales.box_joint_excursion, 0.0)
+        self.assertEqual(
+            grouped_scales.front_group_box_joint_velocity, -0.25
+        )
+        self.assertEqual(
+            grouped_scales.rear_group_box_joint_velocity, -0.25
+        )
+        self.assertEqual(
+            grouped_scales.front_group_box_joint_action_rate, -0.05
+        )
+        self.assertEqual(
+            grouped_scales.rear_group_box_joint_action_rate, -0.05
+        )
+        self.assertAlmostEqual(
+            grouped_scales.rear_support_takeoff_progress * 0.02,
+            1.0,
+        )
+        self.assertEqual(
+            env_cfg.rewards.front_ascent_front_joint_penalty_scale,
+            0.35,
+        )
+        self.assertEqual(
+            env_cfg.rewards.front_ascent_rear_joint_penalty_scale,
+            1.25,
+        )
+        self.assertEqual(
+            env_cfg.rewards.front_ascent_productive_rear_joint_penalty_scale,
+            0.35,
+        )
+        self.assertEqual(
+            env_cfg.rewards.rear_ascent_productive_joint_penalty_scale,
+            0.50,
+        )
+        self.assertEqual(
+            env_cfg.rewards.rear_productive_motion_grace_steps,
+            3,
+        )
+        self.assertEqual(
+            env_cfg.rewards.rear_propulsive_motion_grace_steps,
+            5,
+        )
+        self.assertEqual(env_cfg.rewards.group_joint_maximum_weight, 0.25)
         self.assertTrue(
             env_cfg.box_progress.inter_box_transition_enabled
         )

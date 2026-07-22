@@ -650,6 +650,17 @@ class Go2BoxParkour3BoxCfg(Go2BoxParkour1BoxCfg):
             dismount_front_ground = 25.0
             dismount_rear_ground = 50.0
             inter_box_recovery = 75.0
+            # Replace the 12-joint average with two six-joint groups. A pair
+            # of -0.25/-0.05 base scales preserves the old total strength
+            # when both groups use a phase multiplier of one.
+            box_joint_velocity = 0.0
+            box_joint_action_rate = 0.0
+            box_joint_excursion = 0.0
+            front_group_box_joint_velocity = -0.25
+            rear_group_box_joint_velocity = -0.25
+            front_group_box_joint_action_rate = -0.05
+            rear_group_box_joint_action_rate = -0.05
+            rear_support_takeoff_progress = 50.0
 
         # Start one 5% step tighter than the two reductions already present
         # in model_3500. Keep the penalty scale unchanged so route learning is
@@ -658,6 +669,21 @@ class Go2BoxParkour3BoxCfg(Go2BoxParkour1BoxCfg):
         box_joint_thigh_velocity_threshold = 9.0 * 0.95**3
         box_joint_calf_velocity_threshold = 11.0 * 0.95**3
         box_joint_action_delta_threshold = 0.40 * 0.95
+        # During front-foot ascent, front-leg motion is permitted while the
+        # rear pair remains a stable propulsive base. During rear ascent, a
+        # short high-water progress grace window permits useful motion but
+        # continued non-progressing swings retain the stronger constraint.
+        group_joint_maximum_weight = 0.25
+        front_ascent_front_joint_penalty_scale = 0.35
+        front_ascent_rear_joint_penalty_scale = 1.25
+        front_ascent_productive_rear_joint_penalty_scale = 0.35
+        rear_ascent_front_joint_penalty_scale = 1.0
+        rear_ascent_rear_joint_penalty_scale = 1.25
+        rear_ascent_productive_joint_penalty_scale = 0.50
+        traversal_front_joint_penalty_scale = 1.0
+        traversal_rear_joint_penalty_scale = 1.0
+        rear_productive_motion_grace_steps = 3
+        rear_propulsive_motion_grace_steps = 5
         # Once a foot selects the ground route, weakly restore the walking
         # prior while the robot establishes safe rear support.
         inter_box_ground_reference_kl_weight = 0.15

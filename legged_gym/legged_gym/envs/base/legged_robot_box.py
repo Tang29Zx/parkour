@@ -61,6 +61,32 @@ class LeggedRobotBox(LeggedRobot):
         self.all_upper_joint_indices = torch.cat(
             (self.front_upper_joint_indices, self.rear_upper_joint_indices)
         )
+        self.front_leg_joint_indices = torch.tensor(
+            [
+                index
+                for index, name in enumerate(self.dof_names)
+                if name.startswith(("FL_", "FR_"))
+            ],
+            dtype=torch.long,
+            device=self.device,
+        )
+        self.rear_leg_joint_indices = torch.tensor(
+            [
+                index
+                for index, name in enumerate(self.dof_names)
+                if name.startswith(("RL_", "RR_"))
+            ],
+            dtype=torch.long,
+            device=self.device,
+        )
+        if (
+            len(self.front_leg_joint_indices) != 6
+            or len(self.rear_leg_joint_indices) != 6
+        ):
+            raise ValueError(
+                "Go2 grouped box motion constraints require six front-leg "
+                "and six rear-leg joints."
+            )
         self._init_box_joint_constraints()
         progress_cfg = self.cfg.box_progress
         if progress_cfg.flat_low_base_height_threshold <= 0.0:
@@ -141,6 +167,59 @@ class LeggedRobotBox(LeggedRobot):
             ),
         )
         self._bind_progress_buffers()
+        self.rear_productive_motion_grace_steps = int(
+            getattr(
+                self.cfg.rewards,
+                "rear_productive_motion_grace_steps",
+                3,
+            )
+        )
+        if self.rear_productive_motion_grace_steps < 0:
+            raise ValueError(
+                "rear_productive_motion_grace_steps must be non-negative."
+            )
+        self.rear_propulsive_motion_grace_steps = int(
+            getattr(
+                self.cfg.rewards,
+                "rear_propulsive_motion_grace_steps",
+                5,
+            )
+        )
+        if self.rear_propulsive_motion_grace_steps < 0:
+            raise ValueError(
+                "rear_propulsive_motion_grace_steps must be non-negative."
+            )
+        grouped_scale_names = (
+            "front_ascent_front_joint_penalty_scale",
+            "front_ascent_rear_joint_penalty_scale",
+            "front_ascent_productive_rear_joint_penalty_scale",
+            "rear_ascent_front_joint_penalty_scale",
+            "rear_ascent_rear_joint_penalty_scale",
+            "rear_ascent_productive_joint_penalty_scale",
+            "traversal_front_joint_penalty_scale",
+            "traversal_rear_joint_penalty_scale",
+        )
+        for name in grouped_scale_names:
+            if hasattr(self.cfg.rewards, name) and float(
+                getattr(self.cfg.rewards, name)
+            ) < 0.0:
+                raise ValueError(f"{name} must be non-negative.")
+        group_maximum_weight = float(
+            getattr(self.cfg.rewards, "group_joint_maximum_weight", 0.0)
+        )
+        if not 0.0 <= group_maximum_weight <= 1.0:
+            raise ValueError(
+                "group_joint_maximum_weight must be in [0, 1]."
+            )
+        self.rear_productive_motion_grace_counter = torch.zeros(
+            self.num_envs, dtype=torch.long, device=self.device
+        )
+        self.rear_propulsive_motion_grace_counter = torch.zeros_like(
+            self.rear_productive_motion_grace_counter
+        )
+        self.rear_support_now_buf = torch.zeros(
+            self.num_envs, dtype=torch.bool, device=self.device
+        )
         self.reference_kl_recovery_steps = int(
             getattr(progress_cfg, "reference_kl_recovery_steps", 10)
         )
@@ -2479,6 +2558,7 @@ class LeggedRobotBox(LeggedRobot):
                 else None
             ),
         )
+        self._update_grouped_box_motion_state()
         self._update_landing_guidance(yaw)
         self._apply_landing_commands()
         self._update_course_progress_reward()
@@ -2902,6 +2982,8 @@ class LeggedRobotBox(LeggedRobot):
             "action_rate_penalty": (
                 "action_rate",
                 "box_joint_action_rate",
+                "front_group_box_joint_action_rate",
+                "rear_group_box_joint_action_rate",
                 "front_box_action_rate",
                 "rear_post_contact_action_rate",
                 "all_feet_box_action_rate",
@@ -2909,6 +2991,8 @@ class LeggedRobotBox(LeggedRobot):
             "dof_vel_penalty": (
                 "dof_vel",
                 "box_joint_velocity",
+                "front_group_box_joint_velocity",
+                "rear_group_box_joint_velocity",
                 "front_box_velocity",
                 "rear_post_contact_velocity",
                 "all_feet_box_velocity",
@@ -2942,6 +3026,10 @@ class LeggedRobotBox(LeggedRobot):
             "box_joint_velocity",
             "box_joint_action_rate",
             "box_joint_excursion",
+            "front_group_box_joint_velocity",
+            "rear_group_box_joint_velocity",
+            "front_group_box_joint_action_rate",
+            "rear_group_box_joint_action_rate",
             "box_foot_crossing",
             "front_box_velocity",
             "front_box_action_rate",
@@ -3087,6 +3175,10 @@ class LeggedRobotBox(LeggedRobot):
             self.box_top_reference_kl_step_count[env_ids] = 0
         if hasattr(self, "inter_box_reference_kl_step_count"):
             self.inter_box_reference_kl_step_count[env_ids] = 0
+        if hasattr(self, "rear_productive_motion_grace_counter"):
+            self.rear_productive_motion_grace_counter[env_ids] = 0
+            self.rear_propulsive_motion_grace_counter[env_ids] = 0
+            self.rear_support_now_buf[env_ids] = False
 
     def _near_box_for_speed_control(self):
         """Return environments with a non-zero current-box speed blend."""
@@ -4128,6 +4220,229 @@ class LeggedRobotBox(LeggedRobot):
     def _whole_box_motion_gate(self):
         """Cover approach, traversal, rear-leg ascent, and box exit."""
         return self._box_speed_blend()
+
+    def _update_grouped_box_motion_state(self):
+        """Track productive rear ascent and rear-supported propulsion."""
+        rear_ascent_productive = (
+            (self.rear_foot_clearance_delta > 1e-6)
+            | (self.rear_foot_reach_delta > 1e-6)
+            | self.rear_foot_contact_buf
+        )
+        refreshed = torch.full_like(
+            self.rear_productive_motion_grace_counter,
+            self.rear_productive_motion_grace_steps,
+        )
+        decayed = torch.clamp(
+            self.rear_productive_motion_grace_counter - 1,
+            min=0,
+        )
+        self.rear_productive_motion_grace_counter[:] = torch.where(
+            rear_ascent_productive,
+            refreshed,
+            decayed,
+        )
+
+        rear_forces = torch.linalg.vector_norm(
+            self.contact_forces[
+                :,
+                self.feet_indices[self.rear_foot_local_indices],
+                :,
+            ],
+            dim=-1,
+        )
+        self.rear_support_now_buf[:] = (
+            rear_forces
+            > float(self.cfg.box_progress.contact_force_threshold)
+        ).any(dim=1)
+        front_stage_productive = (
+            (self.box_approach_delta > 1e-6)
+            | (self.front_foot_clearance_delta > 1e-6)
+            | self.front_foot_contact_buf
+        )
+        rear_propulsive = self.rear_support_now_buf & front_stage_productive
+        propulsive_refreshed = torch.full_like(
+            self.rear_propulsive_motion_grace_counter,
+            self.rear_propulsive_motion_grace_steps,
+        )
+        propulsive_decayed = torch.clamp(
+            self.rear_propulsive_motion_grace_counter - 1,
+            min=0,
+        )
+        self.rear_propulsive_motion_grace_counter[:] = torch.where(
+            rear_propulsive,
+            propulsive_refreshed,
+            propulsive_decayed,
+        )
+
+    @staticmethod
+    def _grouped_joint_excess_penalty(
+        values,
+        limits,
+        joint_indices,
+        normalization,
+        maximum_weight,
+    ):
+        """Blend group mean and maximum so one violent joint remains visible."""
+        normalization = max(float(normalization), 1e-6)
+        maximum_weight = float(maximum_weight)
+        if not 0.0 <= maximum_weight <= 1.0:
+            raise ValueError("group_joint_maximum_weight must be in [0, 1].")
+        excess = torch.relu(
+            torch.abs(values[:, joint_indices]) - limits[joint_indices]
+        ) / normalization
+        squared = torch.square(excess).clamp(max=1.0)
+        return (
+            (1.0 - maximum_weight) * squared.mean(dim=1)
+            + maximum_weight * squared.max(dim=1).values
+        ).clamp(max=1.0)
+
+    def _grouped_box_motion_phase_weights(self):
+        """Return phase-aware front/rear weights within the current box."""
+        active = self.next_box_idx < self.box_progress.required_boxes
+        front_done = (
+            self.front_contact_counter
+            >= self.box_progress.front_contact_required_steps
+        )
+        rear_done = (
+            self.rear_contact_counter
+            >= self.box_progress.rear_contact_required_steps
+        )
+        front_ascent = active & ~front_done
+        rear_ascent = active & front_done & ~rear_done
+        traversal = active & front_done & rear_done
+        cfg = self.cfg.rewards
+
+        front_weight = (
+            front_ascent.float()
+            * float(cfg.front_ascent_front_joint_penalty_scale)
+            + rear_ascent.float()
+            * float(cfg.rear_ascent_front_joint_penalty_scale)
+            + traversal.float()
+            * float(cfg.traversal_front_joint_penalty_scale)
+        )
+        rear_productive = self.rear_productive_motion_grace_counter > 0
+        rear_ascent_scale = torch.where(
+            rear_productive,
+            torch.full_like(
+                front_weight,
+                float(cfg.rear_ascent_productive_joint_penalty_scale),
+            ),
+            torch.full_like(
+                front_weight,
+                float(cfg.rear_ascent_rear_joint_penalty_scale),
+            ),
+        )
+        rear_propulsive = self.rear_propulsive_motion_grace_counter > 0
+        front_ascent_rear_scale = torch.where(
+            rear_propulsive,
+            torch.full_like(
+                front_weight,
+                float(
+                    cfg.front_ascent_productive_rear_joint_penalty_scale
+                ),
+            ),
+            torch.full_like(
+                front_weight,
+                float(cfg.front_ascent_rear_joint_penalty_scale),
+            ),
+        )
+        rear_weight = (
+            front_ascent.float() * front_ascent_rear_scale
+            + rear_ascent.float() * rear_ascent_scale
+            + traversal.float()
+            * float(cfg.traversal_rear_joint_penalty_scale)
+        )
+        spatial_gate = LeggedRobotBox._whole_box_motion_gate(self)
+        return front_weight * spatial_gate, rear_weight * spatial_gate
+
+    def _grouped_box_joint_velocity_penalties(self):
+        cfg = self.cfg.rewards
+        maximum_weight = float(cfg.group_joint_maximum_weight)
+        normalization = float(cfg.box_joint_velocity_normalization)
+        front = LeggedRobotBox._grouped_joint_excess_penalty(
+            self.dof_vel,
+            self.box_joint_velocity_thresholds,
+            self.front_leg_joint_indices,
+            normalization,
+            maximum_weight,
+        )
+        rear = LeggedRobotBox._grouped_joint_excess_penalty(
+            self.dof_vel,
+            self.box_joint_velocity_thresholds,
+            self.rear_leg_joint_indices,
+            normalization,
+            maximum_weight,
+        )
+        front_weight, rear_weight = (
+            LeggedRobotBox._grouped_box_motion_phase_weights(self)
+        )
+        return front * front_weight, rear * rear_weight
+
+    def _grouped_box_joint_action_rate_penalties(self):
+        cfg = self.cfg.rewards
+        action_delta = self.actions - self.last_actions
+        limits = torch.full_like(
+            self.box_joint_velocity_thresholds,
+            float(cfg.box_joint_action_delta_threshold),
+        )
+        maximum_weight = float(cfg.group_joint_maximum_weight)
+        normalization = float(cfg.box_joint_action_delta_normalization)
+        front = LeggedRobotBox._grouped_joint_excess_penalty(
+            action_delta,
+            limits,
+            self.front_leg_joint_indices,
+            normalization,
+            maximum_weight,
+        )
+        rear = LeggedRobotBox._grouped_joint_excess_penalty(
+            action_delta,
+            limits,
+            self.rear_leg_joint_indices,
+            normalization,
+            maximum_weight,
+        )
+        front_weight, rear_weight = (
+            LeggedRobotBox._grouped_box_motion_phase_weights(self)
+        )
+        valid_step = (self.episode_length_buf > 1).float()
+        return (
+            front * front_weight * valid_step,
+            rear * rear_weight * valid_step,
+        )
+
+    def _reward_front_group_box_joint_velocity(self):
+        """Weakly constrain front-leg speed while it leads the ascent."""
+        return LeggedRobotBox._grouped_box_joint_velocity_penalties(self)[0]
+
+    def _reward_rear_group_box_joint_velocity(self):
+        """Strongly constrain unproductive rear-leg speed during ascent."""
+        return LeggedRobotBox._grouped_box_joint_velocity_penalties(self)[1]
+
+    def _reward_front_group_box_joint_action_rate(self):
+        """Weakly constrain abrupt front-leg commands during front ascent."""
+        return LeggedRobotBox._grouped_box_joint_action_rate_penalties(self)[0]
+
+    def _reward_rear_group_box_joint_action_rate(self):
+        """Strongly constrain unproductive rear-leg command changes."""
+        return LeggedRobotBox._grouped_box_joint_action_rate_penalties(self)[1]
+
+    def _reward_rear_support_takeoff_progress(self):
+        """Reward front-edge progress only while rear feet provide support."""
+        front_stage = (
+            (self.next_box_idx < self.box_progress.required_boxes)
+            & (
+                (
+                    self.front_contact_counter
+                    < self.box_progress.front_contact_required_steps
+                )
+                | self.front_foot_contact_buf
+            )
+        )
+        return (
+            self.front_foot_clearance_delta
+            * self.rear_support_now_buf.float()
+            * front_stage.float()
+        )
 
     def _reward_box_joint_velocity(self):
         """Penalize excessive speed for all 12 joints throughout the box."""
