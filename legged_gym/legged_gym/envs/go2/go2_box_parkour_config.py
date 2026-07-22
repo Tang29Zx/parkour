@@ -294,7 +294,7 @@ class Go2BoxParkour1BoxCfg(Go2BoxParkourCfg):
         RandomBoxTrack_kwargs.update(
             randomize=True,
             seed=0,
-            num_unique_layouts=7,
+            num_unique_layouts=11,
             track_length=6.2,
             track_width=2.0,
             spawn_margin=0.6,
@@ -309,9 +309,13 @@ class Go2BoxParkour1BoxCfg(Go2BoxParkourCfg):
                         0.08,
                         0.10,
                         0.12,
+                        0.13,
                         0.14,
+                        0.15,
                         0.16,
+                        0.17,
                         0.18,
+                        0.19,
                         0.20,
                     ),
                     lateral_offset=0.0,
@@ -325,10 +329,10 @@ class Go2BoxParkour1BoxCfg(Go2BoxParkourCfg):
             forward_speed_tracking = 0.5
             world_x_direction = 0.1
             course_progress = 0.0
-            landing_quality_progress = 250.0
-            landing_hold_progress = 500.0
+            landing_quality_progress = 0.0
+            landing_hold_progress = 0.0
             landing_deceleration_progress = 0.0
-            landing_alignment_progress = 250.0
+            landing_alignment_progress = 0.0
             speed_error_square = 0.0
             overspeed = -0.2
             action_rate = -0.005
@@ -386,7 +390,7 @@ class Go2BoxParkour1BoxCfg(Go2BoxParkourCfg):
             box_rear_foot_contact = 400.0
             box_passed = 500.0
             recovery_success = 750.0
-            basic_recovery = 250.0
+            basic_recovery = 0.0
             success = 750.0
             termination = -2250.0
             severe_body_impact = -2500.0
@@ -446,11 +450,18 @@ class Go2BoxParkour1BoxCfg(Go2BoxParkourCfg):
         quality_repair_flat_speed_limit = 1.2
         action_rate_floor = 1.0
         flat_airborne_free_ratio = 0.20
+        # Weakly recover the rough-walking prior only on the stable interior
+        # of the box top. The edge-crossing and dismount phases remain free.
+        box_top_reference_kl_weight = 0.25
+        box_top_reference_kl_edge_margin = 0.15
 
     class box_progress(Go2BoxParkourCfg.box_progress):
         required_boxes = 1
-        # Re-enable the flat-walking reference gradually after stable support,
-        # including the final landing transition.
+        # Success only requires safely walking 0.6 m beyond the box. The
+        # rough-walking reference, rather than a handcrafted landing pose,
+        # guides the post-box recovery.
+        landing_require_stability = False
+        reference_kl_post_course_use_time_ramp = True
         reference_kl_recovery_steps = 10
         recovery_steps = 3
         recovery_min_forward_distance = 0.25
@@ -473,7 +484,10 @@ class Go2BoxParkour1BoxCfg(Go2BoxParkourCfg):
             "stable_landing",
         )
         low_height_layouts = (0, 1, 2)
-        full_height_layouts = (2, 3, 4, 5, 6)
+        # Keep the low-box introduction unchanged, then expose a denser
+        # 1 cm height ladder so the policy does not have to bridge 2 cm
+        # changes between the final random layouts.
+        full_height_layouts = (2, 3, 4, 5, 6, 7, 8, 9, 10)
         minimum_stage_iterations = 100
         minimum_episodes = 256
         required_stable_windows = 2
@@ -495,7 +509,7 @@ class Go2BoxParkour1BoxCfg(Go2BoxParkourCfg):
         landing_blend_required_stable_windows = 2
         landing_blend_required_regression_windows = 2
         landing_blend_start_steps = 3
-        landing_blend_start_min_forward_distance = 0.25
+        landing_blend_start_min_forward_distance = 0.6
         landing_blend_start_horizontal_speed_threshold = 2.5
         landing_blend_start_lateral_speed_threshold = 2.0
         landing_blend_start_lateral_offset_threshold = 0.8
@@ -540,7 +554,7 @@ class Go2BoxParkour1BoxCfgPPO(Go2BoxParkourCfgPPO):
         reference_kl_start_coef = 0.02
 
     class runner(Go2BoxParkourCfgPPO.runner):
-        run_name = "one_box_v1814_fixed_landing0_from2950"
+        run_name = "one_box_v1816_kl_walking_no_landing_gate_from2950"
         init_at_random_ep_len = False
         resume = True
         load_run = osp.join(

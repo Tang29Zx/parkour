@@ -208,6 +208,33 @@ class BoxProgressTrackerTest(unittest.TestCase):
         self.update()
         self.assertTrue(self.tracker.success_buf[0])
 
+    def test_landing_stability_can_be_replaced_by_forward_recovery_line(self):
+        self.tracker = self.BoxProgressTracker(
+            2,
+            4,
+            1,
+            "cpu",
+            required_boxes=1,
+            landing_min_forward_distance=0.6,
+            landing_require_stability=False,
+        )
+        self.box_bounds = self.box_bounds[:, :1]
+        self.landing_end_x[:] = 4.4
+        self.curriculum_stage = self.torch.tensor([3, 3])
+        self.tracker.next_box_idx[0] = 1
+        self.tracker.passed_box_count[0] = 1
+        self.base_positions[0] = self.torch.tensor([2.7, 0.0, 0.5])
+        self.base_horizontal_speed[0] = 4.0
+        self.base_lateral_velocity[0] = 1.0
+        self.base_yaw[0] = 1.0
+        self.roll[0] = 1.0
+        self.pitch[0] = 1.0
+
+        self.update()
+
+        self.assertTrue(self.tracker.success_buf[0])
+        self.assertEqual(self.tracker.landing_counter[0].item(), 0)
+
     def test_landing_transition_starts_at_recovery_and_interpolates(self):
         self.tracker = self.BoxProgressTracker(
             2,

@@ -37,6 +37,7 @@ class BoxProgressTracker:
         landing_lateral_offset_threshold=0.40,
         landing_yaw_threshold=0.35,
         landing_deadline_steps=150,
+        landing_require_stability=True,
         body_contact_window_steps=25,
         body_contact_failure_steps=8,
         severe_body_impact_force=80.0,
@@ -150,6 +151,7 @@ class BoxProgressTracker:
         self.landing_yaw_threshold = self.final_landing_yaw_threshold
         self.landing_blend = 1.0
         self.landing_deadline_steps = int(landing_deadline_steps)
+        self.landing_require_stability = bool(landing_require_stability)
         landing_thresholds = (
             self.landing_horizontal_speed_threshold,
             self.landing_lateral_speed_threshold,
@@ -652,7 +654,11 @@ class BoxProgressTracker:
             self.landing_counter + 1,
             torch.zeros_like(self.landing_counter),
         )
-        landing_success = self.landing_counter >= self.landing_steps
+        landing_success = (
+            self.landing_counter >= self.landing_steps
+            if self.landing_require_stability
+            else in_landing_zone
+        )
         self.max_consecutive_valid_landing_steps[:] = torch.maximum(
             self.max_consecutive_valid_landing_steps,
             self.landing_counter,

@@ -3073,8 +3073,21 @@ class BoxRewardTest(unittest.TestCase):
         self.assertEqual(len(terrain["boxes"]), 1)
         self.assertEqual(
             terrain["boxes"][0]["height_choices"],
-            (0.08, 0.10, 0.12, 0.14, 0.16, 0.18, 0.20),
+            (
+                0.08,
+                0.10,
+                0.12,
+                0.13,
+                0.14,
+                0.15,
+                0.16,
+                0.17,
+                0.18,
+                0.19,
+                0.20,
+            ),
         )
+        self.assertEqual(terrain["num_unique_layouts"], 11)
         self.assertEqual(terrain["boxes"][0]["length"], 1.6)
         self.assertEqual(terrain["boxes"][0]["width"], 1.6)
         self.assertEqual(env_cfg.box_progress.min_landing_zone_length, 2.0)
@@ -3145,17 +3158,15 @@ class BoxRewardTest(unittest.TestCase):
             "box_rear_foot_contact": 8.0,
             "box_passed": 10.0,
             "recovery_success": 15.0,
-            "basic_recovery": 5.0,
+            "basic_recovery": 0.0,
             "success": 15.0,
         }
         for name, expected in expected_events.items():
             self.assertAlmostEqual(getattr(scales, name) * 0.02, expected)
-        self.assertAlmostEqual(scales.landing_quality_progress * 0.02, 5.0)
-        self.assertAlmostEqual(scales.landing_hold_progress * 0.02, 10.0)
+        self.assertEqual(scales.landing_quality_progress, 0.0)
+        self.assertEqual(scales.landing_hold_progress, 0.0)
         self.assertEqual(scales.landing_deceleration_progress, 0.0)
-        self.assertAlmostEqual(
-            scales.landing_alignment_progress * 0.02, 5.0
-        )
+        self.assertEqual(scales.landing_alignment_progress, 0.0)
         for name in (
             "termination",
             "landing_overrun",
@@ -3209,7 +3220,7 @@ class BoxRewardTest(unittest.TestCase):
         )
         self.assertEqual(
             runner.run_name,
-            "one_box_v1814_fixed_landing0_from2950",
+            "one_box_v1816_kl_walking_no_landing_gate_from2950",
         )
         self.assertIsNone(runner.ckpt_manipulator)
         self.assertEqual(runner.max_iterations, 2000)
@@ -3222,6 +3233,10 @@ class BoxRewardTest(unittest.TestCase):
         self.assertEqual(algorithm.reference_kl_start_coef, 0.02)
         self.assertEqual(algorithm.reference_kl_max_coef, 0.02)
         self.assertEqual(env_cfg.box_progress.reference_kl_recovery_steps, 10)
+        self.assertFalse(env_cfg.box_progress.landing_require_stability)
+        self.assertTrue(
+            env_cfg.box_progress.reference_kl_post_course_use_time_ramp
+        )
         curriculum = env_cfg.one_box_curriculum
         self.assertEqual(curriculum.state_version, 3)
         self.assertEqual(
@@ -3234,7 +3249,10 @@ class BoxRewardTest(unittest.TestCase):
             ),
         )
         self.assertEqual(curriculum.low_height_layouts, (0, 1, 2))
-        self.assertEqual(curriculum.full_height_layouts, (2, 3, 4, 5, 6))
+        self.assertEqual(
+            curriculum.full_height_layouts,
+            (2, 3, 4, 5, 6, 7, 8, 9, 10),
+        )
         self.assertEqual(curriculum.promotion_success_rate, 0.65)
         self.assertEqual(curriculum.landing_blend_step, 0.1)
         self.assertEqual(curriculum.landing_blend_maximum, 0.4)
@@ -3257,6 +3275,9 @@ class BoxRewardTest(unittest.TestCase):
         self.assertEqual(curriculum.joint_excursion_max_level, 10)
         self.assertEqual(curriculum.landing_blend_minimum_iterations, 100)
         self.assertEqual(curriculum.landing_blend_start_steps, 3)
+        self.assertEqual(
+            curriculum.landing_blend_start_min_forward_distance, 0.6
+        )
         self.assertAlmostEqual(
             curriculum.landing_blend_start_yaw_threshold, np.pi
         )
@@ -3270,6 +3291,10 @@ class BoxRewardTest(unittest.TestCase):
         )
         self.assertEqual(env_cfg.rewards.action_rate_floor, 1.0)
         self.assertEqual(env_cfg.rewards.flat_airborne_free_ratio, 0.20)
+        self.assertEqual(env_cfg.rewards.box_top_reference_kl_weight, 0.25)
+        self.assertEqual(
+            env_cfg.rewards.box_top_reference_kl_edge_margin, 0.15
+        )
 
     def test_three_and_five_box_tasks_keep_the_five_box_geometry(self):
         stages = (
@@ -3371,6 +3396,45 @@ class BoxRewardTest(unittest.TestCase):
 
         torch.testing.assert_close(
             mask, torch.tensor([1.0, 0.0, 0.5, 0.0, 1.0])
+        )
+
+    def test_box_top_reference_kl_is_weak_and_requires_stable_interior(self):
+        env = object.__new__(self.LeggedRobotBox)
+        env.root_states = torch.zeros(4, 13)
+        env.root_states[:, 0] = torch.tensor([1.8, 1.8, 1.8, 1.05])
+        env.root_states[:, 1] = 0.0
+        env.box_top_reference_kl_weight = 0.25
+        env.box_top_reference_kl_edge_margin = 0.15
+        env.box_progress = SimpleNamespace(
+            required_boxes=1,
+            front_contact_required_steps=2,
+            rear_contact_required_steps=2,
+        )
+        env.next_box_idx = torch.zeros(4, dtype=torch.long)
+        env.env_box_bounds = torch.tensor(
+            [[[1.0, 2.6, -0.8, 0.8, 0.12]]] * 4
+        )
+        env.front_contact_counter = torch.tensor([2, 2, 2, 2])
+        env.rear_contact_counter = torch.tensor([2, 1, 2, 2])
+        env.current_box_top_contact_mask = torch.tensor(
+            [
+                [True, False, True, False],
+                [True, False, True, False],
+                [True, True, False, False],
+                [True, False, True, False],
+            ]
+        )
+        env.rear_foot_local_indices = torch.tensor([2, 3])
+        env.base_contact_indices = torch.tensor([0])
+        env.contact_forces = torch.zeros(4, 1, 3)
+        env.cfg = SimpleNamespace(
+            rewards=SimpleNamespace(body_collision_force_threshold=1.0)
+        )
+
+        mask = self.LeggedRobotBox._box_top_reference_kl_mask(env)
+
+        torch.testing.assert_close(
+            mask, torch.tensor([0.25, 0.0, 0.0, 0.0])
         )
 
     def test_geometry_debug_task_keeps_four_physical_tracks(self):

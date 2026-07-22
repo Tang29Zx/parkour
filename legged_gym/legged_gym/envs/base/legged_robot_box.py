@@ -115,6 +115,9 @@ class LeggedRobotBox(LeggedRobot):
             ),
             landing_yaw_threshold=progress_cfg.landing_yaw_threshold,
             landing_deadline_steps=progress_cfg.landing_deadline_steps,
+            landing_require_stability=getattr(
+                progress_cfg, "landing_require_stability", True
+            ),
             body_contact_window_steps=progress_cfg.body_contact_window_steps,
             body_contact_failure_steps=(
                 progress_cfg.body_contact_failure_steps
@@ -134,6 +137,34 @@ class LeggedRobotBox(LeggedRobot):
                 "reference_kl_recovery_steps must be positive."
             )
         self.reference_kl_recovery_counter = torch.zeros(
+            self.num_envs, dtype=torch.long, device=self.device
+        )
+        self.reference_kl_post_course_use_time_ramp = bool(
+            getattr(
+                progress_cfg,
+                "reference_kl_post_course_use_time_ramp",
+                False,
+            )
+        )
+        self.box_top_reference_kl_weight = float(
+            getattr(
+                self.cfg.rewards, "box_top_reference_kl_weight", 0.0
+            )
+        )
+        self.box_top_reference_kl_edge_margin = float(
+            getattr(
+                self.cfg.rewards,
+                "box_top_reference_kl_edge_margin",
+                0.0,
+            )
+        )
+        if not 0.0 <= self.box_top_reference_kl_weight <= 1.0:
+            raise ValueError("box_top_reference_kl_weight must be in [0, 1].")
+        if self.box_top_reference_kl_edge_margin < 0.0:
+            raise ValueError(
+                "box_top_reference_kl_edge_margin must be non-negative."
+            )
+        self.box_top_reference_kl_step_count = torch.zeros(
             self.num_envs, dtype=torch.long, device=self.device
         )
         self._init_one_box_curriculum()
@@ -1451,6 +1482,9 @@ class LeggedRobotBox(LeggedRobot):
             self.reference_kl_recovery_counter + 1,
             torch.zeros_like(self.reference_kl_recovery_counter),
         )
+        self.box_top_reference_kl_step_count += (
+            self._box_top_reference_kl_mask() > 0.0
+        ).long()
 
     def _init_rear_upper_joint_statistics(self):
         """Allocate flat/box statistics for the rear hip and thigh joints."""
@@ -2550,6 +2584,11 @@ class LeggedRobotBox(LeggedRobot):
         episode["curriculum_success_rate"] = (
             self.curriculum_success_buf[env_ids].float().mean()
         )
+        episode_lengths = self.episode_length_buf[env_ids].clamp_min(1)
+        episode["box_top_reference_kl_ratio"] = (
+            self.box_top_reference_kl_step_count[env_ids].float()
+            / episode_lengths.float()
+        ).mean()
         episode["required_boxes"] = torch.tensor(
             float(self.box_progress.required_boxes), device=self.device
         )
@@ -2904,6 +2943,8 @@ class LeggedRobotBox(LeggedRobot):
             self.landing_alignment_delta[env_ids] = 0.0
         if hasattr(self, "reference_kl_recovery_counter"):
             self.reference_kl_recovery_counter[env_ids] = 0
+        if hasattr(self, "box_top_reference_kl_step_count"):
+            self.box_top_reference_kl_step_count[env_ids] = 0
 
     def _near_box_for_speed_control(self):
         """Return environments with a non-zero current-box speed blend."""
@@ -2952,8 +2993,66 @@ class LeggedRobotBox(LeggedRobot):
             * near_y.to(ramp_up.dtype)
         ).clamp(0.0, 1.0)
 
+    def _box_top_reference_kl_mask(self):
+        """Return a weak walking-prior mask on the stable box-top interior."""
+        weight = float(
+            getattr(self, "box_top_reference_kl_weight", 0.0)
+        )
+        if weight <= 0.0 or not hasattr(self, "env_box_bounds"):
+            return torch.zeros(
+                self.root_states.shape[0],
+                dtype=self.root_states.dtype,
+                device=self.root_states.device,
+            )
+
+        num_envs = self.root_states.shape[0]
+        env_ids = torch.arange(num_envs, device=self.root_states.device)
+        course_active = self.next_box_idx < self.box_progress.required_boxes
+        target_indices = self.next_box_idx.clamp(
+            max=self.box_progress.required_boxes - 1
+        )
+        bounds = self.env_box_bounds[env_ids, target_indices]
+        margin = float(self.box_top_reference_kl_edge_margin)
+        base_x = self.root_states[:, 0]
+        base_y = self.root_states[:, 1]
+        inside_top_interior = (
+            (base_x >= bounds[:, 0] + margin)
+            & (base_x <= bounds[:, 1] - margin)
+            & (base_y >= bounds[:, 2] + margin)
+            & (base_y <= bounds[:, 3] - margin)
+        )
+        front_done = (
+            self.front_contact_counter
+            >= self.box_progress.front_contact_required_steps
+        )
+        rear_done = (
+            self.rear_contact_counter
+            >= self.box_progress.rear_contact_required_steps
+        )
+        top_contacts = self.current_box_top_contact_mask
+        enough_top_support = top_contacts.sum(dim=1) >= 2
+        rear_top_support = top_contacts[
+            :, self.rear_foot_local_indices
+        ].any(dim=1)
+        body_contact = (
+            torch.linalg.vector_norm(
+                self.contact_forces[:, self.base_contact_indices, :], dim=-1
+            ).max(dim=1).values
+            > self.cfg.rewards.body_collision_force_threshold
+        )
+        active = (
+            course_active
+            & inside_top_interior
+            & front_done
+            & rear_done
+            & enough_top_support
+            & rear_top_support
+            & ~body_contact
+        )
+        return active.to(self.root_states.dtype) * weight
+
     def get_reference_kl_mask(self):
-        """Protect approach gait and softly recover it after the final box."""
+        """Protect flat gait and weakly regularize stable box-top walking."""
         flat = (self._box_speed_blend() <= 0.0).to(
             dtype=self.root_states.dtype
         )
@@ -2974,8 +3073,15 @@ class LeggedRobotBox(LeggedRobot):
             final_stage = self.episode_curriculum_stage >= 3
         else:
             final_stage = torch.ones_like(course_complete)
+        post_course_progress = (
+            self.steps_in_landing_phase
+            if getattr(
+                self, "reference_kl_post_course_use_time_ramp", False
+            )
+            else self.reference_kl_recovery_counter
+        )
         post_course_ramp = (
-            self.reference_kl_recovery_counter.float()
+            post_course_progress.float()
             / float(self.reference_kl_recovery_steps)
         ).clamp(0.0, 1.0) * (course_complete & final_stage).float()
         protected_flat = (
@@ -2983,7 +3089,8 @@ class LeggedRobotBox(LeggedRobot):
             + recovered_between_boxes.float()
             + post_course_ramp
         ).clamp(0.0, 1.0)
-        return flat * protected_flat
+        flat_mask = flat * protected_flat
+        return torch.maximum(flat_mask, self._box_top_reference_kl_mask())
 
     def _positive_speed_allowance(self):
         """Allow a small positive speed error only near a box."""
@@ -3639,6 +3746,9 @@ class LeggedRobotBox(LeggedRobot):
             "landing_blend_promoted": float(self.landing_blend_promoted),
             "landing_blend_regressed": float(self.landing_blend_regressed),
             "landing_required_steps": float(self.box_progress.landing_steps),
+            "landing_require_stability": float(
+                self.box_progress.landing_require_stability
+            ),
             "landing_required_forward_distance": float(
                 self.box_progress.landing_min_forward_distance
             ),
