@@ -635,6 +635,12 @@ class CriticWarmupTest(unittest.TestCase):
         self.assertIsNotNone(window)
         self.assertAlmostEqual(window["box_pass_rate"], 0.9)
 
+    def test_quality_window_skips_non_box_environments(self):
+        runner = OnPolicyRunner.__new__(OnPolicyRunner)
+        runner.env = SimpleNamespace()
+
+        self.assertIsNone(runner._get_quality_window({}))
+
     def test_runner_saves_unique_warmup_boundary_checkpoint(self):
         runner = OnPolicyRunner.__new__(OnPolicyRunner)
         runner.alg = self.make_ppo()

@@ -475,8 +475,13 @@ class OnPolicyRunner:
         return summary
 
     def _get_quality_window(self, episode_summary):
+        box_progress = getattr(self.env, "box_progress", None)
+        if box_progress is None or not hasattr(
+            box_progress, "required_boxes"
+        ):
+            return None
         final_box_key = "box_{}_pass_rate".format(
-            self.env.box_progress.required_boxes
+            box_progress.required_boxes
         )
         required = (
             "num_terminated",
