@@ -133,6 +133,60 @@ def reset_one_box_critic_from4000(source_state_dict, algo_state_dict):
     return migrated
 
 
+def initialize_three_box_from_one_box3500(
+    source_state_dict, algo_state_dict
+):
+    """Initialize fixed-difficulty three-box training from model 3500."""
+    if int(source_state_dict.get("iter", -1)) != 3500:
+        raise ValueError(
+            "Three-box initialization requires the accepted one-box "
+            "model_3500.pt checkpoint."
+        )
+    task_state = source_state_dict.get("task_curriculum_state_dict")
+    if not isinstance(task_state, dict):
+        raise ValueError("The one-box checkpoint has no curriculum state.")
+    expected_integer_state = {
+        "version": 3,
+        "stage": 3,
+        "height_level": 8,
+        "joint_constraint_phase": 0,
+        "joint_velocity_level": 2,
+        "joint_excursion_level": 0,
+    }
+    mismatches = {
+        key: (task_state.get(key), expected)
+        for key, expected in expected_integer_state.items()
+        if int(task_state.get(key, -1)) != expected
+    }
+    if mismatches:
+        raise ValueError(
+            "model_3500.pt has an unexpected one-box difficulty state: "
+            f"{mismatches}."
+        )
+    if abs(float(task_state.get("landing_blend", -1.0))) > 1e-6:
+        raise ValueError(
+            "Three-box initialization requires landing blend 0.0."
+        )
+    if source_state_dict.get("reference_model_state_dict") is None:
+        raise ValueError(
+            "model_3500.pt has no frozen reference policy to validate its "
+            "training lineage."
+        )
+
+    migrated = reset_critic_and_optimizer(
+        source_state_dict, algo_state_dict
+    )
+    # The runner snapshots the preserved model-3500 Actor as the new frozen
+    # three-box reference. One-box curriculum and optimizer state must not
+    # leak into the immutable three-box task.
+    print(
+        "\033[1;36m Initialized fixed-difficulty three-box training from "
+        "one-box model_3500: preserved the Actor side, reset Critic and "
+        "optimizer, and discarded the one-box curriculum state. \033[0m"
+    )
+    return migrated
+
+
 def initialize_one_box_from_rough2000(
     source_state_dict,
     algo_state_dict,

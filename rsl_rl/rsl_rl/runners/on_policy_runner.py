@@ -915,6 +915,7 @@ class OnPolicyRunner:
         if manipulator_name in {
             "reset_critic_and_optimizer",
             "reset_one_box_critic_from4000",
+            "initialize_three_box_from_one_box3500",
             "initialize_one_box_from_rough2000",
             "initialize_go2_field_wide_scan_from_rough2000",
         }:

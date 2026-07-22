@@ -577,22 +577,150 @@ class Go2BoxParkour1BoxCfgPPO(Go2BoxParkourCfgPPO):
         log_interval = 50
 
 
-class Go2BoxParkour3BoxCfg(Go2BoxParkourCfg):
-    """Three-box curriculum stage on the unchanged five-box terrain."""
+class Go2BoxParkour3BoxCfg(Go2BoxParkour1BoxCfg):
+    """Fixed three-box stage initialized from the model-3500 policy."""
 
-    class env(Go2BoxParkourCfg.env):
+    class env(Go2BoxParkour1BoxCfg.env):
         episode_length_s = 30
 
-    class box_progress(Go2BoxParkourCfg.box_progress):
+    class terrain(Go2BoxParkour1BoxCfg.terrain):
+        RandomBoxTrack_kwargs = deepcopy(
+            Go2BoxParkour1BoxCfg.terrain.RandomBoxTrack_kwargs
+        )
+        RandomBoxTrack_kwargs.update(
+            num_unique_layouts=19,
+            track_length=12.5,
+            first_gap_range=(0.5, 1.5),
+            gap_distributions=[
+                dict(name="normal", range=(0.5, 1.5), weight=1.0),
+            ],
+            boxes=[
+                dict(
+                    gap=0.5,
+                    length=1.2,
+                    width=1.2,
+                    height=0.20,
+                    height_choices=(
+                        0.12,
+                        0.13,
+                        0.14,
+                        0.15,
+                        0.16,
+                        0.17,
+                        0.18,
+                        0.19,
+                        0.20,
+                        0.21,
+                        0.22,
+                        0.23,
+                        0.24,
+                        0.25,
+                        0.26,
+                        0.27,
+                        0.28,
+                        0.29,
+                        0.30,
+                    ),
+                    lateral_offset=0.0,
+                ),
+                dict(
+                    gap=0.5,
+                    length=1.2,
+                    width=1.2,
+                    height=0.20,
+                    height_choices=(
+                        0.18,
+                        0.19,
+                        0.20,
+                        0.21,
+                        0.22,
+                        0.23,
+                        0.24,
+                        0.25,
+                        0.26,
+                        0.27,
+                        0.28,
+                        0.29,
+                        0.30,
+                        0.12,
+                        0.13,
+                        0.14,
+                        0.15,
+                        0.16,
+                        0.17,
+                    ),
+                    lateral_offset=0.0,
+                ),
+                dict(
+                    gap=0.5,
+                    length=1.2,
+                    width=1.2,
+                    height=0.20,
+                    height_choices=(
+                        0.24,
+                        0.25,
+                        0.26,
+                        0.27,
+                        0.28,
+                        0.29,
+                        0.30,
+                        0.12,
+                        0.13,
+                        0.14,
+                        0.15,
+                        0.16,
+                        0.17,
+                        0.18,
+                        0.19,
+                        0.20,
+                        0.21,
+                        0.22,
+                        0.23,
+                    ),
+                    lateral_offset=0.0,
+                ),
+            ],
+        )
+
+    class rewards(Go2BoxParkour1BoxCfg.rewards):
+        # model_3500 had completed two 5% velocity-threshold reductions.
+        box_joint_hip_velocity_threshold = 6.0 * 0.95**2
+        box_joint_thigh_velocity_threshold = 9.0 * 0.95**2
+        box_joint_calf_velocity_threshold = 11.0 * 0.95**2
+
+    class box_progress(Go2BoxParkour1BoxCfg.box_progress):
         required_boxes = 3
+        # Freeze the Stage-3 blend at the model-3500 value of zero.
+        landing_require_stability = False
+        landing_steps = 3
+        landing_min_forward_distance = 0.6
+        landing_horizontal_speed_threshold = 2.5
+        landing_lateral_speed_threshold = 2.0
+        landing_lateral_offset_threshold = 0.8
+        landing_yaw_threshold = np.pi
+
+    class one_box_curriculum(Go2BoxParkour1BoxCfg.one_box_curriculum):
+        # The three-box stage has no automatic height, landing, joint-speed,
+        # or joint-excursion promotion. Its difficulty is immutable.
+        enabled = False
+        staged_progress_enabled = True
+        joint_constraint_enabled = False
 
 
-class Go2BoxParkour3BoxCfgPPO(Go2BoxParkourCfgPPO):
-    class runner(Go2BoxParkourCfgPPO.runner):
-        run_name = "three_box_v9_curriculum"
-        # Continue from the accepted one-box checkpoint without migration.
-        resume = False
-        load_run = -1
-        checkpoint = -1
+class Go2BoxParkour3BoxCfgPPO(Go2BoxParkour1BoxCfgPPO):
+    class runner(Go2BoxParkour1BoxCfgPPO.runner):
+        run_name = "three_box_fixed3500_from3500"
+        resume = True
+        load_run = osp.join(
+            osp.dirname(osp.dirname(osp.dirname(osp.dirname(__file__)))),
+            "logs",
+            "go2_box_parkour",
+            "Jul22_14-19-34_one_box_v1814_from2950",
+        )
+        checkpoint = 3500
+        # Select the one-time Critic reset explicitly from the command line.
+        # Ordinary resumes must leave this disabled.
         ckpt_manipulator = None
         max_iterations = 1000
+        save_interval = 50
+        log_interval = 50

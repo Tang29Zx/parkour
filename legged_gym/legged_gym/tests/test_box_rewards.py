@@ -345,6 +345,77 @@ class HeightEncoderMigrationTest(unittest.TestCase):
                 bad_source, {"model_state_dict": target_model}
             )
 
+    def test_three_box_initializer_accepts_only_frozen_3500_difficulty(self):
+        names = (
+            "std",
+            "actor.0.weight",
+            "memory_a.rnn.weight",
+            "encoders.0.weight",
+            "critic.0.weight",
+            "memory_c.rnn.weight",
+            "critic_encoders.0.weight",
+        )
+        source_model = OrderedDict(
+            (name, torch.full((2, 2), float(index + 1)))
+            for index, name in enumerate(names)
+        )
+        target_model = OrderedDict(
+            (name, torch.full((2, 2), float(index + 101)))
+            for index, name in enumerate(names)
+        )
+        source = {
+            "model_state_dict": source_model,
+            "optimizer_state_dict": {"old": True},
+            "lr_scheduler_state_dict": {"old": True},
+            "reference_model_state_dict": {
+                "actor.0.weight": torch.ones(2, 2)
+            },
+            "task_curriculum_state_dict": {
+                "version": 3,
+                "stage": 3,
+                "height_level": 8,
+                "landing_blend": 0.0,
+                "joint_constraint_phase": 0,
+                "joint_velocity_level": 2,
+                "joint_excursion_level": 0,
+            },
+            "iter": 3500,
+            "infos": {"source": "one_box_v1814"},
+        }
+
+        migrated = self.module.initialize_three_box_from_one_box3500(
+            source, {"model_state_dict": target_model}
+        )
+
+        critic_prefixes = ("critic.", "memory_c.", "critic_encoders.")
+        for key in names:
+            expected = (
+                target_model[key]
+                if key.startswith(critic_prefixes)
+                else source_model[key]
+            )
+            torch.testing.assert_close(
+                migrated["model_state_dict"][key], expected
+            )
+        self.assertEqual(migrated["iter"], 3500)
+        self.assertNotIn("optimizer_state_dict", migrated)
+        self.assertNotIn("lr_scheduler_state_dict", migrated)
+        self.assertNotIn("task_curriculum_state_dict", migrated)
+
+        bad_source = dict(source, iter=3499)
+        with self.assertRaises(ValueError):
+            self.module.initialize_three_box_from_one_box3500(
+                bad_source, {"model_state_dict": target_model}
+            )
+        bad_source = dict(source)
+        bad_source["task_curriculum_state_dict"] = dict(
+            source["task_curriculum_state_dict"], joint_velocity_level=1
+        )
+        with self.assertRaises(ValueError):
+            self.module.initialize_three_box_from_one_box3500(
+                bad_source, {"model_state_dict": target_model}
+            )
+
     def test_one_box_initializer_expands_actor_scan_and_resets_critic(self):
         source_model = OrderedDict(
             [
@@ -3296,33 +3367,63 @@ class BoxRewardTest(unittest.TestCase):
             env_cfg.rewards.box_top_reference_kl_edge_margin, 0.15
         )
 
-    def test_three_and_five_box_tasks_keep_the_five_box_geometry(self):
-        stages = (
-            (
-                self.three_box_cfg,
-                self.three_box_train_cfg,
-                3,
-                30,
-                "three_box",
-            ),
-            (self.env_cfg, self.train_cfg, 5, 45, "five_box"),
-        )
-        reference_boxes = self.env_cfg.terrain.RandomBoxTrack_kwargs["boxes"]
-        for env_cfg, train_cfg, required_boxes, episode_length, run_prefix in stages:
-            self.assertEqual(env_cfg.box_progress.required_boxes, required_boxes)
-            self.assertEqual(env_cfg.env.episode_length_s, episode_length)
-            self.assertEqual(
-                env_cfg.box_progress.min_landing_zone_length, 0.85
-            )
-            self.assertEqual(
-                env_cfg.terrain.RandomBoxTrack_kwargs["boxes"], reference_boxes
-            )
-            self.assertEqual(len(reference_boxes), 5)
-            self.assertTrue(train_cfg.runner.run_name.startswith(run_prefix))
+    def test_three_box_freezes_model_3500_difficulty(self):
+        env_cfg = self.three_box_cfg
+        train_cfg = self.three_box_train_cfg
+        terrain = env_cfg.terrain.RandomBoxTrack_kwargs
+        expected_heights = {
+            round(0.12 + 0.01 * index, 2) for index in range(19)
+        }
 
-        self.assertFalse(self.three_box_train_cfg.runner.resume)
+        self.assertEqual(env_cfg.box_progress.required_boxes, 3)
+        self.assertEqual(env_cfg.env.episode_length_s, 30)
+        self.assertEqual(env_cfg.box_progress.min_landing_zone_length, 2.0)
+        self.assertEqual(terrain["num_unique_layouts"], 19)
+        self.assertEqual(terrain["track_length"], 12.5)
+        self.assertEqual(terrain["first_gap_range"], (0.5, 1.5))
+        self.assertEqual(
+            terrain["gap_distributions"][0]["range"], (0.5, 1.5)
+        )
+        self.assertEqual(len(terrain["boxes"]), 3)
+        for box in terrain["boxes"]:
+            self.assertEqual((box["length"], box["width"]), (1.2, 1.2))
+            self.assertEqual(set(box["height_choices"]), expected_heights)
+        self.assertGreaterEqual(
+            terrain["track_length"]
+            - terrain["spawn_margin"]
+            - max(terrain["first_gap_range"])
+            - sum(box["length"] for box in terrain["boxes"])
+            - 2 * max(terrain["gap_distributions"][0]["range"]),
+            env_cfg.box_progress.min_landing_zone_length,
+        )
+        self.assertFalse(env_cfg.one_box_curriculum.enabled)
+        self.assertTrue(env_cfg.one_box_curriculum.staged_progress_enabled)
+        self.assertFalse(env_cfg.one_box_curriculum.joint_constraint_enabled)
+        self.assertFalse(env_cfg.box_progress.landing_require_stability)
+        self.assertEqual(env_cfg.box_progress.landing_steps, 3)
+        self.assertEqual(
+            env_cfg.rewards.box_joint_hip_velocity_threshold,
+            6.0 * 0.95**2,
+        )
+        self.assertEqual(
+            env_cfg.rewards.box_joint_thigh_velocity_threshold,
+            9.0 * 0.95**2,
+        )
+        self.assertEqual(
+            env_cfg.rewards.box_joint_calf_velocity_threshold,
+            11.0 * 0.95**2,
+        )
+
+        self.assertTrue(train_cfg.runner.resume)
+        self.assertEqual(train_cfg.runner.checkpoint, 3500)
         self.assertIsNone(self.three_box_train_cfg.runner.ckpt_manipulator)
         self.assertEqual(self.three_box_train_cfg.runner.max_iterations, 1000)
+        self.assertTrue(train_cfg.runner.run_name.startswith("three_box"))
+
+        five_box_geometry = self.env_cfg.terrain.RandomBoxTrack_kwargs["boxes"]
+        self.assertEqual(self.env_cfg.box_progress.required_boxes, 5)
+        self.assertEqual(self.env_cfg.env.episode_length_s, 45)
+        self.assertEqual(len(five_box_geometry), 5)
 
     def test_curriculum_tasks_are_registered_with_the_box_environment(self):
         expected = {

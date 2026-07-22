@@ -401,6 +401,9 @@ class LeggedRobotBox(LeggedRobot):
                 f"{name}_delta",
                 torch.zeros_like(self.forward_speed_sum),
             )
+        self.stage_progress_target_idx = torch.full(
+            (self.num_envs,), -1, dtype=torch.long, device=self.device
+        )
         self.current_box_top_contact_mask = torch.zeros(
             self.num_envs,
             len(self.feet_indices),
@@ -628,6 +631,13 @@ class LeggedRobotBox(LeggedRobot):
         cfg = getattr(self.cfg, "one_box_curriculum", None)
         self.uses_task_curriculum = bool(
             cfg is not None and getattr(cfg, "enabled", False)
+        )
+        self.uses_staged_box_progress = bool(
+            self.uses_task_curriculum
+            or (
+                cfg is not None
+                and getattr(cfg, "staged_progress_enabled", False)
+            )
         )
         self.one_box_curriculum_stage = 0
         self.one_box_height_level = 0
@@ -1059,6 +1069,26 @@ class LeggedRobotBox(LeggedRobot):
         target_indices = self.next_box_idx.clamp(
             max=self.box_progress.required_boxes - 1
         )
+        # Dense stage progress belongs to the current target box. Reset its
+        # high-water marks when advancing so every box can provide guidance
+        # once, while backtracking still cannot replay rewards for that box.
+        if not hasattr(self, "stage_progress_target_idx"):
+            self.stage_progress_target_idx = torch.full_like(
+                target_indices, -1
+            )
+        target_changed = self.stage_progress_target_idx != target_indices
+        if target_changed.any():
+            for name in (
+                "box_approach",
+                "front_foot_clearance",
+                "post_front_base",
+                "rear_foot_clearance",
+                "box_exit",
+            ):
+                getattr(self, f"{name}_best")[target_changed] = 0.0
+                getattr(self, f"{name}_delta")[target_changed] = 0.0
+            self.stagnation_counter[target_changed] = 0
+        self.stage_progress_target_idx[:] = target_indices
         bounds = self.env_box_bounds[env_ids, target_indices]
         base_x = self.root_states[:, 0]
         cfg = self.cfg.rewards
@@ -2362,7 +2392,7 @@ class LeggedRobotBox(LeggedRobot):
             > self.cfg.box_progress.contact_force_threshold
         )
 
-        if self.uses_task_curriculum:
+        if self.uses_staged_box_progress:
             self._update_one_box_stage_progress(
                 feet_positions, feet_terrain_heights, feet_contact_forces
             )
@@ -2396,7 +2426,7 @@ class LeggedRobotBox(LeggedRobot):
             external_fall=self.flat_low_base_height_failure_buf,
             external_stagnation=(
                 self.stagnation_candidate_buf
-                if self.uses_task_curriculum
+                if self.uses_staged_box_progress
                 else None
             ),
             curriculum_stage=(
@@ -2924,6 +2954,8 @@ class LeggedRobotBox(LeggedRobot):
             ):
                 getattr(self, f"{name}_best")[env_ids] = 0.0
                 getattr(self, f"{name}_delta")[env_ids] = 0.0
+            if hasattr(self, "stage_progress_target_idx"):
+                self.stage_progress_target_idx[env_ids] = -1
             self.stagnation_counter[env_ids] = 0
             self.max_stagnation_steps[env_ids] = 0
             self.stagnation_candidate_buf[env_ids] = False
