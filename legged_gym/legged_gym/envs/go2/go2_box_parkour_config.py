@@ -695,6 +695,9 @@ class Go2BoxParkour3BoxCfg(Go2BoxParkour1BoxCfg):
         landing_steps = 3
         landing_min_forward_distance = 0.6
         landing_horizontal_speed_threshold = 2.5
+        # Deceleration shaping is disabled for this task, but the shared
+        # buffer initializer still requires an ordered speed interval.
+        landing_deceleration_start_speed = 3.0
         landing_lateral_speed_threshold = 2.0
         landing_lateral_offset_threshold = 0.8
         landing_yaw_threshold = np.pi

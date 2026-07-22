@@ -3401,6 +3401,10 @@ class BoxRewardTest(unittest.TestCase):
         self.assertFalse(env_cfg.one_box_curriculum.joint_constraint_enabled)
         self.assertFalse(env_cfg.box_progress.landing_require_stability)
         self.assertEqual(env_cfg.box_progress.landing_steps, 3)
+        self.assertGreater(
+            env_cfg.box_progress.landing_deceleration_start_speed,
+            env_cfg.box_progress.landing_horizontal_speed_threshold,
+        )
         self.assertEqual(
             env_cfg.rewards.box_joint_hip_velocity_threshold,
             6.0 * 0.95**2,
