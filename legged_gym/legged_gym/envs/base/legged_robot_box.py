@@ -127,6 +127,15 @@ class LeggedRobotBox(LeggedRobot):
             pitch_threshold=progress_cfg.pitch_threshold,
             base_height_threshold=progress_cfg.base_height_threshold,
             lateral_limit=progress_cfg.lateral_limit,
+            inter_box_transition_enabled=getattr(
+                progress_cfg, "inter_box_transition_enabled", False
+            ),
+            inter_box_recovery_steps=getattr(
+                progress_cfg, "inter_box_recovery_steps", 3
+            ),
+            inter_box_stagnation_steps=getattr(
+                progress_cfg, "inter_box_stagnation_steps", 100
+            ),
         )
         self._bind_progress_buffers()
         self.reference_kl_recovery_steps = int(
@@ -165,6 +174,20 @@ class LeggedRobotBox(LeggedRobot):
                 "box_top_reference_kl_edge_margin must be non-negative."
             )
         self.box_top_reference_kl_step_count = torch.zeros(
+            self.num_envs, dtype=torch.long, device=self.device
+        )
+        self.inter_box_ground_reference_kl_weight = float(
+            getattr(
+                self.cfg.rewards,
+                "inter_box_ground_reference_kl_weight",
+                0.0,
+            )
+        )
+        if not 0.0 <= self.inter_box_ground_reference_kl_weight <= 1.0:
+            raise ValueError(
+                "inter_box_ground_reference_kl_weight must be in [0, 1]."
+            )
+        self.inter_box_reference_kl_step_count = torch.zeros(
             self.num_envs, dtype=torch.long, device=self.device
         )
         self._init_one_box_curriculum()
@@ -625,6 +648,21 @@ class LeggedRobotBox(LeggedRobot):
         self.landing_quality_delta = tracker.landing_quality_delta
         self.landing_hold_delta = tracker.landing_hold_delta
         self.episode_timeout_buf = tracker.episode_timeout_buf
+        self.transition_pending = tracker.transition_pending
+        self.transition_ground_route = tracker.transition_ground_route
+        self.direct_transition_success_buf = (
+            tracker.direct_transition_success_buf
+        )
+        self.dismount_front_ground_buf = tracker.dismount_front_ground_buf
+        self.dismount_rear_ground_buf = tracker.dismount_rear_ground_buf
+        self.inter_box_recovery_buf = tracker.inter_box_recovery_buf
+        self.inter_box_stagnation_buf = tracker.inter_box_stagnation_buf
+        self.transition_started_count = tracker.transition_started_count
+        self.direct_transition_success_count = (
+            tracker.direct_transition_success_count
+        )
+        self.ground_transition_count = tracker.ground_transition_count
+        self.inter_box_recovery_count = tracker.inter_box_recovery_count
 
     def _init_one_box_curriculum(self):
         """Initialize global and per-episode state for the one-box course."""
@@ -1514,6 +1552,9 @@ class LeggedRobotBox(LeggedRobot):
         )
         self.box_top_reference_kl_step_count += (
             self._box_top_reference_kl_mask() > 0.0
+        ).long()
+        self.inter_box_reference_kl_step_count += (
+            self._inter_box_ground_reference_kl_mask() > 0.0
         ).long()
 
     def _init_rear_upper_joint_statistics(self):
@@ -2619,6 +2660,70 @@ class LeggedRobotBox(LeggedRobot):
             self.box_top_reference_kl_step_count[env_ids].float()
             / episode_lengths.float()
         ).mean()
+        episode["inter_box_reference_kl_ratio"] = (
+            self.inter_box_reference_kl_step_count[env_ids].float()
+            / episode_lengths.float()
+        ).mean()
+        transition_starts = self.transition_started_count[env_ids]
+        direct_transitions = self.direct_transition_success_count[env_ids]
+        ground_transitions = self.ground_transition_count[env_ids]
+        ground_recoveries = self.inter_box_recovery_count[env_ids]
+        route_decisions = direct_transitions.sum() + ground_transitions.sum()
+        episode["mean_inter_box_transitions"] = (
+            transition_starts.float().mean()
+        )
+        episode["mean_direct_transitions"] = (
+            direct_transitions.float().mean()
+        )
+        episode["mean_ground_transitions"] = (
+            ground_transitions.float().mean()
+        )
+        episode["mean_ground_recoveries"] = (
+            ground_recoveries.float().mean()
+        )
+        episode["direct_transition_share"] = (
+            direct_transitions.sum().float()
+            / route_decisions.clamp_min(1).float()
+        )
+        episode["ground_transition_share"] = (
+            ground_transitions.sum().float()
+            / route_decisions.clamp_min(1).float()
+        )
+        episode["ground_recovery_success_rate"] = (
+            ground_recoveries.sum().float()
+            / ground_transitions.sum().clamp_min(1).float()
+        )
+        episode["inter_box_stagnation_rate"] = (
+            self.inter_box_stagnation_buf[env_ids].float().mean()
+        )
+        episode["max_transition_stagnation_steps"] = (
+            self.box_progress.max_transition_stagnation_steps[env_ids]
+            .float()
+            .max()
+        )
+        for gap_idx, gap_name in enumerate(("close", "medium", "far")):
+            starts = self.box_progress.transition_started_by_gap[
+                env_ids, gap_idx
+            ].sum()
+            direct = self.box_progress.direct_transition_by_gap[
+                env_ids, gap_idx
+            ].sum()
+            ground = self.box_progress.ground_transition_by_gap[
+                env_ids, gap_idx
+            ].sum()
+            recovered = self.box_progress.inter_box_recovery_by_gap[
+                env_ids, gap_idx
+            ].sum()
+            episode[f"transition_{gap_name}_count"] = starts.float()
+            episode[f"transition_{gap_name}_direct_rate"] = (
+                direct.float() / starts.clamp_min(1).float()
+            )
+            episode[f"transition_{gap_name}_ground_rate"] = (
+                ground.float() / starts.clamp_min(1).float()
+            )
+            episode[f"transition_{gap_name}_recovery_rate"] = (
+                recovered.float() / ground.clamp_min(1).float()
+            )
         episode["required_boxes"] = torch.tensor(
             float(self.box_progress.required_boxes), device=self.device
         )
@@ -2977,6 +3082,8 @@ class LeggedRobotBox(LeggedRobot):
             self.reference_kl_recovery_counter[env_ids] = 0
         if hasattr(self, "box_top_reference_kl_step_count"):
             self.box_top_reference_kl_step_count[env_ids] = 0
+        if hasattr(self, "inter_box_reference_kl_step_count"):
+            self.inter_box_reference_kl_step_count[env_ids] = 0
 
     def _near_box_for_speed_control(self):
         """Return environments with a non-zero current-box speed blend."""
@@ -3083,6 +3190,20 @@ class LeggedRobotBox(LeggedRobot):
         )
         return active.to(self.root_states.dtype) * weight
 
+    def _inter_box_ground_reference_kl_mask(self):
+        """Weakly restore walking only after the ground route is selected."""
+        weight = float(
+            getattr(self, "inter_box_ground_reference_kl_weight", 0.0)
+        )
+        if weight <= 0.0 or not hasattr(self, "transition_pending"):
+            return torch.zeros(
+                self.root_states.shape[0],
+                dtype=self.root_states.dtype,
+                device=self.root_states.device,
+            )
+        active = self.transition_pending & self.transition_ground_route
+        return active.to(self.root_states.dtype) * weight
+
     def get_reference_kl_mask(self):
         """Protect flat gait and weakly regularize stable box-top walking."""
         flat = (self._box_speed_blend() <= 0.0).to(
@@ -3122,7 +3243,11 @@ class LeggedRobotBox(LeggedRobot):
             + post_course_ramp
         ).clamp(0.0, 1.0)
         flat_mask = flat * protected_flat
-        return torch.maximum(flat_mask, self._box_top_reference_kl_mask())
+        obstacle_mask = torch.maximum(
+            self._box_top_reference_kl_mask(),
+            self._inter_box_ground_reference_kl_mask(),
+        )
+        return torch.maximum(flat_mask, obstacle_mask)
 
     def _positive_speed_allowance(self):
         """Allow a small positive speed error only near a box."""
@@ -4653,6 +4778,22 @@ class LeggedRobotBox(LeggedRobot):
     def _reward_box_passed(self):
         """Emit one event when the current box is passed."""
         return self.box_passed_buf.float()
+
+    def _reward_direct_transition_success(self):
+        """Reward reaching the next box top without touching gap ground."""
+        return self.direct_transition_success_buf.float()
+
+    def _reward_dismount_front_ground(self):
+        """Reward the first valid front-foot contact in the inter-box gap."""
+        return self.dismount_front_ground_buf.float()
+
+    def _reward_dismount_rear_ground(self):
+        """Reward the first valid rear-foot contact in the inter-box gap."""
+        return self.dismount_rear_ground_buf.float()
+
+    def _reward_inter_box_recovery(self):
+        """Reward stable two-foot support after selecting the ground route."""
+        return self.inter_box_recovery_buf.float()
 
     def _reward_box_front_foot_contact(self):
         """Emit once after enough front-foot contact steps on the box top."""

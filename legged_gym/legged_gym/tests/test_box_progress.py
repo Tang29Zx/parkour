@@ -736,6 +736,14 @@ class BoxProgressTrackerTest(unittest.TestCase):
         self.tracker.fall_buf[:] = True
         self.tracker.incomplete_buf[:] = True
         self.tracker.episode_timeout_buf[:] = True
+        self.tracker.transition_pending[:] = True
+        self.tracker.transition_ground_route[:] = True
+        self.tracker.transition_ground_contact_mask[:] = True
+        self.tracker.inter_box_recovery_counter[:] = 3
+        self.tracker.transition_stagnation_counter[:] = 4
+        self.tracker.direct_transition_success_count[:] = 1
+        self.tracker.ground_transition_count[:] = 1
+        self.tracker.inter_box_recovery_count[:] = 1
         self.tracker.task_progress_buf[:] = 1.0
         self.tracker.reset(self.torch.tensor([0, 1]))
         self.assertTrue((self.tracker.landing_phase_start_step == -1).all())
@@ -771,6 +779,14 @@ class BoxProgressTrackerTest(unittest.TestCase):
             self.tracker.fall_buf,
             self.tracker.incomplete_buf,
             self.tracker.episode_timeout_buf,
+            self.tracker.transition_pending,
+            self.tracker.transition_ground_route,
+            self.tracker.transition_ground_contact_mask,
+            self.tracker.inter_box_recovery_counter,
+            self.tracker.transition_stagnation_counter,
+            self.tracker.direct_transition_success_count,
+            self.tracker.ground_transition_count,
+            self.tracker.inter_box_recovery_count,
             self.tracker.task_progress_buf,
         ):
             self.assertFalse(value.any())
@@ -957,6 +973,123 @@ class BoxProgressTrackerTest(unittest.TestCase):
 
         self.assertTrue(self.tracker.success_buf[0])
         self.assertFalse(self.tracker.landing_overrun_buf[0])
+
+    def _enable_three_box_transitions(self, stagnation_steps=100):
+        self.tracker = self.BoxProgressTracker(
+            2,
+            4,
+            3,
+            "cpu",
+            required_boxes=3,
+            inter_box_transition_enabled=True,
+            inter_box_recovery_steps=3,
+            inter_box_stagnation_steps=stagnation_steps,
+        )
+        self.box_bounds = self.box_bounds[:, :3]
+
+    def _pass_first_box_for_transition(self):
+        self.put_foot_on_box(0, 0, 0)
+        self.put_foot_on_box(0, 2, 0)
+        self.update()
+        self.update()
+        self.base_positions[0, 0] = 2.16
+        self.update()
+        self.assertTrue(self.tracker.box_passed_buf[0])
+        self.assertTrue(self.tracker.transition_pending[0])
+        self.assertEqual(self.tracker.transition_started_count[0].item(), 1)
+
+    def test_direct_transition_requires_next_box_top_without_ground(self):
+        self._enable_three_box_transitions()
+        self._pass_first_box_for_transition()
+        self.contact_forces[0].zero_()
+        self.feet_positions[0].zero_()
+        self.terrain_heights[0].zero_()
+        self.put_foot_on_box(0, 0, 1)
+        self.put_foot_on_box(0, 2, 1)
+
+        self.update()
+        self.assertFalse(self.tracker.direct_transition_success_buf[0])
+        self.update()
+
+        self.assertTrue(self.tracker.direct_transition_success_buf[0])
+        self.assertFalse(self.tracker.transition_pending[0])
+        self.assertEqual(
+            self.tracker.direct_transition_success_count[0].item(), 1
+        )
+        self.assertEqual(self.tracker.ground_transition_count[0].item(), 0)
+        # The synthetic 1.0 m gap belongs to the medium bin.
+        self.assertEqual(
+            self.tracker.direct_transition_by_gap[0, 1].item(), 1
+        )
+
+    def test_ground_route_rewards_front_rear_and_stable_recovery(self):
+        self._enable_three_box_transitions()
+        self._pass_first_box_for_transition()
+        self.contact_forces[0].zero_()
+        self.feet_positions[0].zero_()
+        self.terrain_heights[0].zero_()
+        self.feet_positions[0, 0] = self.torch.tensor([2.5, -0.2, 0.0])
+        self.feet_positions[0, 2] = self.torch.tensor([2.5, 0.2, 0.0])
+        self.contact_forces[0, [0, 2], 2] = 2.0
+        self.base_positions[0, 0] = 2.5
+
+        self.update()
+        self.assertTrue(self.tracker.transition_ground_route[0])
+        self.assertTrue(self.tracker.dismount_front_ground_buf[0])
+        self.assertTrue(self.tracker.dismount_rear_ground_buf[0])
+        self.assertFalse(self.tracker.inter_box_recovery_buf[0])
+        self.update()
+        self.assertFalse(self.tracker.dismount_front_ground_buf[0])
+        self.assertFalse(self.tracker.dismount_rear_ground_buf[0])
+        self.update()
+
+        self.assertTrue(self.tracker.inter_box_recovery_buf[0])
+        self.assertFalse(self.tracker.transition_pending[0])
+        self.assertEqual(self.tracker.ground_transition_count[0].item(), 1)
+        self.assertEqual(self.tracker.inter_box_recovery_count[0].item(), 1)
+        self.assertEqual(
+            self.tracker.best_inter_box_recovery_steps[0].item(), 3
+        )
+
+    def test_ground_contact_permanently_disables_direct_bonus(self):
+        self._enable_three_box_transitions()
+        self._pass_first_box_for_transition()
+        self.contact_forces[0].zero_()
+        self.feet_positions[0].zero_()
+        self.terrain_heights[0].zero_()
+        self.feet_positions[0, 0] = self.torch.tensor([2.5, 0.0, 0.0])
+        self.contact_forces[0, 0, 2] = 2.0
+        self.update()
+        self.assertTrue(self.tracker.transition_ground_route[0])
+
+        self.contact_forces[0].zero_()
+        self.feet_positions[0].zero_()
+        self.terrain_heights[0].zero_()
+        self.put_foot_on_box(0, 0, 1)
+        self.put_foot_on_box(0, 2, 1)
+        self.update()
+        self.update()
+
+        self.assertFalse(self.tracker.direct_transition_success_buf[0])
+        self.assertEqual(
+            self.tracker.direct_transition_success_count[0].item(), 0
+        )
+
+    def test_inter_box_stagnation_covers_the_gap_between_boxes(self):
+        self._enable_three_box_transitions(stagnation_steps=3)
+        self._pass_first_box_for_transition()
+        self.contact_forces[0].zero_()
+        self.feet_positions[0].zero_()
+        self.terrain_heights[0].zero_()
+
+        self.update()
+        self.update()
+        self.assertFalse(self.tracker.stagnation_buf[0])
+        self.update()
+
+        self.assertTrue(self.tracker.inter_box_stagnation_buf[0])
+        self.assertTrue(self.tracker.stagnation_buf[0])
+        self.assertTrue(self.tracker.failure_buf[0])
 
 
 if __name__ == "__main__":

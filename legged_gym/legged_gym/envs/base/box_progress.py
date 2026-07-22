@@ -45,6 +45,9 @@ class BoxProgressTracker:
         pitch_threshold=1.6,
         base_height_threshold=0.15,
         lateral_limit=0.8,
+        inter_box_transition_enabled=False,
+        inter_box_recovery_steps=3,
+        inter_box_stagnation_steps=100,
     ):
         front_foot_indices = tuple(int(index) for index in front_foot_indices)
         rear_foot_indices = tuple(int(index) for index in rear_foot_indices)
@@ -81,6 +84,10 @@ class BoxProgressTracker:
             )
         if severe_body_impact_force <= 0.0:
             raise ValueError("severe_body_impact_force must be positive.")
+        if inter_box_recovery_steps <= 0:
+            raise ValueError("inter_box_recovery_steps must be positive.")
+        if inter_box_stagnation_steps <= 0:
+            raise ValueError("inter_box_stagnation_steps must be positive.")
 
         self.num_envs = int(num_envs)
         self.num_feet = int(num_feet)
@@ -169,6 +176,11 @@ class BoxProgressTracker:
         self.pitch_threshold = float(pitch_threshold)
         self.base_height_threshold = float(base_height_threshold)
         self.lateral_limit = float(lateral_limit)
+        self.inter_box_transition_enabled = bool(
+            inter_box_transition_enabled
+        ) and required_boxes > 1
+        self.inter_box_recovery_steps = int(inter_box_recovery_steps)
+        self.inter_box_stagnation_steps = int(inter_box_stagnation_steps)
 
         self.next_box_idx = torch.zeros(
             self.num_envs, dtype=torch.long, device=device
@@ -248,6 +260,58 @@ class BoxProgressTracker:
         self.fall_buf = torch.zeros_like(self.box_passed_buf)
         self.incomplete_buf = torch.zeros_like(self.box_passed_buf)
         self.episode_timeout_buf = torch.zeros_like(self.box_passed_buf)
+        self.transition_pending = torch.zeros_like(self.box_passed_buf)
+        self.transition_ground_route = torch.zeros_like(self.box_passed_buf)
+        self.transition_source_box_idx = torch.full_like(
+            self.next_box_idx, -1
+        )
+        self.transition_gap_bin = torch.full_like(self.next_box_idx, -1)
+        self.transition_ground_contact_mask = torch.zeros_like(
+            self.foot_contact_mask
+        )
+        self.inter_box_recovery_counter = torch.zeros_like(self.next_box_idx)
+        self.best_inter_box_recovery_steps = torch.zeros_like(
+            self.next_box_idx
+        )
+        self.transition_stagnation_counter = torch.zeros_like(
+            self.next_box_idx
+        )
+        self.max_transition_stagnation_steps = torch.zeros_like(
+            self.next_box_idx
+        )
+        self.transition_progress_best = torch.zeros(
+            self.num_envs, dtype=torch.float, device=device
+        )
+        self.direct_transition_success_buf = torch.zeros_like(
+            self.box_passed_buf
+        )
+        self.dismount_front_ground_buf = torch.zeros_like(
+            self.box_passed_buf
+        )
+        self.dismount_rear_ground_buf = torch.zeros_like(
+            self.box_passed_buf
+        )
+        self.inter_box_recovery_buf = torch.zeros_like(self.box_passed_buf)
+        self.inter_box_stagnation_buf = torch.zeros_like(self.box_passed_buf)
+        self.transition_started_count = torch.zeros_like(self.next_box_idx)
+        self.direct_transition_success_count = torch.zeros_like(
+            self.next_box_idx
+        )
+        self.ground_transition_count = torch.zeros_like(self.next_box_idx)
+        self.inter_box_recovery_count = torch.zeros_like(self.next_box_idx)
+        transition_shape = (self.num_envs, 3)
+        self.transition_started_by_gap = torch.zeros(
+            transition_shape, dtype=torch.long, device=device
+        )
+        self.direct_transition_by_gap = torch.zeros_like(
+            self.transition_started_by_gap
+        )
+        self.ground_transition_by_gap = torch.zeros_like(
+            self.transition_started_by_gap
+        )
+        self.inter_box_recovery_by_gap = torch.zeros_like(
+            self.transition_started_by_gap
+        )
         self.task_progress_buf = torch.zeros(
             self.num_envs, dtype=torch.float, device=device
         )
@@ -298,6 +362,24 @@ class BoxProgressTracker:
         self.landing_score_sum[env_ids] = 0.0
         self.landing_phase_step_count[env_ids] = 0
         self.max_consecutive_valid_landing_steps[env_ids] = 0
+        self.transition_pending[env_ids] = False
+        self.transition_ground_route[env_ids] = False
+        self.transition_source_box_idx[env_ids] = -1
+        self.transition_gap_bin[env_ids] = -1
+        self.transition_ground_contact_mask[env_ids] = False
+        self.inter_box_recovery_counter[env_ids] = 0
+        self.best_inter_box_recovery_steps[env_ids] = 0
+        self.transition_stagnation_counter[env_ids] = 0
+        self.max_transition_stagnation_steps[env_ids] = 0
+        self.transition_progress_best[env_ids] = 0.0
+        self.transition_started_count[env_ids] = 0
+        self.direct_transition_success_count[env_ids] = 0
+        self.ground_transition_count[env_ids] = 0
+        self.inter_box_recovery_count[env_ids] = 0
+        self.transition_started_by_gap[env_ids] = 0
+        self.direct_transition_by_gap[env_ids] = 0
+        self.ground_transition_by_gap[env_ids] = 0
+        self.inter_box_recovery_by_gap[env_ids] = 0
         for name in (
             "landing_zone",
             "landing_horizontal_speed",
@@ -339,6 +421,11 @@ class BoxProgressTracker:
         self.fall_buf[env_ids] = False
         self.incomplete_buf[env_ids] = False
         self.episode_timeout_buf[env_ids] = False
+        self.direct_transition_success_buf[env_ids] = False
+        self.dismount_front_ground_buf[env_ids] = False
+        self.dismount_rear_ground_buf[env_ids] = False
+        self.inter_box_recovery_buf[env_ids] = False
+        self.inter_box_stagnation_buf[env_ids] = False
         self.task_progress_buf[env_ids] = 0.0
 
     def configure_landing_transition(
@@ -387,6 +474,237 @@ class BoxProgressTracker:
         )
         self.landing_yaw_threshold = interpolate(
             start_values[4], self.final_landing_yaw_threshold
+        )
+
+    @staticmethod
+    def _transition_gap_bins(gaps):
+        """Map edge-to-edge gaps to close, medium, and far bins."""
+        return torch.where(
+            gaps <= 0.8,
+            torch.zeros_like(gaps, dtype=torch.long),
+            torch.where(
+                gaps <= 1.1,
+                torch.ones_like(gaps, dtype=torch.long),
+                torch.full_like(gaps, 2, dtype=torch.long),
+            ),
+        )
+
+    def _increment_transition_gap_count(self, counts, mask):
+        env_ids = mask.nonzero(as_tuple=False).flatten()
+        if env_ids.numel() == 0:
+            return
+        gap_bins = self.transition_gap_bin[env_ids].clamp(0, 2)
+        counts[env_ids, gap_bins] += 1
+
+    def _update_inter_box_transition(
+        self,
+        box_bounds,
+        env_origins,
+        feet_positions,
+        feet_terrain_heights,
+        feet_contact_forces,
+        base_positions,
+        roll,
+        pitch,
+        body_contact,
+        active,
+        target_bounds,
+        contact_requirements_met,
+    ):
+        """Advance an optional direct-jump or ground-recovery transition."""
+        if not self.inter_box_transition_enabled:
+            return
+
+        env_ids = torch.arange(self.num_envs, device=self.device)
+        pending = self.transition_pending & active
+        source_indices = self.transition_source_box_idx.clamp(
+            min=0, max=self.required_boxes - 1
+        )
+        source_bounds = box_bounds[env_ids, source_indices]
+        ground_height = env_origins[:, 2].unsqueeze(1)
+        force_contact = (
+            feet_contact_forces.norm(dim=-1) > self.contact_force_threshold
+        )
+        between_boxes = (
+            (feet_positions[:, :, 0] > source_bounds[:, 1].unsqueeze(1))
+            & (feet_positions[:, :, 0] < target_bounds[:, 0].unsqueeze(1))
+            & (
+                torch.abs(
+                    feet_positions[:, :, 1] - env_origins[:, 1].unsqueeze(1)
+                )
+                <= self.lateral_limit
+            )
+        )
+        ground_contact = (
+            pending.unsqueeze(1)
+            & between_boxes
+            & (
+                torch.abs(feet_terrain_heights - ground_height) <= 1e-6
+            )
+            & (
+                torch.abs(feet_positions[:, :, 2] - feet_terrain_heights)
+                <= self.top_contact_tolerance
+            )
+            & force_contact
+        )
+
+        previous_front_seen = self.transition_ground_contact_mask[
+            :, self.front_foot_indices
+        ].any(dim=1)
+        previous_rear_seen = self.transition_ground_contact_mask[
+            :, self.rear_foot_indices
+        ].any(dim=1)
+        selected_ground_route = (
+            pending & ground_contact.any(dim=1) & ~self.transition_ground_route
+        )
+        self.transition_ground_route |= selected_ground_route
+        self.ground_transition_count += selected_ground_route.long()
+        self._increment_transition_gap_count(
+            self.ground_transition_by_gap, selected_ground_route
+        )
+
+        self.transition_ground_contact_mask |= ground_contact
+        current_front_seen = self.transition_ground_contact_mask[
+            :, self.front_foot_indices
+        ].any(dim=1)
+        current_rear_seen = self.transition_ground_contact_mask[
+            :, self.rear_foot_indices
+        ].any(dim=1)
+        self.dismount_front_ground_buf[:] = (
+            pending
+            & self.transition_ground_route
+            & ~previous_front_seen
+            & current_front_seen
+        )
+        self.dismount_rear_ground_buf[:] = (
+            pending
+            & self.transition_ground_route
+            & ~previous_rear_seen
+            & current_rear_seen
+        )
+
+        current_ground_feet = ground_contact.sum(dim=1)
+        current_rear_support = ground_contact[
+            :, self.rear_foot_indices
+        ].any(dim=1)
+        base_height = base_positions[:, 2] - env_origins[:, 2]
+        safe_ground_recovery = (
+            pending
+            & self.transition_ground_route
+            & (current_ground_feet >= 2)
+            & current_rear_support
+            & ~body_contact
+            & (roll.abs() <= self.landing_roll_threshold)
+            & (pitch.abs() <= self.landing_pitch_threshold)
+            & (base_height >= self.landing_base_height_threshold)
+        )
+        previous_recovery = self.inter_box_recovery_counter.clone()
+        self.inter_box_recovery_counter[:] = torch.where(
+            safe_ground_recovery,
+            self.inter_box_recovery_counter + 1,
+            torch.zeros_like(self.inter_box_recovery_counter),
+        )
+        self.best_inter_box_recovery_steps[:] = torch.maximum(
+            self.best_inter_box_recovery_steps,
+            self.inter_box_recovery_counter,
+        )
+        self.inter_box_recovery_buf[:] = (
+            pending
+            & (previous_recovery < self.inter_box_recovery_steps)
+            & (
+                self.inter_box_recovery_counter
+                >= self.inter_box_recovery_steps
+            )
+        )
+        self.inter_box_recovery_count += self.inter_box_recovery_buf.long()
+        self._increment_transition_gap_count(
+            self.inter_box_recovery_by_gap, self.inter_box_recovery_buf
+        )
+
+        # Ground contact chooses the safe route before a simultaneous top
+        # contact can be classified as a direct jump.
+        self.direct_transition_success_buf[:] = (
+            pending
+            & ~self.transition_ground_route
+            & contact_requirements_met
+            & ~body_contact
+        )
+        self.direct_transition_success_count += (
+            self.direct_transition_success_buf.long()
+        )
+        self._increment_transition_gap_count(
+            self.direct_transition_by_gap,
+            self.direct_transition_success_buf,
+        )
+        transition_complete = (
+            self.direct_transition_success_buf | self.inter_box_recovery_buf
+        )
+        self.transition_pending[transition_complete] = False
+
+    def _start_inter_box_transitions(
+        self, box_bounds, target_indices, passed_envs, base_x
+    ):
+        """Start transition tracking after passing a non-final box."""
+        if not self.inter_box_transition_enabled or passed_envs.numel() == 0:
+            return
+        next_indices = self.next_box_idx[passed_envs]
+        has_next_box = next_indices < self.required_boxes
+        env_ids = passed_envs[has_next_box]
+        if env_ids.numel() == 0:
+            return
+        source_indices = target_indices[env_ids]
+        next_indices = self.next_box_idx[env_ids]
+        gaps = (
+            box_bounds[env_ids, next_indices, 0]
+            - box_bounds[env_ids, source_indices, 1]
+        )
+        gap_bins = self._transition_gap_bins(gaps)
+        self.transition_pending[env_ids] = True
+        self.transition_ground_route[env_ids] = False
+        self.transition_source_box_idx[env_ids] = source_indices
+        self.transition_gap_bin[env_ids] = gap_bins
+        self.transition_ground_contact_mask[env_ids] = False
+        self.inter_box_recovery_counter[env_ids] = 0
+        self.transition_stagnation_counter[env_ids] = 0
+        self.transition_progress_best[env_ids] = base_x[env_ids]
+        self.transition_started_count[env_ids] += 1
+        self.transition_started_by_gap[env_ids, gap_bins] += 1
+
+    def _update_inter_box_stagnation(self, base_x):
+        """Terminate a transition that stops making forward progress."""
+        if not self.inter_box_transition_enabled:
+            return
+        candidate_best = torch.maximum(self.transition_progress_best, base_x)
+        # Accumulate sub-centimetre motion, but do not let contact jitter keep
+        # a stationary transition alive indefinitely.
+        forward_progress = self.transition_pending & (
+            candidate_best >= self.transition_progress_best + 0.01
+        )
+        self.transition_progress_best[:] = torch.where(
+            forward_progress,
+            candidate_best,
+            self.transition_progress_best,
+        )
+        refreshed = (
+            forward_progress
+            | self.dismount_front_ground_buf
+            | self.dismount_rear_ground_buf
+            | self.inter_box_recovery_buf
+            | self.direct_transition_success_buf
+            | self.box_passed_buf
+        )
+        self.transition_stagnation_counter[:] = torch.where(
+            self.transition_pending & ~refreshed,
+            self.transition_stagnation_counter + 1,
+            torch.zeros_like(self.transition_stagnation_counter),
+        )
+        self.max_transition_stagnation_steps[:] = torch.maximum(
+            self.max_transition_stagnation_steps,
+            self.transition_stagnation_counter,
+        )
+        self.inter_box_stagnation_buf[:] = (
+            self.transition_stagnation_counter
+            >= self.inter_box_stagnation_steps
         )
 
     def update(
@@ -491,6 +809,20 @@ class BoxProgressTracker:
         contact_requirements_met = (
             self.front_contact_counter >= self.front_contact_required_steps
         ) & (self.rear_contact_counter >= self.rear_contact_required_steps)
+        self._update_inter_box_transition(
+            box_bounds=box_bounds,
+            env_origins=env_origins,
+            feet_positions=feet_positions,
+            feet_terrain_heights=feet_terrain_heights,
+            feet_contact_forces=feet_contact_forces,
+            base_positions=base_positions,
+            roll=roll,
+            pitch=pitch,
+            body_contact=body_contact,
+            active=active,
+            target_bounds=target_bounds,
+            contact_requirements_met=contact_requirements_met,
+        )
         crossed_target = active & (
             base_positions[:, 0] > target_bounds[:, 1] + self.pass_margin
         )
@@ -503,6 +835,13 @@ class BoxProgressTracker:
         self.foot_contact_mask[passed_envs] = False
         self.front_contact_counter[passed_envs] = 0
         self.rear_contact_counter[passed_envs] = 0
+        self._start_inter_box_transitions(
+            box_bounds=box_bounds,
+            target_indices=target_indices,
+            passed_envs=passed_envs,
+            base_x=base_positions[:, 0],
+        )
+        self._update_inter_box_stagnation(base_positions[:, 0])
 
         force_contact = feet_contact_forces.norm(dim=-1) > self.contact_force_threshold
         course_rear = box_bounds[:, self.required_boxes - 1, 1]
@@ -839,7 +1178,10 @@ class BoxProgressTracker:
         self.generic_failure_buf[:] = hard_taken & ~self.landing_lateral_exit_buf
         if external_stagnation is None:
             external_stagnation = torch.zeros_like(natural_timeout)
-        self.stagnation_buf[:] = external_stagnation & ~hard_taken
+        combined_stagnation = (
+            external_stagnation | self.inter_box_stagnation_buf
+        )
+        self.stagnation_buf[:] = combined_stagnation & ~hard_taken
         terminal_taken = hard_taken | self.stagnation_buf
         self.curriculum_success_buf[:] = (
             curriculum_success_candidate & ~terminal_taken

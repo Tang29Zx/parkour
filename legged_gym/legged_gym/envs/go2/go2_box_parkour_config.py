@@ -106,6 +106,10 @@ class Go2BoxParkourCfg(DebugGo2BoxCfg):
             post_front_base_progress = 0.0
             rear_foot_clearance_progress = 0.0
             recovery_success = 0.0
+            direct_transition_success = 0.0
+            dismount_front_ground = 0.0
+            dismount_rear_ground = 0.0
+            inter_box_recovery = 0.0
             box_rear_foot_contact = 10.0
             box_passed = 25.0
             success = 1250.0
@@ -163,6 +167,7 @@ class Go2BoxParkourCfg(DebugGo2BoxCfg):
         front_foot_reach_height_tolerance = 0.02
         front_foot_reach_base_overrun = 0.15
         foot_guidance_min_forward_speed = 0.05
+        inter_box_ground_reference_kl_weight = 0.0
 
     class box_progress:
         required_boxes = 5
@@ -195,6 +200,9 @@ class Go2BoxParkourCfg(DebugGo2BoxCfg):
         flat_low_base_height_threshold = 0.20
         flat_low_base_height_steps = 25
         lateral_limit = 0.8
+        inter_box_transition_enabled = False
+        inter_box_recovery_steps = 3
+        inter_box_stagnation_steps = 100
 
 
 class Go2BoxParkourCfgPPO(Go2RoughCfgPPO):
@@ -683,10 +691,23 @@ class Go2BoxParkour3BoxCfg(Go2BoxParkour1BoxCfg):
         )
 
     class rewards(Go2BoxParkour1BoxCfg.rewards):
-        # model_3500 had completed two 5% velocity-threshold reductions.
-        box_joint_hip_velocity_threshold = 6.0 * 0.95**2
-        box_joint_thigh_velocity_threshold = 9.0 * 0.95**2
-        box_joint_calf_velocity_threshold = 11.0 * 0.95**2
+        class scales(Go2BoxParkour1BoxCfg.rewards.scales):
+            # A direct box-to-box landing receives a small preference over
+            # the safe ground route. Both remain much smaller than failure.
+            direct_transition_success = 200.0
+            dismount_front_ground = 25.0
+            dismount_rear_ground = 50.0
+            inter_box_recovery = 75.0
+
+        # Start one 5% step tighter than the two reductions already present
+        # in model_3500. Keep the penalty scale unchanged so route learning is
+        # not destabilized by a simultaneous threshold and weight increase.
+        box_joint_hip_velocity_threshold = 6.0 * 0.95**3
+        box_joint_thigh_velocity_threshold = 9.0 * 0.95**3
+        box_joint_calf_velocity_threshold = 11.0 * 0.95**3
+        # Once a foot selects the ground route, weakly restore the walking
+        # prior while the robot establishes safe rear support.
+        inter_box_ground_reference_kl_weight = 0.15
 
     class box_progress(Go2BoxParkour1BoxCfg.box_progress):
         required_boxes = 3
@@ -701,6 +722,9 @@ class Go2BoxParkour3BoxCfg(Go2BoxParkour1BoxCfg):
         landing_lateral_speed_threshold = 2.0
         landing_lateral_offset_threshold = 0.8
         landing_yaw_threshold = np.pi
+        inter_box_transition_enabled = True
+        inter_box_recovery_steps = 3
+        inter_box_stagnation_steps = 100
 
     class one_box_curriculum(Go2BoxParkour1BoxCfg.one_box_curriculum):
         # The three-box stage has no automatic height, landing, joint-speed,
