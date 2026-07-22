@@ -261,6 +261,15 @@ class BoxProgressTrackerTest(unittest.TestCase):
         self.assertTrue(self.tracker.basic_recovery_buf[0])
         self.assertTrue(self.tracker.success_buf[0])
 
+        # Breaking and rebuilding support must not pay basic recovery twice.
+        self.body_contact[0] = True
+        self.update()
+        self.body_contact[0] = False
+        for _ in range(3):
+            self.update()
+        self.assertFalse(self.tracker.basic_recovery_buf[0])
+        self.assertTrue(self.tracker.basic_recovery_earned[0])
+
         self.tracker.configure_landing_transition(
             blend=1.0,
             start_steps=3,
@@ -689,6 +698,7 @@ class BoxProgressTrackerTest(unittest.TestCase):
         self.tracker.rear_foot_contact_buf[:] = True
         self.tracker.body_contact_window_failure_buf[:] = True
         self.tracker.severe_body_impact_buf[:] = True
+        self.tracker.basic_recovery_earned[:] = True
         self.tracker.success_buf[:] = True
         self.tracker.missed_box_buf[:] = True
         self.tracker.out_of_track_buf[:] = True
@@ -723,6 +733,7 @@ class BoxProgressTrackerTest(unittest.TestCase):
             self.tracker.rear_foot_contact_buf,
             self.tracker.body_contact_window_failure_buf,
             self.tracker.severe_body_impact_buf,
+            self.tracker.basic_recovery_earned,
             self.tracker.success_buf,
             self.tracker.missed_box_buf,
             self.tracker.out_of_track_buf,

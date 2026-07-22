@@ -333,17 +333,27 @@ class Go2BoxParkour1BoxCfg(Go2BoxParkourCfg):
             overspeed = -0.2
             action_rate = -0.005
             flat_orientation = -0.1
-            dof_vel = 0.0
+            # Keep the repository's conservative effort regularization active
+            # during one-box training. These coefficients are deliberately
+            # much smaller than the task-event rewards so they improve motion
+            # efficiency without making standing still the easiest solution.
+            dof_vel = -5e-5
             lin_pos_y = -0.15
             yaw_abs = -0.1
-            energy_substeps = 0.0
-            torques = 0.0
+            energy_substeps = -2e-7
+            torques = -1e-7
             dof_error_named = 0.0
             dof_error = 0.0
             body_collision = -5.0
             thigh_collision = -0.1
             calf_collision = -0.5
             box_approach_overspeed = -1.0
+            # Full-window constraints cover all 12 joints from the short
+            # approach through rear-leg ascent and box exit.
+            box_joint_velocity = -2.0
+            box_joint_action_rate = -0.5
+            box_joint_excursion = -1.0
+            box_foot_crossing = -2.0
             # Keep necessary front-foot lift, but trim visibly excessive
             # upper-leg motion in the active box window.
             front_box_velocity = -0.5
@@ -397,6 +407,18 @@ class Go2BoxParkour1BoxCfg(Go2BoxParkourCfg):
         box_approach_speed_window = 0.5
         box_approach_speed_limit = 1.0
         box_approach_speed_normalization = 1.0
+        box_joint_hip_velocity_threshold = 5.0
+        box_joint_thigh_velocity_threshold = 7.0
+        box_joint_calf_velocity_threshold = 9.0
+        box_joint_velocity_normalization = 4.0
+        box_joint_action_delta_threshold = 0.30
+        box_joint_action_delta_normalization = 0.30
+        box_joint_hip_allowance = 0.45
+        box_joint_thigh_allowance = 1.00
+        box_joint_calf_allowance = 0.85
+        box_joint_excursion_normalization = 0.40
+        box_foot_side_margin = 0.03
+        box_foot_crossing_normalization = 0.10
         front_box_velocity_threshold = 7.0
         front_box_velocity_normalization = 4.0
         front_box_action_delta_threshold = 0.50

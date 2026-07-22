@@ -61,6 +61,7 @@ class LeggedRobotBox(LeggedRobot):
         self.all_upper_joint_indices = torch.cat(
             (self.front_upper_joint_indices, self.rear_upper_joint_indices)
         )
+        self._init_box_joint_constraints()
         progress_cfg = self.cfg.box_progress
         if progress_cfg.flat_low_base_height_threshold <= 0.0:
             raise ValueError(
@@ -467,6 +468,48 @@ class LeggedRobotBox(LeggedRobot):
                 f"found {[self.feet_names[index] for index in indices.tolist()]}."
             )
         return indices
+
+    def _init_box_joint_constraints(self):
+        """Build per-joint soft limits for the complete obstacle window."""
+        rewards_cfg = self.cfg.rewards
+        thresholds = []
+        allowances = []
+        for name in self.dof_names:
+            if "_hip_joint" in name:
+                thresholds.append(
+                    getattr(rewards_cfg, "box_joint_hip_velocity_threshold", 5.0)
+                )
+                allowances.append(
+                    getattr(rewards_cfg, "box_joint_hip_allowance", 0.45)
+                )
+            elif "_thigh_joint" in name:
+                thresholds.append(
+                    getattr(rewards_cfg, "box_joint_thigh_velocity_threshold", 7.0)
+                )
+                allowances.append(
+                    getattr(rewards_cfg, "box_joint_thigh_allowance", 1.00)
+                )
+            elif "_calf_joint" in name:
+                thresholds.append(
+                    getattr(rewards_cfg, "box_joint_calf_velocity_threshold", 9.0)
+                )
+                allowances.append(
+                    getattr(rewards_cfg, "box_joint_calf_allowance", 0.85)
+                )
+            else:
+                raise ValueError(
+                    f"Unsupported joint in box motion constraints: {name}"
+                )
+        if len(thresholds) != self.num_actions:
+            raise ValueError(
+                "Box motion constraints require one limit per action joint."
+            )
+        self.box_joint_velocity_thresholds = torch.tensor(
+            thresholds, dtype=torch.float, device=self.device
+        )
+        self.box_joint_excursion_allowances = torch.tensor(
+            allowances, dtype=torch.float, device=self.device
+        )
 
     def _body_indices_with_token(self, body_names, token):
         names = [name for name in body_names if token in name]
@@ -2487,15 +2530,21 @@ class LeggedRobotBox(LeggedRobot):
                 result_count.float()
             )
         continuous_groups = {
-            "torque_penalty": ("exceed_torque_limits_l1norm",),
+            "torque_penalty": (
+                "torques",
+                "energy_substeps",
+                "exceed_torque_limits_l1norm",
+            ),
             "action_rate_penalty": (
                 "action_rate",
+                "box_joint_action_rate",
                 "front_box_action_rate",
                 "rear_post_contact_action_rate",
                 "all_feet_box_action_rate",
             ),
             "dof_vel_penalty": (
                 "dof_vel",
+                "box_joint_velocity",
                 "front_box_velocity",
                 "rear_post_contact_velocity",
                 "all_feet_box_velocity",
@@ -2526,6 +2575,10 @@ class LeggedRobotBox(LeggedRobot):
             "flat_yaw_abs",
             "world_overspeed",
             "box_approach_overspeed",
+            "box_joint_velocity",
+            "box_joint_action_rate",
+            "box_joint_excursion",
+            "box_foot_crossing",
             "front_box_velocity",
             "front_box_action_rate",
             "front_box_excursion",
@@ -3236,6 +3289,83 @@ class LeggedRobotBox(LeggedRobot):
         return (
             self.next_box_idx < self.box_progress.required_boxes
         ) & self._near_box_for_speed_control()
+
+    def _whole_box_motion_gate(self):
+        """Cover approach, traversal, rear-leg ascent, and box exit."""
+        return self._box_speed_blend()
+
+    def _reward_box_joint_velocity(self):
+        """Penalize excessive speed for all 12 joints throughout the box."""
+        normalization = max(
+            float(self.cfg.rewards.box_joint_velocity_normalization), 1e-6
+        )
+        excess = torch.relu(
+            torch.abs(self.dof_vel) - self.box_joint_velocity_thresholds
+        ) / normalization
+        return (
+            torch.square(excess).mean(dim=1).clamp(max=1.0)
+            * LeggedRobotBox._whole_box_motion_gate(self)
+        )
+
+    def _reward_box_joint_action_rate(self):
+        """Penalize abrupt commands for every joint throughout the box."""
+        threshold = float(self.cfg.rewards.box_joint_action_delta_threshold)
+        normalization = max(
+            float(self.cfg.rewards.box_joint_action_delta_normalization), 1e-6
+        )
+        excess = torch.relu(
+            torch.abs(self.actions - self.last_actions) - threshold
+        ) / normalization
+        return (
+            torch.square(excess).mean(dim=1).clamp(max=1.0)
+            * LeggedRobotBox._whole_box_motion_gate(self)
+            * (self.episode_length_buf > 1).float()
+        )
+
+    def _reward_box_joint_excursion(self):
+        """Keep hip, thigh, and calf motion inside natural soft envelopes."""
+        normalization = max(
+            float(self.cfg.rewards.box_joint_excursion_normalization), 1e-6
+        )
+        excess = torch.relu(
+            torch.abs(self.dof_pos - self.default_dof_pos)
+            - self.box_joint_excursion_allowances
+        ) / normalization
+        return (
+            torch.square(excess).mean(dim=1).clamp(max=1.0)
+            * LeggedRobotBox._whole_box_motion_gate(self)
+        )
+
+    def _reward_box_foot_crossing(self):
+        """Keep left and right feet on their natural sides of the body."""
+        body_states = self.all_rigid_body_states.view(self.num_envs, -1, 13)
+        feet_world_offset = (
+            body_states[:, self.feet_indices, :3]
+            - self.root_states[:, None, :3]
+        )
+        feet_local = quat_rotate_inverse(
+            self.base_quat[:, None, :]
+            .expand(-1, len(self.feet_indices), -1)
+            .reshape(-1, 4),
+            feet_world_offset.reshape(-1, 3),
+        ).reshape(self.num_envs, len(self.feet_indices), 3)
+        margin = float(self.cfg.rewards.box_foot_side_margin)
+        normalization = max(
+            float(self.cfg.rewards.box_foot_crossing_normalization), 1e-6
+        )
+        left_violation = torch.relu(
+            margin - feet_local[:, self.left_foot_local_indices, 1]
+        )
+        right_violation = torch.relu(
+            margin + feet_local[:, self.right_foot_local_indices, 1]
+        )
+        violation = torch.cat((left_violation, right_violation), dim=1)
+        return (
+            torch.square(violation / normalization)
+            .mean(dim=1)
+            .clamp(max=1.0)
+            * LeggedRobotBox._whole_box_motion_gate(self)
+        )
 
     def _all_feet_box_motion_gate(self):
         """Select true four-foot box-top support, not merely prior contact."""

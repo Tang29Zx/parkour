@@ -230,6 +230,7 @@ class BoxProgressTracker:
         )
         self.severe_body_impact_buf = torch.zeros_like(self.box_passed_buf)
         self.basic_recovery_buf = torch.zeros_like(self.box_passed_buf)
+        self.basic_recovery_earned = torch.zeros_like(self.box_passed_buf)
         self.curriculum_success_buf = torch.zeros_like(self.box_passed_buf)
         self.stagnation_buf = torch.zeros_like(self.box_passed_buf)
         self.success_buf = torch.zeros_like(self.box_passed_buf)
@@ -283,6 +284,7 @@ class BoxProgressTracker:
         self.body_contact_step_count[env_ids] = 0
         self.recovery_counter[env_ids] = 0
         self.best_recovery_hold_steps[env_ids] = 0
+        self.basic_recovery_earned[env_ids] = False
         self.landing_counter[env_ids] = 0
         self.best_landing_hold_steps[env_ids] = 0
         self.landing_phase_start_step[env_ids] = -1
@@ -620,7 +622,9 @@ class BoxProgressTracker:
         self.basic_recovery_buf[:] = (
             (previous_recovery_counter < self.recovery_steps)
             & recovery_success
+            & ~self.basic_recovery_earned
         )
+        self.basic_recovery_earned |= self.basic_recovery_buf
         self.best_recovery_hold_steps[:] = torch.maximum(
             self.best_recovery_hold_steps,
             self.recovery_counter,

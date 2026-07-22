@@ -2259,6 +2259,61 @@ class BoxRewardTest(unittest.TestCase):
         torch.testing.assert_close(action_rate, expected)
         torch.testing.assert_close(excursion, expected)
 
+    def test_full_box_window_penalizes_all_joints_and_foot_crossing(self):
+        num_envs = 3
+        thresholds = torch.tensor([5.0, 7.0, 9.0] * 4)
+        allowances = torch.tensor([0.45, 1.0, 0.85] * 4)
+        env = SimpleNamespace(
+            num_envs=num_envs,
+            box_joint_velocity_thresholds=thresholds,
+            box_joint_excursion_allowances=allowances,
+            dof_vel=torch.stack(
+                (thresholds, thresholds + 4.0, thresholds + 4.0)
+            ),
+            dof_pos=torch.stack(
+                (allowances, allowances + 0.4, allowances + 0.4)
+            ),
+            default_dof_pos=torch.zeros(num_envs, 12),
+            actions=torch.tensor(
+                [[0.30] * 12, [0.60] * 12, [0.60] * 12]
+            ),
+            last_actions=torch.zeros(num_envs, 12),
+            episode_length_buf=torch.full((num_envs,), 2),
+            feet_indices=torch.arange(4),
+            left_foot_local_indices=torch.tensor([0, 2]),
+            right_foot_local_indices=torch.tensor([1, 3]),
+            root_states=torch.zeros(num_envs, 13),
+            base_quat=torch.tensor([[0.0, 0.0, 0.0, 1.0]]).repeat(
+                num_envs, 1
+            ),
+            all_rigid_body_states=torch.zeros(num_envs, 4, 13),
+            cfg=SimpleNamespace(
+                rewards=SimpleNamespace(
+                    box_joint_velocity_normalization=4.0,
+                    box_joint_action_delta_threshold=0.30,
+                    box_joint_action_delta_normalization=0.30,
+                    box_joint_excursion_normalization=0.40,
+                    box_foot_side_margin=0.03,
+                    box_foot_crossing_normalization=0.10,
+                )
+            ),
+        )
+        env._box_speed_blend = lambda: torch.tensor([1.0, 1.0, 0.0])
+        natural_y = torch.tensor([0.20, -0.20, 0.20, -0.20])
+        crossed_y = torch.tensor([-0.10, 0.10, -0.10, 0.10])
+        env.all_rigid_body_states[0, :, 1] = natural_y
+        env.all_rigid_body_states[1:, :, 1] = crossed_y
+
+        velocity = self.LeggedRobotBox._reward_box_joint_velocity(env)
+        action_rate = self.LeggedRobotBox._reward_box_joint_action_rate(env)
+        excursion = self.LeggedRobotBox._reward_box_joint_excursion(env)
+        crossing = self.LeggedRobotBox._reward_box_foot_crossing(env)
+
+        torch.testing.assert_close(velocity, torch.tensor([0.0, 1.0, 0.0]))
+        torch.testing.assert_close(action_rate, torch.tensor([0.0, 1.0, 0.0]))
+        torch.testing.assert_close(excursion, torch.tensor([0.0, 1.0, 0.0]))
+        torch.testing.assert_close(crossing, torch.tensor([0.0, 1.0, 0.0]))
+
     def test_center_and_direction_shaping_stays_below_terminal_costs(self):
         scales = self.one_box_cfg.rewards.scales
         dt = 0.02
@@ -2279,6 +2334,18 @@ class BoxRewardTest(unittest.TestCase):
             maximum_center_cost,
             abs(scales.termination * dt),
         )
+
+    def test_one_box_effort_penalties_are_enabled_conservatively(self):
+        scales = self.one_box_cfg.rewards.scales
+
+        self.assertEqual(scales.torques, -1e-7)
+        self.assertEqual(scales.energy_substeps, -2e-7)
+        self.assertEqual(scales.dof_vel, -5e-5)
+        self.assertEqual(scales.exceed_torque_limits_l1norm, -1.0)
+        self.assertGreater(scales.box_front_foot_contact, 0.0)
+        self.assertGreater(scales.box_rear_foot_contact, 0.0)
+        self.assertGreater(scales.box_passed, 0.0)
+        self.assertGreater(scales.success, 0.0)
 
     def test_zero_yaw_error_has_zero_reward_and_deviation_is_negative(self):
         env = self.make_speed_reward_env()
@@ -2753,6 +2820,10 @@ class BoxRewardTest(unittest.TestCase):
         self.assertEqual(scales.thigh_collision, -0.1)
         self.assertEqual(scales.calf_collision, -0.5)
         self.assertEqual(scales.box_approach_overspeed, -1.0)
+        self.assertEqual(scales.box_joint_velocity, -2.0)
+        self.assertEqual(scales.box_joint_action_rate, -0.5)
+        self.assertEqual(scales.box_joint_excursion, -1.0)
+        self.assertEqual(scales.box_foot_crossing, -2.0)
         self.assertEqual(scales.front_box_velocity, -0.5)
         self.assertEqual(scales.front_box_action_rate, -0.1)
         self.assertEqual(scales.front_box_excursion, -0.1)
@@ -2761,6 +2832,9 @@ class BoxRewardTest(unittest.TestCase):
         self.assertEqual(scales.all_feet_box_velocity, -2.0)
         self.assertEqual(scales.all_feet_box_action_rate, -0.5)
         self.assertEqual(scales.all_feet_box_excursion, -0.25)
+        self.assertEqual(env_cfg.rewards.box_joint_hip_allowance, 0.45)
+        self.assertEqual(env_cfg.rewards.box_joint_thigh_allowance, 1.0)
+        self.assertEqual(env_cfg.rewards.box_joint_calf_allowance, 0.85)
         self.assertEqual(scales.front_foot_lift_progress, 0.0)
         self.assertEqual(scales.front_foot_reach_progress, 0.0)
         self.assertEqual(scales.rear_foot_lift_progress, 0.0)
