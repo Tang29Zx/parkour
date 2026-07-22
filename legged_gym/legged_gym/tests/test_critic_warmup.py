@@ -394,6 +394,47 @@ class CriticWarmupTest(unittest.TestCase):
             ppo.reference_actor_critic.memory_a.hidden_states
         )
 
+    def test_warmup_recurrent_reference_is_distinct_from_kl_reference(self):
+        actor_critic = ActorCriticRecurrent(
+            num_actor_obs=2,
+            num_critic_obs=2,
+            num_actions=1,
+            actor_hidden_dims=[4],
+            critic_hidden_dims=[4],
+            rnn_type="gru",
+            rnn_hidden_size=4,
+        )
+        ppo = PPO(
+            actor_critic,
+            critic_warmup_iterations=100,
+            reference_kl_max_coef=1.0,
+        )
+        ppo.snapshot_reference_policy()
+        with torch.no_grad():
+            ppo.actor_critic.actor[0].weight.add_(0.1)
+        ppo.start_critic_warmup(4000)
+        ppo.init_storage(2, 1, [2], [2], [1])
+        observations = torch.tensor([[0.2, -0.1], [0.4, 0.3]])
+
+        ppo.act(observations, observations)
+
+        self.assertGreater(ppo.rollout_actor_output_max_diff.item(), 0.0)
+        self.assertEqual(ppo.warmup_actor_output_max_diff.item(), 0.0)
+        self.assertEqual(ppo.warmup_actor_std_max_diff.item(), 0.0)
+        self.assertEqual(ppo.warmup_actor_parameter_max_diff(), 0.0)
+        self.assertGreater(ppo.actor_parameter_max_diff(), 0.0)
+
+        dones = torch.tensor([True, False])
+        ppo.process_env_step(
+            torch.zeros(2), dones, {}, observations, observations
+        )
+        self.assertTrue(
+            (
+                ppo.warmup_actor_critic.memory_a.hidden_states[:, 0]
+                == 0.0
+            ).all()
+        )
+
     def test_inference_rollout_statistics_are_reset_out_of_place(self):
         actor_critic = ActorCriticRecurrent(
             num_actor_obs=2,
@@ -732,6 +773,12 @@ class CriticWarmupTest(unittest.TestCase):
             torch.testing.assert_close(
                 actual_reference[name], expected_reference[name]
             )
+        _, stats = runner.alg.update(4000)
+        self.assertGreater(stats["actor_parameter_max_diff"].item(), 0.0)
+        self.assertEqual(
+            stats["warmup_actor_parameter_max_diff"].item(), 0.0
+        )
+        self.assertEqual(stats["actor_update_enabled"].item(), 0.0)
 
     def test_negative_warmup_length_is_rejected(self):
         with self.assertRaises(ValueError):

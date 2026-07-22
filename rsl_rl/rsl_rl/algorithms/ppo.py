@@ -195,6 +195,7 @@ class PPO:
         ) < 0.0:
             raise ValueError("Actor equivalence tolerances must be non-negative.")
         self.reference_actor_critic = None
+        self.warmup_actor_critic = None
         self._reset_rollout_actor_equivalence_statistics()
         self.require_v11_curriculum_state = bool(
             require_v11_curriculum_state
@@ -341,11 +342,18 @@ class PPO:
         self.rollout_actor_std_max_diff = torch.zeros(
             (), device=self.device
         )
+        self.warmup_actor_output_max_diff = torch.zeros(
+            (), device=self.device
+        )
+        self.warmup_actor_std_max_diff = torch.zeros(
+            (), device=self.device
+        )
 
     def start_critic_warmup(self, start_iteration):
         """Train only the Critic for a fixed number of loaded iterations."""
         if self.critic_warmup_iterations == 0:
             self.critic_warmup_until_iteration = None
+            self.warmup_actor_critic = None
             return
         self.critic_warmup_until_iteration = (
             int(start_iteration) + self.critic_warmup_iterations
@@ -364,6 +372,20 @@ class PPO:
             actor_enabled=False,
             learning_rate=self.learning_rate,
         )
+        self.snapshot_warmup_actor_policy()
+
+    def snapshot_warmup_actor_policy(self):
+        """Freeze the current Actor solely for warmup invariance checks."""
+        self.warmup_actor_critic = copy.deepcopy(self.actor_critic).to(
+            self.device
+        )
+        for memory_name in ("memory_a", "memory_s", "memory_c"):
+            memory = getattr(self.warmup_actor_critic, memory_name, None)
+            if memory is not None and hasattr(memory, "hidden_states"):
+                memory.hidden_states = None
+        self.warmup_actor_critic.eval()
+        for parameter in self.warmup_actor_critic.parameters():
+            parameter.requires_grad_(False)
 
     def _set_actor_encoder_trainable(self, trainable):
         """Freeze only the Actor observation encoders for staged repair."""
@@ -762,10 +784,8 @@ class PPO:
                 self.transition.reference_action_sigma = (
                     self.reference_actor_critic.action_std.detach()
                 )
-                # Both policies run the same one-step recurrent path here.
-                # This is the valid equivalence check during Critic warmup;
-                # comparing this rollout against padded batch replay also
-                # includes expected CUDA GRU accumulation-order differences.
+                # Track behavioral distance to the KL reference separately
+                # from the Critic-warmup invariance checks below.
                 self.rollout_actor_output_max_diff = torch.maximum(
                     self.rollout_actor_output_max_diff,
                     torch.max(
@@ -791,6 +811,27 @@ class PPO:
             self.transition.reference_action_sigma = (
                 self.transition.action_sigma
             )
+        if self.warmup_actor_critic is not None:
+            with torch.no_grad():
+                self.warmup_actor_critic.act(obs)
+                self.warmup_actor_output_max_diff = torch.maximum(
+                    self.warmup_actor_output_max_diff,
+                    torch.max(
+                        torch.abs(
+                            self.transition.action_mean
+                            - self.warmup_actor_critic.action_mean.detach()
+                        )
+                    ),
+                )
+                self.warmup_actor_std_max_diff = torch.maximum(
+                    self.warmup_actor_std_max_diff,
+                    torch.max(
+                        torch.abs(
+                            self.transition.action_sigma
+                            - self.warmup_actor_critic.action_std.detach()
+                        )
+                    ),
+                )
         # need to record obs and critic_obs before env.step()
         self.transition.observations = obs
         self.transition.critic_observations = critic_obs
@@ -813,6 +854,8 @@ class PPO:
         self.actor_critic.reset(dones)
         if self.reference_actor_critic is not None:
             self.reference_actor_critic.reset(dones)
+        if self.warmup_actor_critic is not None:
+            self.warmup_actor_critic.reset(dones)
     
     def compute_returns(self, last_critic_obs):
         last_values= self.actor_critic.evaluate(last_critic_obs).detach()
@@ -957,16 +1000,25 @@ class PPO:
         average_stats["actor_std_max_diff"] = (
             self.rollout_actor_std_max_diff.detach().clone()
         )
+        average_stats["warmup_actor_parameter_max_diff"] = torch.tensor(
+            self.warmup_actor_parameter_max_diff(), device=self.device
+        )
+        average_stats["warmup_actor_output_max_diff"] = (
+            self.warmup_actor_output_max_diff.detach().clone()
+        )
+        average_stats["warmup_actor_std_max_diff"] = (
+            self.warmup_actor_std_max_diff.detach().clone()
+        )
         if critic_warmup_active:
             parameter_diff = average_stats[
-                "actor_parameter_max_diff"
+                "warmup_actor_parameter_max_diff"
             ].item()
             output_diff = average_stats.get(
-                "actor_output_max_diff",
+                "warmup_actor_output_max_diff",
                 torch.zeros((), device=self.device),
             ).item()
             std_diff = average_stats.get(
-                "actor_std_max_diff",
+                "warmup_actor_std_max_diff",
                 torch.zeros((), device=self.device),
             ).item()
             if (
@@ -985,6 +1037,8 @@ class PPO:
                     f"std_max_diff={std_diff:.3e} (limit "
                     f"{self.actor_std_equivalence_tolerance:.3e})."
                 )
+        elif self.warmup_actor_critic is not None:
+            self.warmup_actor_critic = None
         self._reset_rollout_actor_equivalence_statistics()
         self.storage.clear()
         if (
@@ -1187,6 +1241,21 @@ class PPO:
             maximum = max(maximum, difference)
         return maximum
 
+    def warmup_actor_parameter_max_diff(self):
+        """Return Actor drift from the policy frozen at warmup start."""
+        if self.warmup_actor_critic is None:
+            return 0.0
+        warmup_state = self.warmup_actor_critic.state_dict()
+        maximum = 0.0
+        for name, value in self.actor_critic.state_dict().items():
+            if not self._is_actor_side_parameter(name):
+                continue
+            difference = torch.max(
+                torch.abs(value.detach() - warmup_state[name].detach())
+            ).item()
+            maximum = max(maximum, difference)
+        return maximum
+
     def state_dict(self):
         state_dict = {
             "model_state_dict": self.actor_critic.state_dict(),
@@ -1352,3 +1421,7 @@ class PPO:
         self._restore_reference_policy(
             state_dict.get("reference_model_state_dict")
         )
+        if self.is_critic_warmup_active(checkpoint_iteration):
+            self.snapshot_warmup_actor_policy()
+        else:
+            self.warmup_actor_critic = None
