@@ -626,6 +626,15 @@ class LeggedRobotBox(LeggedRobot):
             )
         if not 0.0 < float(cfg.landing_blend_step) <= 1.0:
             raise ValueError("landing_blend_step must be in (0, 1].")
+        landing_blend_maximum = float(
+            getattr(cfg, "landing_blend_maximum", 1.0)
+        )
+        if not 0.0 < landing_blend_maximum <= 1.0:
+            raise ValueError("landing_blend_maximum must be in (0, 1].")
+        if float(cfg.landing_blend_step) > landing_blend_maximum:
+            raise ValueError(
+                "landing_blend_step cannot exceed landing_blend_maximum."
+            )
         if min(
             int(cfg.landing_blend_required_stable_windows),
             int(cfg.landing_blend_required_regression_windows),
@@ -1101,13 +1110,39 @@ class LeggedRobotBox(LeggedRobot):
         layouts = tuple(int(value) for value in cfg.full_height_layouts)
         return layouts[: self.one_box_height_level + 1]
 
+    def _randomize_one_box_heights(self):
+        """Return whether all final heights should be sampled per reset."""
+        if not self.uses_task_curriculum:
+            return False
+        cfg = self.cfg.one_box_curriculum
+        final_stage = len(cfg.stage_names) - 1
+        max_height_level = len(cfg.full_height_layouts) - 1
+        return bool(
+            getattr(cfg, "randomize_final_height_layouts", False)
+            and self.one_box_curriculum_stage == final_stage
+            and self.one_box_height_level >= max_height_level
+        )
+
     def _assign_one_box_layouts(self, env_ids):
         if not self.uses_task_curriculum or len(env_ids) == 0:
             return
         allowed = self._allowed_one_box_layouts()
-        selected_layout = torch.tensor(
+        allowed_tensor = torch.tensor(
             allowed, dtype=torch.long, device=self.device
-        )[torch.remainder(env_ids, len(allowed))]
+        )
+        if self._randomize_one_box_heights():
+            selected_layout = allowed_tensor[
+                torch.randint(
+                    len(allowed),
+                    (len(env_ids),),
+                    dtype=torch.long,
+                    device=self.device,
+                )
+            ]
+        else:
+            selected_layout = allowed_tensor[
+                torch.remainder(env_ids, len(allowed))
+            ]
         physical_indices = torch.empty_like(env_ids)
         num_tracks = self.cfg.terrain.num_rows * self.cfg.terrain.num_cols
         for layout in allowed:
@@ -2918,10 +2953,20 @@ class LeggedRobotBox(LeggedRobot):
             self.landing_blend_resume_pending = bool(
                 state.get("landing_blend_resume_pending", False)
             )
+        landing_blend_maximum = float(
+            getattr(
+                self.cfg.one_box_curriculum,
+                "landing_blend_maximum",
+                1.0,
+            )
+        )
         if not np.isfinite(self.landing_blend) or not (
-            0.0 <= self.landing_blend <= 1.0
+            0.0 <= self.landing_blend <= landing_blend_maximum + 1e-6
         ):
             raise RuntimeError("One-box landing blend is out of range.")
+        self.landing_blend = min(
+            self.landing_blend, landing_blend_maximum
+        )
         if (
             expected_version >= 3
             and stage < 3
@@ -2935,6 +2980,19 @@ class LeggedRobotBox(LeggedRobot):
             self.landing_blend_regression_windows,
         ) < 0:
             raise RuntimeError("Landing blend window counters cannot be negative.")
+        final_stage = len(self.cfg.one_box_curriculum.stage_names) - 1
+        if (
+            bool(
+                getattr(
+                    self.cfg.one_box_curriculum,
+                    "randomize_final_height_layouts",
+                    False,
+                )
+            )
+            and stage == final_stage
+            and self.landing_blend >= landing_blend_maximum - 1e-6
+        ):
+            self.one_box_height_level = max_height_level
         self.one_box_curriculum_promoted = False
         self.landing_blend_promoted = False
         self.landing_blend_regressed = False
@@ -3062,15 +3120,28 @@ class LeggedRobotBox(LeggedRobot):
         ):
             return False
 
-        if self.landing_blend < 1.0:
+        landing_blend_maximum = float(
+            getattr(cfg, "landing_blend_maximum", 1.0)
+        )
+        if self.landing_blend < landing_blend_maximum - 1e-6:
             self.landing_blend = round(
                 min(
-                    1.0,
+                    landing_blend_maximum,
                     self.landing_blend + float(cfg.landing_blend_step),
                 ),
                 6,
             )
             self.landing_blend_promoted = True
+            if (
+                self.landing_blend >= landing_blend_maximum - 1e-6
+                and bool(
+                    getattr(cfg, "randomize_final_height_layouts", False)
+                )
+            ):
+                self.one_box_height_level = len(
+                    cfg.full_height_layouts
+                ) - 1
+                self.one_box_curriculum_promoted = True
         else:
             max_height_level = len(cfg.full_height_layouts) - 1
             if self.one_box_height_level >= max_height_level:
@@ -3101,6 +3172,16 @@ class LeggedRobotBox(LeggedRobot):
                 self.one_box_curriculum_promoted
             ),
             "landing_blend": float(self.landing_blend),
+            "landing_blend_maximum": float(
+                getattr(
+                    self.cfg.one_box_curriculum,
+                    "landing_blend_maximum",
+                    1.0,
+                )
+            ),
+            "random_height_active": float(
+                self._randomize_one_box_heights()
+            ),
             "landing_blend_age": float(
                 max(
                     int(iteration) - self.landing_blend_start_iteration,

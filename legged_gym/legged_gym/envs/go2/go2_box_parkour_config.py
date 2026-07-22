@@ -348,24 +348,21 @@ class Go2BoxParkour1BoxCfg(Go2BoxParkourCfg):
             thigh_collision = -0.1
             calf_collision = -0.5
             box_approach_overspeed = -1.0
-            # Full-window constraints cover all 12 joints from the short
-            # approach through rear-leg ascent and box exit.
-            box_joint_velocity = -2.0
-            box_joint_action_rate = -0.5
-            box_joint_excursion = -1.0
-            box_foot_crossing = -2.0
-            # Keep necessary front-foot lift, but trim visibly excessive
-            # upper-leg motion in the active box window.
-            front_box_velocity = -0.5
-            front_box_action_rate = -0.1
-            front_box_excursion = -0.1
-            rear_post_contact_velocity = -2.0
-            rear_post_contact_action_rate = -0.5
-            # With all four feet truly supported on top, large motions are no
-            # longer necessary. These remain zero below their soft thresholds.
-            all_feet_box_velocity = -2.0
-            all_feet_box_action_rate = -0.5
-            all_feet_box_excursion = -0.25
+            # Use one weak, non-overlapping 12-joint regularizer throughout
+            # the obstacle window. Stage-specific front/rear/top penalties
+            # are disabled below so the same motion is not charged repeatedly.
+            box_joint_velocity = -0.5
+            box_joint_action_rate = -0.1
+            box_joint_excursion = -0.2
+            box_foot_crossing = -0.5
+            front_box_velocity = 0.0
+            front_box_action_rate = 0.0
+            front_box_excursion = 0.0
+            rear_post_contact_velocity = 0.0
+            rear_post_contact_action_rate = 0.0
+            all_feet_box_velocity = 0.0
+            all_feet_box_action_rate = 0.0
+            all_feet_box_excursion = 0.0
             rear_support_missing = -0.2
             flat_airborne = -0.2
             lateral_velocity_square = -0.3
@@ -407,15 +404,15 @@ class Go2BoxParkour1BoxCfg(Go2BoxParkourCfg):
         box_approach_speed_window = 0.5
         box_approach_speed_limit = 1.0
         box_approach_speed_normalization = 1.0
-        box_joint_hip_velocity_threshold = 5.0
-        box_joint_thigh_velocity_threshold = 7.0
-        box_joint_calf_velocity_threshold = 9.0
+        box_joint_hip_velocity_threshold = 6.0
+        box_joint_thigh_velocity_threshold = 9.0
+        box_joint_calf_velocity_threshold = 11.0
         box_joint_velocity_normalization = 4.0
-        box_joint_action_delta_threshold = 0.30
-        box_joint_action_delta_normalization = 0.30
-        box_joint_hip_allowance = 0.45
-        box_joint_thigh_allowance = 1.00
-        box_joint_calf_allowance = 0.85
+        box_joint_action_delta_threshold = 0.40
+        box_joint_action_delta_normalization = 0.40
+        box_joint_hip_allowance = 0.55
+        box_joint_thigh_allowance = 1.20
+        box_joint_calf_allowance = 1.00
         box_joint_excursion_normalization = 0.40
         box_foot_side_margin = 0.03
         box_foot_crossing_normalization = 0.10
@@ -479,6 +476,12 @@ class Go2BoxParkour1BoxCfg(Go2BoxParkourCfg):
         # Stage 3 begins exactly at the Stage-2 recovery contract, then
         # tightens one level at a time toward the final landing contract.
         landing_blend_step = 0.1
+        # The accepted model_4000 already operates at 0.4. Treat that contract
+        # as the final landing difficulty instead of tightening toward 1.0.
+        landing_blend_maximum = 0.4
+        # Once the final landing level is reached, train all configured final
+        # heights in parallel. Torch RNG keeps sampling reproducible by seed.
+        randomize_final_height_layouts = True
         landing_blend_minimum_iterations = 100
         landing_blend_required_stable_windows = 2
         landing_blend_required_regression_windows = 2
@@ -512,7 +515,7 @@ class Go2BoxParkour1BoxCfgPPO(Go2BoxParkourCfgPPO):
         reference_kl_start_coef = 0.02
 
     class runner(Go2BoxParkourCfgPPO.runner):
-        run_name = "one_box_v189_exit_quality_from4000"
+        run_name = "one_box_v1812_final04_random_heights_from4000"
         init_at_random_ep_len = False
         resume = True
         load_run = osp.join(
