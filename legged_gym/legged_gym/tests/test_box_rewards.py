@@ -3382,7 +3382,7 @@ class BoxRewardTest(unittest.TestCase):
         self.assertEqual(terrain["track_length"], 12.5)
         self.assertEqual(terrain["first_gap_range"], (0.5, 1.5))
         self.assertEqual(
-            terrain["gap_distributions"][0]["range"], (0.5, 1.5)
+            terrain["gap_distributions"][0]["range"], (0.3, 1.5)
         )
         self.assertEqual(len(terrain["boxes"]), 3)
         for box in terrain["boxes"]:
@@ -3417,6 +3417,10 @@ class BoxRewardTest(unittest.TestCase):
             env_cfg.rewards.box_joint_calf_velocity_threshold,
             11.0 * 0.95**3,
         )
+        self.assertEqual(
+            env_cfg.rewards.box_joint_action_delta_threshold,
+            0.40 * 0.95,
+        )
         self.assertTrue(
             env_cfg.box_progress.inter_box_transition_enabled
         )
@@ -3426,12 +3430,12 @@ class BoxRewardTest(unittest.TestCase):
             env_cfg.rewards.inter_box_ground_reference_kl_weight, 0.15
         )
         transition_scales = env_cfg.rewards.scales
-        self.assertEqual(transition_scales.direct_transition_success, 200.0)
+        self.assertEqual(transition_scales.direct_transition_success, 300.0)
         self.assertEqual(transition_scales.dismount_front_ground, 25.0)
         self.assertEqual(transition_scales.dismount_rear_ground, 50.0)
         self.assertEqual(transition_scales.inter_box_recovery, 75.0)
         self.assertAlmostEqual(
-            transition_scales.direct_transition_success * 0.02, 4.0
+            transition_scales.direct_transition_success * 0.02, 6.0
         )
         self.assertAlmostEqual(
             (

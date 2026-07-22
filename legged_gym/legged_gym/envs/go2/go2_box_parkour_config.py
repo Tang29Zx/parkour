@@ -600,7 +600,7 @@ class Go2BoxParkour3BoxCfg(Go2BoxParkour1BoxCfg):
             track_length=12.5,
             first_gap_range=(0.5, 1.5),
             gap_distributions=[
-                dict(name="normal", range=(0.5, 1.5), weight=1.0),
+                dict(name="normal", range=(0.3, 1.5), weight=1.0),
             ],
             boxes=[
                 dict(
@@ -694,7 +694,7 @@ class Go2BoxParkour3BoxCfg(Go2BoxParkour1BoxCfg):
         class scales(Go2BoxParkour1BoxCfg.rewards.scales):
             # A direct box-to-box landing receives a small preference over
             # the safe ground route. Both remain much smaller than failure.
-            direct_transition_success = 200.0
+            direct_transition_success = 300.0
             dismount_front_ground = 25.0
             dismount_rear_ground = 50.0
             inter_box_recovery = 75.0
@@ -705,6 +705,7 @@ class Go2BoxParkour3BoxCfg(Go2BoxParkour1BoxCfg):
         box_joint_hip_velocity_threshold = 6.0 * 0.95**3
         box_joint_thigh_velocity_threshold = 9.0 * 0.95**3
         box_joint_calf_velocity_threshold = 11.0 * 0.95**3
+        box_joint_action_delta_threshold = 0.40 * 0.95
         # Once a foot selects the ground route, weakly restore the walking
         # prior while the robot establishes safe rear support.
         inter_box_ground_reference_kl_weight = 0.15
