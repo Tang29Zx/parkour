@@ -46,6 +46,7 @@ class BoxProgressTracker:
         base_height_threshold=0.15,
         lateral_limit=0.8,
         inter_box_transition_enabled=False,
+        inter_box_ground_route_steps=1,
         inter_box_recovery_steps=3,
         inter_box_stagnation_steps=100,
     ):
@@ -86,6 +87,10 @@ class BoxProgressTracker:
             raise ValueError("severe_body_impact_force must be positive.")
         if inter_box_recovery_steps <= 0:
             raise ValueError("inter_box_recovery_steps must be positive.")
+        if inter_box_ground_route_steps <= 0:
+            raise ValueError(
+                "inter_box_ground_route_steps must be positive."
+            )
         if inter_box_stagnation_steps <= 0:
             raise ValueError("inter_box_stagnation_steps must be positive.")
 
@@ -179,6 +184,9 @@ class BoxProgressTracker:
         self.inter_box_transition_enabled = bool(
             inter_box_transition_enabled
         ) and required_boxes > 1
+        self.inter_box_ground_route_steps = int(
+            inter_box_ground_route_steps
+        )
         self.inter_box_recovery_steps = int(inter_box_recovery_steps)
         self.inter_box_stagnation_steps = int(inter_box_stagnation_steps)
 
@@ -268,6 +276,15 @@ class BoxProgressTracker:
         self.transition_gap_bin = torch.full_like(self.next_box_idx, -1)
         self.transition_ground_contact_mask = torch.zeros_like(
             self.foot_contact_mask
+        )
+        self.transition_ground_contact_counter = torch.zeros_like(
+            self.next_box_idx
+        )
+        self.transition_front_ground_earned = torch.zeros_like(
+            self.box_passed_buf
+        )
+        self.transition_rear_ground_earned = torch.zeros_like(
+            self.box_passed_buf
         )
         self.inter_box_recovery_counter = torch.zeros_like(self.next_box_idx)
         self.best_inter_box_recovery_steps = torch.zeros_like(
@@ -367,6 +384,9 @@ class BoxProgressTracker:
         self.transition_source_box_idx[env_ids] = -1
         self.transition_gap_bin[env_ids] = -1
         self.transition_ground_contact_mask[env_ids] = False
+        self.transition_ground_contact_counter[env_ids] = 0
+        self.transition_front_ground_earned[env_ids] = False
+        self.transition_rear_ground_earned[env_ids] = False
         self.inter_box_recovery_counter[env_ids] = 0
         self.best_inter_box_recovery_steps[env_ids] = 0
         self.transition_stagnation_counter[env_ids] = 0
@@ -548,14 +568,19 @@ class BoxProgressTracker:
             & force_contact
         )
 
-        previous_front_seen = self.transition_ground_contact_mask[
-            :, self.front_foot_indices
-        ].any(dim=1)
-        previous_rear_seen = self.transition_ground_contact_mask[
-            :, self.rear_foot_indices
-        ].any(dim=1)
+        current_ground_contact = pending & ground_contact.any(dim=1)
+        self.transition_ground_contact_counter[:] = torch.where(
+            current_ground_contact,
+            self.transition_ground_contact_counter + 1,
+            torch.zeros_like(self.transition_ground_contact_counter),
+        )
         selected_ground_route = (
-            pending & ground_contact.any(dim=1) & ~self.transition_ground_route
+            pending
+            & (
+                self.transition_ground_contact_counter
+                >= self.inter_box_ground_route_steps
+            )
+            & ~self.transition_ground_route
         )
         self.transition_ground_route |= selected_ground_route
         self.ground_transition_count += selected_ground_route.long()
@@ -573,15 +598,19 @@ class BoxProgressTracker:
         self.dismount_front_ground_buf[:] = (
             pending
             & self.transition_ground_route
-            & ~previous_front_seen
+            & ~self.transition_front_ground_earned
             & current_front_seen
         )
         self.dismount_rear_ground_buf[:] = (
             pending
             & self.transition_ground_route
-            & ~previous_rear_seen
+            & ~self.transition_rear_ground_earned
             & current_rear_seen
         )
+        self.transition_front_ground_earned |= (
+            self.dismount_front_ground_buf
+        )
+        self.transition_rear_ground_earned |= self.dismount_rear_ground_buf
 
         current_ground_feet = ground_contact.sum(dim=1)
         current_rear_support = ground_contact[
@@ -640,6 +669,7 @@ class BoxProgressTracker:
             self.direct_transition_success_buf | self.inter_box_recovery_buf
         )
         self.transition_pending[transition_complete] = False
+        self.transition_ground_contact_counter[transition_complete] = 0
 
     def _start_inter_box_transitions(
         self, box_bounds, target_indices, passed_envs, base_x
@@ -664,6 +694,9 @@ class BoxProgressTracker:
         self.transition_source_box_idx[env_ids] = source_indices
         self.transition_gap_bin[env_ids] = gap_bins
         self.transition_ground_contact_mask[env_ids] = False
+        self.transition_ground_contact_counter[env_ids] = 0
+        self.transition_front_ground_earned[env_ids] = False
+        self.transition_rear_ground_earned[env_ids] = False
         self.inter_box_recovery_counter[env_ids] = 0
         self.transition_stagnation_counter[env_ids] = 0
         self.transition_progress_best[env_ids] = base_x[env_ids]

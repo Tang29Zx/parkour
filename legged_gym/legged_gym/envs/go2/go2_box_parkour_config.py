@@ -9,6 +9,11 @@ from legged_gym.envs.go2.debug_go2_box_config import DebugGo2BoxCfg
 from legged_gym.envs.go2.go2_config import Go2RoughCfgPPO
 
 
+_THREE_BOX_HEIGHT_CHOICES = tuple(
+    round(0.12 + 0.01 * index, 2) for index in range(29)
+)
+
+
 class Go2BoxParkourCfg(DebugGo2BoxCfg):
     """Reuse the verified box geometry with policy actions enabled."""
 
@@ -201,6 +206,7 @@ class Go2BoxParkourCfg(DebugGo2BoxCfg):
         flat_low_base_height_steps = 25
         lateral_limit = 0.8
         inter_box_transition_enabled = False
+        inter_box_ground_route_steps = 1
         inter_box_recovery_steps = 3
         inter_box_stagnation_steps = 100
 
@@ -596,11 +602,11 @@ class Go2BoxParkour3BoxCfg(Go2BoxParkour1BoxCfg):
             Go2BoxParkour1BoxCfg.terrain.RandomBoxTrack_kwargs
         )
         RandomBoxTrack_kwargs.update(
-            num_unique_layouts=19,
+            num_unique_layouts=29,
             track_length=12.5,
             first_gap_range=(0.5, 1.5),
             gap_distributions=[
-                dict(name="normal", range=(0.3, 1.5), weight=1.0),
+                dict(name="normal", range=(0.1, 1.5), weight=1.0),
             ],
             boxes=[
                 dict(
@@ -608,26 +614,17 @@ class Go2BoxParkour3BoxCfg(Go2BoxParkour1BoxCfg):
                     length=1.2,
                     width=1.2,
                     height=0.20,
+                    height_choices=_THREE_BOX_HEIGHT_CHOICES,
+                    lateral_offset=0.0,
+                ),
+                dict(
+                    gap=0.5,
+                    length=1.2,
+                    width=1.2,
+                    height=0.20,
                     height_choices=(
-                        0.12,
-                        0.13,
-                        0.14,
-                        0.15,
-                        0.16,
-                        0.17,
-                        0.18,
-                        0.19,
-                        0.20,
-                        0.21,
-                        0.22,
-                        0.23,
-                        0.24,
-                        0.25,
-                        0.26,
-                        0.27,
-                        0.28,
-                        0.29,
-                        0.30,
+                        _THREE_BOX_HEIGHT_CHOICES[10:]
+                        + _THREE_BOX_HEIGHT_CHOICES[:10]
                     ),
                     lateral_offset=0.0,
                 ),
@@ -637,53 +634,8 @@ class Go2BoxParkour3BoxCfg(Go2BoxParkour1BoxCfg):
                     width=1.2,
                     height=0.20,
                     height_choices=(
-                        0.18,
-                        0.19,
-                        0.20,
-                        0.21,
-                        0.22,
-                        0.23,
-                        0.24,
-                        0.25,
-                        0.26,
-                        0.27,
-                        0.28,
-                        0.29,
-                        0.30,
-                        0.12,
-                        0.13,
-                        0.14,
-                        0.15,
-                        0.16,
-                        0.17,
-                    ),
-                    lateral_offset=0.0,
-                ),
-                dict(
-                    gap=0.5,
-                    length=1.2,
-                    width=1.2,
-                    height=0.20,
-                    height_choices=(
-                        0.24,
-                        0.25,
-                        0.26,
-                        0.27,
-                        0.28,
-                        0.29,
-                        0.30,
-                        0.12,
-                        0.13,
-                        0.14,
-                        0.15,
-                        0.16,
-                        0.17,
-                        0.18,
-                        0.19,
-                        0.20,
-                        0.21,
-                        0.22,
-                        0.23,
+                        _THREE_BOX_HEIGHT_CHOICES[20:]
+                        + _THREE_BOX_HEIGHT_CHOICES[:20]
                     ),
                     lateral_offset=0.0,
                 ),
@@ -724,6 +676,7 @@ class Go2BoxParkour3BoxCfg(Go2BoxParkour1BoxCfg):
         landing_lateral_offset_threshold = 0.8
         landing_yaw_threshold = np.pi
         inter_box_transition_enabled = True
+        inter_box_ground_route_steps = 2
         inter_box_recovery_steps = 3
         inter_box_stagnation_steps = 100
 
@@ -736,6 +689,13 @@ class Go2BoxParkour3BoxCfg(Go2BoxParkour1BoxCfg):
 
 
 class Go2BoxParkour3BoxCfgPPO(Go2BoxParkour1BoxCfgPPO):
+    class algorithm(Go2BoxParkour1BoxCfgPPO.algorithm):
+        # The previous 2e-5 update rate destabilized the Actor within roughly
+        # 100 iterations after warmup. Keep Critic warmup unchanged and use a
+        # conservative Actor update with less exploratory pressure.
+        actor_finetune_learning_rate = 5e-6
+        actor_finetune_entropy_coef = 0.001
+
     class runner(Go2BoxParkour1BoxCfgPPO.runner):
         run_name = "three_box_fixed3500_from3500"
         resume = True

@@ -3372,17 +3372,17 @@ class BoxRewardTest(unittest.TestCase):
         train_cfg = self.three_box_train_cfg
         terrain = env_cfg.terrain.RandomBoxTrack_kwargs
         expected_heights = {
-            round(0.12 + 0.01 * index, 2) for index in range(19)
+            round(0.12 + 0.01 * index, 2) for index in range(29)
         }
 
         self.assertEqual(env_cfg.box_progress.required_boxes, 3)
         self.assertEqual(env_cfg.env.episode_length_s, 30)
         self.assertEqual(env_cfg.box_progress.min_landing_zone_length, 2.0)
-        self.assertEqual(terrain["num_unique_layouts"], 19)
+        self.assertEqual(terrain["num_unique_layouts"], 29)
         self.assertEqual(terrain["track_length"], 12.5)
         self.assertEqual(terrain["first_gap_range"], (0.5, 1.5))
         self.assertEqual(
-            terrain["gap_distributions"][0]["range"], (0.3, 1.5)
+            terrain["gap_distributions"][0]["range"], (0.1, 1.5)
         )
         self.assertEqual(len(terrain["boxes"]), 3)
         for box in terrain["boxes"]:
@@ -3424,6 +3424,7 @@ class BoxRewardTest(unittest.TestCase):
         self.assertTrue(
             env_cfg.box_progress.inter_box_transition_enabled
         )
+        self.assertEqual(env_cfg.box_progress.inter_box_ground_route_steps, 2)
         self.assertEqual(env_cfg.box_progress.inter_box_recovery_steps, 3)
         self.assertEqual(env_cfg.box_progress.inter_box_stagnation_steps, 100)
         self.assertEqual(
@@ -3448,6 +3449,12 @@ class BoxRewardTest(unittest.TestCase):
         )
 
         self.assertTrue(train_cfg.runner.resume)
+        self.assertEqual(
+            train_cfg.algorithm.actor_finetune_learning_rate, 5e-6
+        )
+        self.assertEqual(
+            train_cfg.algorithm.actor_finetune_entropy_coef, 0.001
+        )
         self.assertEqual(train_cfg.runner.checkpoint, 3500)
         self.assertIsNone(self.three_box_train_cfg.runner.ckpt_manipulator)
         self.assertEqual(self.three_box_train_cfg.runner.max_iterations, 1000)

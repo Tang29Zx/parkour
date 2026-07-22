@@ -130,6 +130,9 @@ class LeggedRobotBox(LeggedRobot):
             inter_box_transition_enabled=getattr(
                 progress_cfg, "inter_box_transition_enabled", False
             ),
+            inter_box_ground_route_steps=getattr(
+                progress_cfg, "inter_box_ground_route_steps", 1
+            ),
             inter_box_recovery_steps=getattr(
                 progress_cfg, "inter_box_recovery_steps", 3
             ),

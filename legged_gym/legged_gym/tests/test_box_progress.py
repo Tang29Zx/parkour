@@ -739,6 +739,9 @@ class BoxProgressTrackerTest(unittest.TestCase):
         self.tracker.transition_pending[:] = True
         self.tracker.transition_ground_route[:] = True
         self.tracker.transition_ground_contact_mask[:] = True
+        self.tracker.transition_ground_contact_counter[:] = 2
+        self.tracker.transition_front_ground_earned[:] = True
+        self.tracker.transition_rear_ground_earned[:] = True
         self.tracker.inter_box_recovery_counter[:] = 3
         self.tracker.transition_stagnation_counter[:] = 4
         self.tracker.direct_transition_success_count[:] = 1
@@ -782,6 +785,9 @@ class BoxProgressTrackerTest(unittest.TestCase):
             self.tracker.transition_pending,
             self.tracker.transition_ground_route,
             self.tracker.transition_ground_contact_mask,
+            self.tracker.transition_ground_contact_counter,
+            self.tracker.transition_front_ground_earned,
+            self.tracker.transition_rear_ground_earned,
             self.tracker.inter_box_recovery_counter,
             self.tracker.transition_stagnation_counter,
             self.tracker.direct_transition_success_count,
@@ -982,6 +988,7 @@ class BoxProgressTrackerTest(unittest.TestCase):
             "cpu",
             required_boxes=3,
             inter_box_transition_enabled=True,
+            inter_box_ground_route_steps=2,
             inter_box_recovery_steps=3,
             inter_box_stagnation_steps=stagnation_steps,
         )
@@ -1034,6 +1041,10 @@ class BoxProgressTrackerTest(unittest.TestCase):
         self.base_positions[0, 0] = 2.5
 
         self.update()
+        self.assertFalse(self.tracker.transition_ground_route[0])
+        self.assertFalse(self.tracker.dismount_front_ground_buf[0])
+        self.assertFalse(self.tracker.dismount_rear_ground_buf[0])
+        self.update()
         self.assertTrue(self.tracker.transition_ground_route[0])
         self.assertTrue(self.tracker.dismount_front_ground_buf[0])
         self.assertTrue(self.tracker.dismount_rear_ground_buf[0])
@@ -1060,6 +1071,8 @@ class BoxProgressTrackerTest(unittest.TestCase):
         self.feet_positions[0, 0] = self.torch.tensor([2.5, 0.0, 0.0])
         self.contact_forces[0, 0, 2] = 2.0
         self.update()
+        self.assertFalse(self.tracker.transition_ground_route[0])
+        self.update()
         self.assertTrue(self.tracker.transition_ground_route[0])
 
         self.contact_forces[0].zero_()
@@ -1074,6 +1087,31 @@ class BoxProgressTrackerTest(unittest.TestCase):
         self.assertEqual(
             self.tracker.direct_transition_success_count[0].item(), 0
         )
+
+    def test_single_ground_contact_step_keeps_direct_route_available(self):
+        self._enable_three_box_transitions()
+        self._pass_first_box_for_transition()
+        self.contact_forces[0].zero_()
+        self.feet_positions[0].zero_()
+        self.terrain_heights[0].zero_()
+        self.feet_positions[0, 0] = self.torch.tensor([2.5, 0.0, 0.0])
+        self.contact_forces[0, 0, 2] = 2.0
+        self.update()
+        self.assertFalse(self.tracker.transition_ground_route[0])
+
+        self.contact_forces[0].zero_()
+        self.feet_positions[0].zero_()
+        self.terrain_heights[0].zero_()
+        self.put_foot_on_box(0, 0, 1)
+        self.put_foot_on_box(0, 2, 1)
+        self.update()
+        self.update()
+
+        self.assertTrue(self.tracker.direct_transition_success_buf[0])
+        self.assertEqual(
+            self.tracker.direct_transition_success_count[0].item(), 1
+        )
+        self.assertEqual(self.tracker.ground_transition_count[0].item(), 0)
 
     def test_inter_box_stagnation_covers_the_gap_between_boxes(self):
         self._enable_three_box_transitions(stagnation_steps=3)
