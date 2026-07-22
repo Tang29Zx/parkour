@@ -863,9 +863,10 @@ class OnPolicyRunner:
 
     def load(self, path, load_optimizer=True):
         manipulator_name = self.cfg.get("ckpt_manipulator", False)
-        expands_rough_height_grid = (
-            manipulator_name == "initialize_one_box_from_rough2000"
-        )
+        expands_rough_height_grid = manipulator_name in {
+            "initialize_one_box_from_rough2000",
+            "initialize_go2_field_wide_scan_from_rough2000",
+        }
         self.actor_runtime_config_compatible = (
             self._verify_actor_runtime_config(
                 path,
@@ -910,6 +911,7 @@ class OnPolicyRunner:
             "reset_critic_and_optimizer",
             "reset_one_box_critic_from4000",
             "initialize_one_box_from_rough2000",
+            "initialize_go2_field_wide_scan_from_rough2000",
         }:
             self.alg.start_critic_warmup(self.current_learning_iteration)
             self.alg.set_quality_levels(0.0, 0.0)

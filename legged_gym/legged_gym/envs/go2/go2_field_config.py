@@ -226,4 +226,25 @@ class Go2FieldCfgPPO( Go2RoughCfgPPO ):
         max_iterations = 38000
         save_interval = 10000
         log_interval = 100
-        
+
+
+class Go2FieldWideScanCfg(Go2FieldCfg):
+    """Original Go2 field task with the box task's wider height scan."""
+
+    class terrain(Go2FieldCfg.terrain):
+        measured_points_x = np.linspace(-0.5, 3.0, 36).tolist()
+        measured_points_y = np.linspace(-0.8, 0.8, 17).tolist()
+
+
+class Go2FieldWideScanCfgPPO(Go2FieldCfgPPO):
+    class algorithm(Go2FieldCfgPPO.algorithm):
+        # The one-time migration resets the complete Critic side. Keep the
+        # expanded walking Actor fixed while the new Critic adapts.
+        critic_warmup_iterations = 100
+
+    class runner(Go2FieldCfgPPO.runner):
+        experiment_name = "field_go2_wide_scan"
+        run_name = "go2_field_wide_scan_from_rough2000"
+        ckpt_manipulator = None
+        save_interval = 100
+        log_interval = 20

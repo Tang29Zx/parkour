@@ -230,6 +230,25 @@ def initialize_one_box_from_rough2000(
     )
 
 
+def initialize_go2_field_wide_scan_from_rough2000(
+    source_state_dict,
+    algo_state_dict,
+):
+    """Expand the rough Actor scan and reset Critic for the Go2 field task."""
+    migrated = initialize_one_box_from_rough2000(
+        source_state_dict,
+        algo_state_dict,
+        source_grid_shape=(21, 11),
+        target_grid_shape=(36, 17),
+    )
+    print(
+        "\033[1;36m Initialized the 36x17 Go2 field policy from rough "
+        "model_2000: retained the aligned Actor scan, reset Critic and "
+        "optimizer. \033[0m"
+    )
+    return migrated
+
+
 def initialize_one_box_lift_from_warmup2100(
     source_state_dict, algo_state_dict
 ):
