@@ -908,14 +908,23 @@ class OnPolicyRunner:
         self.current_learning_iteration = loaded_dict['iter']
         if manipulator_name in {
             "reset_critic_and_optimizer",
+            "reset_one_box_critic_from4000",
             "initialize_one_box_from_rough2000",
         }:
             self.alg.start_critic_warmup(self.current_learning_iteration)
             self.alg.set_quality_levels(0.0, 0.0)
-            if self.alg.reference_kl_max_coef > 0.0:
+            if (
+                manipulator_name != "reset_one_box_critic_from4000"
+                and self.alg.reference_kl_max_coef > 0.0
+            ):
                 self.alg.snapshot_reference_policy()
-            else:
+            elif self.alg.reference_kl_max_coef <= 0.0:
                 self.alg.reference_actor_critic = None
+            elif self.alg.reference_actor_critic is None:
+                raise RuntimeError(
+                    "The one-box Critic reset must preserve its frozen "
+                    "walking reference policy."
+                )
         env = getattr(self, "env", None)
         if bool(getattr(env, "uses_task_curriculum", False)):
             if manipulator_name == "initialize_one_box_from_rough2000":

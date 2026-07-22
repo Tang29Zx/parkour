@@ -669,6 +669,70 @@ class CriticWarmupTest(unittest.TestCase):
                 resumed.alg.critic_warmup_until_iteration, 11800
             )
 
+    def test_one_box_reset_keeps_reference_and_curriculum_during_warmup(self):
+        source = self.make_ppo()
+        source.reference_kl_min_coef = 0.02
+        source.reference_kl_max_coef = 0.02
+        source.set_reference_kl_coef(0.02)
+        source.snapshot_reference_policy()
+        expected_reference = source._reference_actor_state_dict()
+        with torch.no_grad():
+            source.actor_critic.actor.weight.add_(5.0)
+            source.actor_critic.critic.weight.add_(7.0)
+        expected_actor = source.actor_critic.actor.weight.detach().clone()
+        source_state = source.state_dict()
+        task_state = {
+            "version": 3,
+            "stage": 3,
+            "height_level": 0,
+            "landing_blend": 0.4,
+        }
+        source_state.update(
+            iter=4000,
+            infos={"source": "one_box_v187"},
+            task_curriculum_state_dict=task_state,
+        )
+
+        restored_task = {}
+        with tempfile.TemporaryDirectory() as temp_dir:
+            source_path = Path(temp_dir) / "source.pt"
+            torch.save(source_state, source_path)
+
+            runner = OnPolicyRunner.__new__(OnPolicyRunner)
+            runner.device = "cpu"
+            runner.cfg = {
+                "ckpt_manipulator": "reset_one_box_critic_from4000"
+            }
+            runner.alg = self.make_ppo()
+            initial_critic = (
+                runner.alg.actor_critic.critic.weight.detach().clone()
+            )
+            runner.log_dir = temp_dir
+            runner.env = SimpleNamespace(
+                uses_task_curriculum=True,
+                load_task_curriculum_state=lambda state: restored_task.update(
+                    state
+                ),
+                get_task_curriculum_state=lambda: task_state,
+                reset=lambda: None,
+            )
+            runner.load(str(source_path))
+
+        self.assertEqual(runner.alg.critic_warmup_until_iteration, 4100)
+        torch.testing.assert_close(
+            runner.alg.actor_critic.actor.weight.detach(), expected_actor
+        )
+        torch.testing.assert_close(
+            runner.alg.actor_critic.critic.weight.detach(), initial_critic
+        )
+        self.assertEqual(restored_task, task_state)
+        actual_reference = runner.alg._reference_actor_state_dict()
+        self.assertEqual(set(actual_reference), set(expected_reference))
+        for name in expected_reference:
+            torch.testing.assert_close(
+                actual_reference[name], expected_reference[name]
+            )
+
     def test_negative_warmup_length_is_rejected(self):
         with self.assertRaises(ValueError):
             LossControlledPPO(

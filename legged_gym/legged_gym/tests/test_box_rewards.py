@@ -277,6 +277,74 @@ class HeightEncoderMigrationTest(unittest.TestCase):
                 dict(model_state_dict=target_model),
             )
 
+    def test_one_box_critic_reset_preserves_task_and_reference_state(self):
+        names = (
+            "std",
+            "actor.0.weight",
+            "memory_a.rnn.weight",
+            "encoders.0.weight",
+            "critic.0.weight",
+            "memory_c.rnn.weight",
+            "critic_encoders.0.weight",
+        )
+        source_model = OrderedDict(
+            (name, torch.full((2, 2), float(index + 1)))
+            for index, name in enumerate(names)
+        )
+        target_model = OrderedDict(
+            (name, torch.full((2, 2), float(index + 101)))
+            for index, name in enumerate(names)
+        )
+        task_state = {
+            "version": 3,
+            "stage": 3,
+            "height_level": 0,
+            "landing_blend": 0.4,
+        }
+        reference_state = {"actor.0.weight": torch.full((2, 2), 9.0)}
+        algorithm_state = {"current_reference_kl_coef": 0.02}
+        source = {
+            "model_state_dict": source_model,
+            "optimizer_state_dict": {"old": True},
+            "lr_scheduler_state_dict": {"old": True},
+            "algorithm_state_dict": algorithm_state,
+            "reference_model_state_dict": reference_state,
+            "task_curriculum_state_dict": task_state,
+            "iter": 4000,
+            "infos": {"source": "one_box_v187"},
+        }
+
+        migrated = self.module.reset_one_box_critic_from4000(
+            source, {"model_state_dict": target_model}
+        )
+
+        critic_prefixes = ("critic.", "memory_c.", "critic_encoders.")
+        for key in names:
+            expected = (
+                target_model[key]
+                if key.startswith(critic_prefixes)
+                else source_model[key]
+            )
+            torch.testing.assert_close(
+                migrated["model_state_dict"][key], expected
+            )
+        self.assertEqual(migrated["task_curriculum_state_dict"], task_state)
+        self.assertEqual(
+            migrated["algorithm_state_dict"], algorithm_state
+        )
+        torch.testing.assert_close(
+            migrated["reference_model_state_dict"]["actor.0.weight"],
+            reference_state["actor.0.weight"],
+        )
+        self.assertNotIn("optimizer_state_dict", migrated)
+        self.assertNotIn("lr_scheduler_state_dict", migrated)
+
+        bad_source = dict(source, iter=3999)
+        with self.assertRaises(ValueError):
+            self.module.reset_one_box_critic_from4000(
+                bad_source, {"model_state_dict": target_model}
+            )
+
     def test_one_box_initializer_expands_actor_scan_and_resets_critic(self):
         source_model = OrderedDict(
             [

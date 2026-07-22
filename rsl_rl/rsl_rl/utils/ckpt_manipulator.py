@@ -96,6 +96,43 @@ def reset_critic_and_optimizer(source_state_dict, algo_state_dict):
     )
 
 
+def reset_one_box_critic_from4000(source_state_dict, algo_state_dict):
+    """Reset the one-box Critic while preserving curriculum and reference."""
+    if int(source_state_dict.get("iter", -1)) != 4000:
+        raise ValueError(
+            "The one-box Critic reset requires the accepted model_4000.pt."
+        )
+    task_state = source_state_dict.get("task_curriculum_state_dict")
+    if not isinstance(task_state, dict):
+        raise ValueError("The one-box checkpoint has no curriculum state.")
+    if (
+        int(task_state.get("version", -1)) != 3
+        or int(task_state.get("stage", -1)) != 3
+        or abs(float(task_state.get("landing_blend", -1.0)) - 0.4) > 1e-6
+    ):
+        raise ValueError(
+            "The one-box Critic reset requires Stage 3 at landing blend 0.4."
+        )
+    if source_state_dict.get("reference_model_state_dict") is None:
+        raise ValueError(
+            "The one-box checkpoint has no frozen walking reference policy."
+        )
+
+    reset_state = reset_critic_and_optimizer(
+        source_state_dict, algo_state_dict
+    )
+    migrated = copy.deepcopy(source_state_dict)
+    migrated["model_state_dict"] = reset_state["model_state_dict"]
+    migrated.pop("optimizer_state_dict", None)
+    migrated.pop("lr_scheduler_state_dict", None)
+    print(
+        "\033[1;36m Preserved the model_4000 Actor, one-box curriculum, "
+        "and frozen walking reference; reset all Critic modules and the "
+        "optimizer. \033[0m"
+    )
+    return migrated
+
+
 def initialize_one_box_from_rough2000(
     source_state_dict,
     algo_state_dict,
